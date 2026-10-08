@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HolidayLink app mark: a stylised chain link on the brand gradient.
+  Drawn inside the 72dp adaptive-icon safe zone (centre of the 108dp canvas).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="-45">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M41,32h26a9,9 0 0 1 9,9v8a9,9 0 0 1 -9,9h-26a9,9 0 0 1 -9,-9v-8a9,9 0 0 1 9,-9z" />
+    </group>
+
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="135">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M41,32h26a9,9 0 0 1 9,9v8a9,9 0 0 1 -9,9h-26a9,9 0 0 1 -9,-9v-8a9,9 0 0 1 9,-9z" />
+    </group>
+
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="-45">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M47,48h14a4,4 0 0 1 4,4v4a4,4 0 0 1 -4,4h-14a4,4 0 0 1 -4,-4v-4a4,4 0 0 1 4,-4z" />
+    </group>
+</vector>

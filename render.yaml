@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: holidaylink-api
+    runtime: node
+    plan: free
+    buildCommand: cd server && npm ci
+    startCommand: cd server && npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DEFAULT_COUNTRY_CODE
+        value: "256"
+      - key: PG_POOL_MAX
+        value: "5"
+      - key: PG_CONNECT_TIMEOUT_MS
+        value: "8000"
+      - key: PGSSL_DISABLE
+        value: "false"
+      - key: INFOBIP_BASE_URL
+        sync: false
+      - key: INFOBIP_API_KEY
+        sync: false
+      - key: INFOBIP_FROM
+        value: "HolidayLink"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODELS
+        value: "gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
+      - key: UPLOAD_DIR
+        value: "./uploads"
+      - key: CONTENT_SOURCE
+        value: "neon"
+      - key: MAX_VIDEO_MB
+        value: "100"
+      - key: MEDIA_STORAGE
+        value: "local"

@@ -1,0 +1,16 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+server/.env
+
+node_modules/
+*.keystore
+*.jks
+.gradle/
+build/
+local.properties
+
+# Uploaded avatars, status photos and attachments are user data, not source.
+uploads/
+server/uploads/

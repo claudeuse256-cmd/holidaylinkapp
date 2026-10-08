@@ -1,0 +1,315 @@
+package org.holidaylink.app.data
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import org.holidaylink.app.config.AppConfig
+import org.holidaylink.app.ui.theme.ChatDensity
+import org.holidaylink.app.ui.theme.ThemeMode
+import java.util.Locale
+
+/** Media auto-download policy, mirroring the three states users expect. */
+enum class AutoDownload { ALWAYS, WIFI_ONLY, NEVER }
+
+/** Default timer applied to new messages. */
+enum class DisappearingDuration(val seconds: Long, val label: String) {
+    OFF(0L, "Off"),
+    DAY_1(86_400L, "24 hours"),
+    WEEK_1(604_800L, "7 days"),
+    MONTH_3(2_592_000L, "90 days");
+
+    companion object {
+        fun fromSeconds(seconds: Long): DisappearingDuration =
+            entries.firstOrNull { it.seconds == seconds } ?: OFF
+    }
+}
+
+/** One immutable snapshot of every device-side setting. */
+data class SettingsSnapshot(
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    val fontScale: Float = 1f,
+    val chatDensity: ChatDensity = ChatDensity.COMFORTABLE,
+    val animationsEnabled: Boolean = true,
+    val chatWallpaper: String? = null,
+    val chatWallpaperSolid: Boolean = false,
+    val autoDownloadPhotos: AutoDownload = AutoDownload.WIFI_ONLY,
+    val autoDownloadVideos: AutoDownload = AutoDownload.WIFI_ONLY,
+    val autoDownloadDocuments: AutoDownload = AutoDownload.NEVER,
+    val saveMediaToGallery: Boolean = true,
+    val dataSaver: Boolean = false,
+    val readReceipts: Boolean = true,
+    val typingIndicators: Boolean = true,
+    val onlineVisibility: Boolean = true,
+    val disappearing: DisappearingDuration = DisappearingDuration.OFF,
+    val language: String = "en",
+    val appLockEnabled: Boolean = false,
+    val biometricLockEnabled: Boolean = false,
+    val appLockPin: String? = null,
+    val notifyMessages: Boolean = true,
+    val notifyCalls: Boolean = true,
+    val notifyStatus: Boolean = true,
+    val notifyAi: Boolean = true,
+    val notifySound: Boolean = true,
+    val notifyVibration: Boolean = true,
+    val notifyPreview: Boolean = true,
+    val mutedChats: Map<String, Boolean> = emptyMap(),
+    val aiEnabled: Boolean = true,
+    val saveAiChats: Boolean = true,
+    val aiResponseStyle: String = "balanced"
+)
+
+/**
+ * Device-side settings backed by SharedPreferences.
+ *
+ * A single immutable snapshot is exposed as Compose state, so any screen that reads
+ * [state] recomposes the instant a setting changes. Nothing here talks to the network;
+ * settings that the server also enforces are mirrored locally for instant UI feedback
+ * and are pushed to the backend by the screens that own them.
+ */
+object AppSettings {
+
+    private lateinit var prefs: SharedPreferences
+
+    var state by mutableStateOf(SettingsSnapshot())
+        private set
+
+    private val listeners = mutableListOf<(SettingsSnapshot) -> Unit>()
+
+    fun init(context: Context) {
+        if (::prefs.isInitialized) return
+        prefs = context.applicationContext
+            .getSharedPreferences(AppConfig.PREFS, Context.MODE_PRIVATE)
+        state = read()
+    }
+
+    /** Notified after every local change; used to debounce server syncs. */
+    fun addListener(listener: (SettingsSnapshot) -> Unit) {
+        listeners += listener
+    }
+
+    fun removeListener(listener: (SettingsSnapshot) -> Unit) {
+        listeners -= listener
+    }
+
+    // ------------------------------------------------------------------ keys
+
+    private object K {
+        const val THEME = "set.theme"
+        const val FONT_SCALE = "set.fontScale"
+        const val DENSITY = "set.chatDensity"
+        const val ANIMATIONS = "set.animations"
+        const val WALLPAPER = "set.wallpaper"
+        const val WALLPAPER_SOLID = "set.wallpaperSolid"
+        const val DL_PHOTOS = "set.dlPhotos"
+        const val DL_VIDEOS = "set.dlVideos"
+        const val DL_DOCS = "set.dlDocs"
+        const val SAVE_GALLERY = "set.saveGallery"
+        const val DATA_SAVER = "set.dataSaver"
+        const val RECEIPTS = "set.readReceipts"
+        const val TYPING = "set.typing"
+        const val ONLINE = "set.onlineVisibility"
+        const val DISAPPEARING = "set.disappearing"
+        const val LANGUAGE = "set.language"
+        const val APP_LOCK = "set.appLock"
+        const val BIOMETRIC = "set.biometric"
+        const val PIN = "set.pin"
+        const val N_MSG = "set.notify.messages"
+        const val N_CALL = "set.notify.calls"
+        const val N_STATUS = "set.notify.status"
+        const val N_AI = "set.notify.ai"
+        const val N_SOUND = "set.notify.sound"
+        const val N_VIBRATE = "set.notify.vibration"
+        const val N_PREVIEW = "set.notify.preview"
+        const val MUTED = "set.mutedChats"
+        const val AI_ENABLED = "set.ai.enabled"
+        const val AI_SAVE = "set.ai.save"
+        const val AI_STYLE = "set.ai.style"
+    }
+
+    private fun read(): SettingsSnapshot {
+        val p = prefs
+        return SettingsSnapshot(
+            themeMode = enumOrDefault(p.getString(K.THEME, null), ThemeMode.SYSTEM),
+            fontScale = p.getFloat(K.FONT_SCALE, 1f).coerceIn(0.85f, 1.45f),
+            chatDensity = enumOrDefault(p.getString(K.DENSITY, null), ChatDensity.COMFORTABLE),
+            animationsEnabled = p.getBoolean(K.ANIMATIONS, true),
+            chatWallpaper = p.getString(K.WALLPAPER, null),
+            chatWallpaperSolid = p.getBoolean(K.WALLPAPER_SOLID, false),
+            autoDownloadPhotos = enumOrDefault(p.getString(K.DL_PHOTOS, null), AutoDownload.WIFI_ONLY),
+            autoDownloadVideos = enumOrDefault(p.getString(K.DL_VIDEOS, null), AutoDownload.WIFI_ONLY),
+            autoDownloadDocuments = enumOrDefault(p.getString(K.DL_DOCS, null), AutoDownload.NEVER),
+            saveMediaToGallery = p.getBoolean(K.SAVE_GALLERY, true),
+            dataSaver = p.getBoolean(K.DATA_SAVER, false),
+            readReceipts = p.getBoolean(K.RECEIPTS, true),
+            typingIndicators = p.getBoolean(K.TYPING, true),
+            onlineVisibility = p.getBoolean(K.ONLINE, true),
+            disappearing = enumOrDefault(p.getString(K.DISAPPEARING, null), DisappearingDuration.OFF),
+            language = p.getString(K.LANGUAGE, "en") ?: "en",
+            appLockEnabled = p.getBoolean(K.APP_LOCK, false),
+            biometricLockEnabled = p.getBoolean(K.BIOMETRIC, false),
+            appLockPin = p.getString(K.PIN, null),
+            notifyMessages = p.getBoolean(K.N_MSG, true),
+            notifyCalls = p.getBoolean(K.N_CALL, true),
+            notifyStatus = p.getBoolean(K.N_STATUS, true),
+            notifyAi = p.getBoolean(K.N_AI, true),
+            notifySound = p.getBoolean(K.N_SOUND, true),
+            notifyVibration = p.getBoolean(K.N_VIBRATE, true),
+            notifyPreview = p.getBoolean(K.N_PREVIEW, true),
+            mutedChats = decodeMuted(p.getString(K.MUTED, "").orEmpty()),
+            aiEnabled = p.getBoolean(K.AI_ENABLED, true),
+            saveAiChats = p.getBoolean(K.AI_SAVE, true),
+            aiResponseStyle = p.getString(K.AI_STYLE, "balanced") ?: "balanced"
+        )
+    }
+
+    private inline fun <reified T : Enum<T>> enumOrDefault(raw: String?, fallback: T): T =
+        raw?.let { runCatching { enumValueOf<T>(it) }.getOrNull() } ?: fallback
+
+    private fun decodeMuted(raw: String): Map<String, Boolean> {
+        if (raw.isBlank()) return emptyMap()
+        val result = LinkedHashMap<String, Boolean>()
+        for (pair in raw.split(';')) {
+            if (pair.isBlank()) continue
+            val idx = pair.lastIndexOf('=')
+            if (idx <= 0) continue
+            result[pair.substring(0, idx)] = pair.substring(idx + 1) == "1"
+        }
+        return result
+    }
+
+    private fun encodeMuted(map: Map<String, Boolean>): String =
+        map.entries.joinToString(";") { "${it.key}=${if (it.value) 1 else 0}" }
+
+    private fun commit(): SettingsSnapshot {
+        state = read()
+        listeners.toList().forEach { runCatching { it(state) } }
+        return state
+    }
+
+    // ------------------------------------------------------------------ mutations
+
+    private inline fun <reified T : Enum<T>> putEnum(key: String, value: T) {
+        prefs.edit().putString(key, value.name).apply()
+        commit()
+    }
+
+    fun setThemeMode(value: ThemeMode) = putEnum(K.THEME, value)
+    fun setChatDensity(value: ChatDensity) = putEnum(K.DENSITY, value)
+    fun setFontScale(value: Float) {
+        prefs.edit().putFloat(K.FONT_SCALE, value.coerceIn(0.85f, 1.45f)).apply()
+        commit()
+    }
+
+    fun setAnimations(value: Boolean) {
+        prefs.edit().putBoolean(K.ANIMATIONS, value).apply()
+        commit()
+    }
+
+    fun setChatWallpaper(uri: String?) {
+        prefs.edit().apply {
+            if (uri == null) remove(K.WALLPAPER) else putString(K.WALLPAPER, uri)
+        }.apply()
+        commit()
+    }
+
+    fun setChatWallpaperSolid(value: Boolean) {
+        prefs.edit().putBoolean(K.WALLPAPER_SOLID, value).apply()
+        commit()
+    }
+
+    fun setAutoDownloadPhotos(value: AutoDownload) = putEnum(K.DL_PHOTOS, value)
+    fun setAutoDownloadVideos(value: AutoDownload) = putEnum(K.DL_VIDEOS, value)
+    fun setAutoDownloadDocuments(value: AutoDownload) = putEnum(K.DL_DOCS, value)
+
+    fun setSaveMediaToGallery(value: Boolean) {
+        prefs.edit().putBoolean(K.SAVE_GALLERY, value).apply()
+        commit()
+    }
+
+    fun setDataSaver(value: Boolean) {
+        prefs.edit().putBoolean(K.DATA_SAVER, value).apply()
+        commit()
+    }
+
+    fun setReadReceipts(value: Boolean) {
+        prefs.edit().putBoolean(K.RECEIPTS, value).apply()
+        commit()
+    }
+
+    fun setTypingIndicators(value: Boolean) {
+        prefs.edit().putBoolean(K.TYPING, value).apply()
+        commit()
+    }
+
+    fun setOnlineVisibility(value: Boolean) {
+        prefs.edit().putBoolean(K.ONLINE, value).apply()
+        commit()
+    }
+
+    fun setDisappearing(value: DisappearingDuration) = putEnum(K.DISAPPEARING, value)
+
+    fun setLanguage(tag: String) {
+        prefs.edit().putString(K.LANGUAGE, tag.lowercase(Locale.US)).apply()
+        commit()
+    }
+
+    fun setAppLockEnabled(value: Boolean) {
+        prefs.edit().putBoolean(K.APP_LOCK, value).apply()
+        commit()
+    }
+
+    fun setBiometricLockEnabled(value: Boolean) {
+        prefs.edit().putBoolean(K.BIOMETRIC, value).apply()
+        commit()
+    }
+
+    fun setAppLockPin(pin: String?) {
+        prefs.edit().apply { if (pin == null) remove(K.PIN) else putString(K.PIN, pin) }.apply()
+        commit()
+    }
+
+    fun setNotifyMessages(value: Boolean) = flag(K.N_MSG, value)
+    fun setNotifyCalls(value: Boolean) = flag(K.N_CALL, value)
+    fun setNotifyStatus(value: Boolean) = flag(K.N_STATUS, value)
+    fun setNotifyAi(value: Boolean) = flag(K.N_AI, value)
+    fun setNotifySound(value: Boolean) = flag(K.N_SOUND, value)
+    fun setNotifyVibration(value: Boolean) = flag(K.N_VIBRATE, value)
+    fun setNotifyPreview(value: Boolean) = flag(K.N_PREVIEW, value)
+
+    private fun flag(key: String, value: Boolean) {
+        prefs.edit().putBoolean(key, value).apply()
+        commit()
+    }
+
+    fun isChatMuted(conversationId: String): Boolean =
+        state.mutedChats[conversationId] == true
+
+    fun setChatMuted(conversationId: String, muted: Boolean) {
+        val next = LinkedHashMap(state.mutedChats)
+        if (muted) next[conversationId] = true else next.remove(conversationId)
+        prefs.edit().putString(K.MUTED, encodeMuted(next)).apply()
+        commit()
+    }
+
+    fun setAiEnabled(value: Boolean) = flag(K.AI_ENABLED, value)
+    fun setSaveAiChats(value: Boolean) = flag(K.AI_SAVE, value)
+    fun setAiResponseStyle(value: String) {
+        prefs.edit().putString(K.AI_STYLE, value).apply()
+        commit()
+    }
+
+    /**
+     * Clears local presentation state only.
+     * Deliberately never touches the auth token, the app-lock PIN or any server data,
+     * so "Clear cache" can never destroy a session or unlock the app for someone else.
+     */
+    fun clearLocalCache() {
+        prefs.edit()
+            .remove(K.WALLPAPER)
+            .remove(K.MUTED)
+            .apply()
+        commit()
+    }
+}
