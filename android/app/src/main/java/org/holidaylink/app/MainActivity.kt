@@ -105,6 +105,7 @@ import org.holidaylink.app.ui.CallsScreen
 import org.holidaylink.app.ui.ChatScreen
 import org.holidaylink.app.ui.ChatsScreen
 import org.holidaylink.app.ui.ContactsScreen
+import org.holidaylink.app.ui.UsersScreen
 import org.holidaylink.app.ui.MyProfileScreen
 import org.holidaylink.app.ui.NewChatScreen
 import org.holidaylink.app.ui.NotificationListScreen
@@ -593,7 +594,7 @@ private fun TabShell(
         ) {
             NotificationPermissionBanner(notificationPermission)
 
-            // Exact reference layout: glass header, status row, then one combined search field.
+            // Chats keeps the glass header + status + search. Users/Channels stay clean.
             GlassHeader(
                 me = me,
                 onNewChat = onNewChat,
@@ -602,14 +603,16 @@ private fun TabShell(
                 onProfile = onOpenProfileTab
             )
 
-            GlassStatusRow(
-                api = api,
-                me = me,
-                onOpenStatus = onOpenStatus,
-                onPostStatus = onPostStatus
-            )
+            if (tab == Tab.Chats) {
+                GlassStatusRow(
+                    api = api,
+                    me = me,
+                    onOpenStatus = onOpenStatus,
+                    onPostStatus = onPostStatus
+                )
 
-            GlassSearchBar(onClick = onSearch)
+                GlassSearchBar(onClick = onSearch)
+            }
 
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when (tab) {
@@ -619,7 +622,7 @@ private fun TabShell(
                         onOpenChat = onOpenChat,
                         showChrome = false
                     )
-                    Tab.Users -> ContactsScreen(
+                    Tab.Users -> UsersScreen(
                         api = api,
                         onOpenChat = onOpenDirect,
                         onOpenProfile = onOpenProfile

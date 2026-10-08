@@ -881,6 +881,15 @@ export function registerFeatures(app, ctx) {
     res.json(r.rows.map(x => ({ user_id:x.user_id, public_key:x.public_key || null })));
   });
 
+  // Member ids for ranking common groups (caller must be a member).
+  app.get('/conversations/:id/members', auth, async (req, res) => {
+    try {
+      if (!(await roleIn(req.params.id, req.user.sub))) return res.status(403).json({ error: 'NOT_MEMBER' });
+      const r = await db('SELECT user_id FROM conversation_members WHERE conversation_id=$1', [req.params.id]);
+      res.json(r.rows.map(x => x.user_id));
+    } catch (err) { return fail(res, err, 'members'); }
+  });
+
   // ---------------------------------------------------------------- messages
 
   app.get('/conversations/:id/messages', auth, async (req, res) => {

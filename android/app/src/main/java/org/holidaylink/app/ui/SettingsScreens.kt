@@ -196,8 +196,6 @@ fun SettingsHub(
     var confirmLogout by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
-    var healthText by remember { mutableStateOf("") }
-    var testing by remember { mutableStateOf(false) }
 
     SettingsScaffold("Settings", onBack = {}, snackbar = snackbar) {
         // -------- profile header
@@ -248,31 +246,6 @@ fun SettingsHub(
             SettingsNavRow("Language", Icons.Default.Language, "App language", onClick = { onOpen(SettingsRoute.Language) })
             SettingsNavRow("Chats", Icons.Default.Groups, "Chat wallpaper and defaults", onClick = { onOpen(SettingsRoute.ChatSettings) })
             SettingsNavRow("HolidayLink AI", Icons.Default.AutoAwesome, "Assistant and AI settings", onClick = { onOpen(SettingsRoute.AiSettings) })
-        }
-
-        SettingsSection("Server") {
-            SettingsValueRow(
-                title = "Backend address",
-                icon = Icons.Default.CloudDownload,
-                value = org.holidaylink.app.config.AppConfig.resolve(context),
-                onClick = { onOpen(SettingsRoute.Server) }
-            )
-            SettingsNavRow(
-                title = "Test connection",
-                icon = Icons.Default.RadioButtonChecked,
-                subtitle = healthText.ifBlank { "Check the server and database" },
-                onClick = {
-                    if (testing) return@SettingsNavRow
-                    testing = true
-                    healthText = ""
-                    scope.launch {
-                        val info = api.health()
-                        healthText = if (info.ok) "Connected. Database: ${info.database}."
-                        else "Not reachable. ${info.detail}"
-                        testing = false
-                    }
-                }
-            )
         }
 
         SettingsSection("About") {
@@ -502,7 +475,7 @@ fun PrivacyScreen(api: Api, onBack: () -> Unit) {
 
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "These rules are enforced by the HolidayLink server. Choosing \"Nobody\" " +
+                    "These rules are enforced automatically. Choosing \"Nobody\" " +
                         "means your last seen, photo and About are not sent to other people at all.",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

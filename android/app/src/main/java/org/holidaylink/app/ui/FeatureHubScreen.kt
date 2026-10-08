@@ -164,7 +164,7 @@ fun VideoHubScreen(
             uploadProgress = 0.5f
             runCatching { api.uploadVideo(uri, picked.name, picked.sizeBytes.takeIf { it > 0 } ?: 99L * 1024 * 1024, caption) }
                 .onSuccess { uploadProgress = 1f; videos = listOf(it) + videos; mine = listOf(it) + mine; caption = ""; info = "Video posted."; composerOpen = false }
-                .onFailure { info = it.message ?: "Video upload failed. Check server address + DATABASE_URL on Render." }
+                .onFailure { info = it.message ?: "Video upload failed. Check your internet and try again." }
             uploading = false; uploadProgress = 0f
         }
     }
@@ -263,11 +263,11 @@ private fun TikTokVideoCard(api: Api?, video: org.holidaylink.app.net.VideoPost,
         Spacer(Modifier.height(8.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             androidx.compose.material3.IconButton(onClick = {
-                scope.launch { runCatching { api?.toggleVideoLike(video.id) }.onSuccess { (l, c) -> liked = l; likes = c; onChanged(video.copy(liked = l, likes = c)) } }
+                scope.launch { val a = api ?: return@launch; runCatching { a.toggleVideoLike(video.id) }.onSuccess { (l, c) -> liked = l; likes = c; onChanged(video.copy(liked = l, likes = c)) } }
             }) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(if (liked) Icons.Default.Favorite else Icons.Default.FavoriteBorder, "Like", tint = if (liked) Color.Red else MaterialTheme.colorScheme.onSurface); Text("$likes", style = MaterialTheme.typography.labelSmall) } }
             androidx.compose.material3.IconButton(onClick = { commentsOpen = !commentsOpen }) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(Icons.Default.Comment, "Comments"); Text("$commentCount", style = MaterialTheme.typography.labelSmall) } }
             androidx.compose.material3.IconButton(onClick = {
-                scope.launch { runCatching { api?.toggleVideoSave(video.id) }.onSuccess { s -> saved = s; onChanged(video.copy(saved = s)) } }
+                scope.launch { val a = api ?: return@launch; runCatching { a.toggleVideoSave(video.id) }.onSuccess { s -> saved = s; onChanged(video.copy(saved = s)) } }
             }) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(if (saved) Icons.Default.Bookmark else Icons.Default.BookmarkBorder, "Favorite", tint = if (saved) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface); Text(if (saved) "Saved" else "Save", style = MaterialTheme.typography.labelSmall) } }
         }
         if (commentsOpen) VideoComments(api = api, videoId = video.id, onCount = { commentCount = it; onChanged(video.copy(comments = it)) })

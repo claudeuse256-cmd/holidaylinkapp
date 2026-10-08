@@ -483,6 +483,29 @@ class Api(context: Context) {
     suspend fun createCommunity(title: String, memberIds: List<String>): String =
         postJson("conversations/community", JSONObject().put("title", title).put("memberIds", JSONArray(memberIds))).getString("id")
 
+    fun appContextForCache(): android.content.Context = appContext
+
+    suspend fun conversationMembers(conversationId: String): List<String> {
+        val array = getArray("conversations/${enc(conversationId)}/members")
+        return (0 until array.length()).map { array.optString(it) }.filter { it.isNotBlank() }
+    }
+
+    fun saveUsersCache(users: List<User>) {
+        runCatching {
+            val arr = org.json.JSONArray()
+            users.take(500).forEach { u ->
+                arr.put(org.json.JSONObject().put("id", u.id).put("display_name", u.displayName).put("username", u.username).put("avatar_url", u.avatarUrl).put("online", u.online))
+            }
+            prefs.edit().putString("cache.users", arr.toString()).putLong("cache.users.at", System.currentTimeMillis()).apply()
+        }
+    }
+
+    fun readUsersCache(): List<User> {
+        val raw = prefs.getString("cache.users", null) ?: return emptyList()
+        val array = org.json.JSONArray(raw)
+        return (0 until array.length()).map { array.getJSONObject(it).toUser() }
+    }
+
     suspend fun storeItems(): List<StoreItem> {
         val array = getArray("store/items")
         return (0 until array.length()).map { i ->
@@ -545,7 +568,7 @@ class Api(context: Context) {
             HealthInfo(false, "unavailable", e.message ?: "Server unreachable")
         } catch (e: IOException) {
             Log.w(TAG, "health check failed: ${e.message}")
-            HealthInfo(false, "unavailable", "Can't reach ${AppConfig.resolve(appContext)}. Check the server address in Settings.")
+            HealthInfo(false, "unavailable", "Can't reach HolidayLink. Check your internet and try again.")
         }
     }
 

@@ -130,7 +130,7 @@ private val HELP_TEXT = """
 
     If something looks wrong
 
-    • Messages not arriving: check the server address in Settings, then "Test connection".
+    • Messages not arriving: check your internet connection and reopen the chat.
     • Not seeing contacts on HolidayLink: the list only shows accounts whose numbers matched.
       Everyone else is listed under "Invite to HolidayLink".
     • Missing notifications: Android blocks them until you allow them. Settings > Notifications

@@ -26,6 +26,14 @@ object ContactMatcher {
         return Countries.dialCodeForRegion(iso)
     }
 
+    fun defaultDialCodes(context: Context): List<String> {
+        val stored = Countries.byIso(
+            context.getSharedPreferences(org.holidaylink.app.config.AppConfig.PREFS, Context.MODE_PRIVATE)
+                .getString("countryIso", Countries.DEFAULT_ISO)
+        ).dialCode
+        return listOfNotNull(stored, deviceRegionDialCode(context)).distinct()
+    }
+
     /** Blocking: always call from Dispatchers.IO. */
     fun readPhoneHashes(context: Context, dialCodes: List<String>): List<String> {
         val hashes = LinkedHashSet<String>()
