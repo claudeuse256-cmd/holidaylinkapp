@@ -72,14 +72,15 @@ import org.holidaylink.app.net.StatusUpdate
 @Composable
 fun StatusScreen(
     api: Api,
-    me: Me?
+    me: Me?,
+    startWithComposer: Boolean = false
 ) {
     var statuses by remember { mutableStateOf<List<StatusUpdate>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var refreshing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
-    var composerOpen by remember { mutableStateOf(false) }
+    var composerOpen by remember(startWithComposer) { mutableStateOf(startWithComposer) }
     // Which person's reel entry the list is currently filtered to; null shows everyone.
     var selectedUserId by remember { mutableStateOf<String?>(null) }
 
@@ -124,6 +125,10 @@ fun StatusScreen(
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
             }
+            androidx.compose.material3.Button(onClick = { composerOpen = true }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+                Icon(Icons.Default.Add, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Post")
+            }
+            Spacer(Modifier.width(4.dp))
             RefreshButton { reload++ }
         }
 
@@ -162,7 +167,8 @@ fun StatusScreen(
                     EmptyState(
                         icon = Icons.Default.Campaign,
                         title = "No status updates",
-                        subtitle = "Post a short note or photo. Updates disappear after 24 hours."
+                        subtitle = "Post a short note or photo. Updates disappear after 24 hours.",
+                        action = { androidx.compose.material3.Button(onClick = { composerOpen = true }) { Text("+ Post status") } }
                     )
                 } else if (selected != null && mine.isEmpty() && others.isEmpty()) {
                     EmptyState(

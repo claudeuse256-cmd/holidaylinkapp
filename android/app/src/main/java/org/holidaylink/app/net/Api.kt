@@ -190,7 +190,17 @@ data class AuthResult(
 data class VideoPost(
     val id: String, val userId: String, val videoUrl: String, val thumbnailUrl: String? = null,
     val caption: String = "", val views: Long = 0, val createdAt: String = "",
-    val user: User, val liked: Boolean = false, val likes: Int = 0, val comments: Int = 0
+    val user: User, val liked: Boolean = false, val likes: Int = 0, val comments: Int = 0,
+    val saved: Boolean = false
+)
+
+data class VideoComment(
+    val id: String, val body: String, val createdAt: String, val user: User
+)
+
+data class StoreItem(
+    val id: String, val title: String, val description: String,
+    val priceMinor: Long, val currency: String, val imageUrl: String?
 )
 
 data class TwoFactorStatus(val enabled: Boolean, val updatedAt: String? = null)
@@ -409,12 +419,76 @@ class Api(context: Context) {
     }
 
     suspend fun videos(): List<VideoPost> {
-        val array = getArray("videos")
-        return (0 until array.length()).map { i -> array.getJSONObject(i).toVideoPost() }
+        return cachedList("cache.videos", 60_000) { getArray("videos") }
+            .map { i -> i.toVideoPost() }
+    }
+
+    private suspend fun cachedList(key: String, ttlMs: Long, fetch: suspend () -> org.json.JSONArray): List<org.json.JSONObject> {
+        val now = System.currentTimeMillis()
+        val at = prefs.getLong("$key.at", 0L)
+        try {
+            val array = fetch()
+            prefs.edit().putString(key, array.toString()).putLong("$key.at", now).apply()
+            return (0 until array.length()).map { array.getJSONObject(it) }
+        } catch (e: Exception) {
+            // Offline: serve stale cache regardless of age; fresh fetch wins when online.
+            val raw = prefs.getString(key, null) ?: throw e
+            if (raw.isBlank() || (now - at > ttlMs && raw.isBlank())) throw e
+            val array = org.json.JSONArray(raw)
+            return (0 until array.length()).map { array.getJSONObject(it) }
+        }
+    }
+
+    suspend fun statusesCached(): List<StatusUpdate> {
+        return try { statuses() } catch (e: Exception) {
+            val raw = prefs.getString("cache.statuses", null) ?: throw e
+            val array = org.json.JSONArray(raw)
+            (0 until array.length()).map { array.getJSONObject(it).toStatus() }
+        }
     }
 
     suspend fun markVideoViewed(videoId: String) {
         runCatching { postJson("videos/${enc(videoId)}/view", JSONObject()) }
+    }
+
+    suspend fun toggleVideoLike(videoId: String): Pair<Boolean, Int> {
+        val o = postJson("videos/${enc(videoId)}/like", JSONObject())
+        return Pair(o.optBoolean("liked"), o.optInt("likes"))
+    }
+
+    suspend fun toggleVideoSave(videoId: String): Boolean {
+        val o = postJson("videos/${enc(videoId)}/save", JSONObject())
+        return o.optBoolean("saved")
+    }
+
+    suspend fun videoComments(videoId: String): List<VideoComment> {
+        val array = getArray("videos/${enc(videoId)}/comments")
+        return (0 until array.length()).map { array.getJSONObject(it).toVideoComment() }
+    }
+
+    suspend fun postVideoComment(videoId: String, body: String): VideoComment {
+        return postJson("videos/${enc(videoId)}/comments", JSONObject().put("body", body)).toVideoComment()
+    }
+
+    suspend fun deleteVideo(videoId: String) { deleteJson("videos/${enc(videoId)}") }
+
+    suspend fun myVideos(): List<VideoPost> {
+        val array = getArray("me/videos")
+        return (0 until array.length()).map { array.getJSONObject(it).toVideoPost() }
+    }
+
+    suspend fun createChannel(title: String, memberIds: List<String>): String =
+        postJson("conversations/channel", JSONObject().put("title", title).put("memberIds", JSONArray(memberIds))).getString("id")
+
+    suspend fun createCommunity(title: String, memberIds: List<String>): String =
+        postJson("conversations/community", JSONObject().put("title", title).put("memberIds", JSONArray(memberIds))).getString("id")
+
+    suspend fun storeItems(): List<StoreItem> {
+        val array = getArray("store/items")
+        return (0 until array.length()).map { i ->
+            val o = array.getJSONObject(i)
+            StoreItem(o.optString("id"), o.optString("title"), o.optString("description"), o.optLong("price_minor"), o.optString("currency", "UGX"), o.optString("image_url").takeIf { it.isNotBlank() })
+        }
     }
 
     suspend fun uploadVideo(uri: Uri, name: String?, sizeBytes: Long, caption: String): VideoPost = withContext(Dispatchers.IO) {
@@ -696,6 +770,7 @@ class Api(context: Context) {
 
     suspend fun statuses(): List<StatusUpdate> {
         val array = getArray("statuses")
+        runCatching { prefs.edit().putString("cache.statuses", array.toString()).apply() }
         return (0 until array.length()).map { i -> array.getJSONObject(i).toStatus() }
     }
 
@@ -1201,8 +1276,17 @@ private fun JSONObject.toVideoPost(): VideoPost {
         thumbnailUrl = optString("thumbnailUrl").ifBlank { optString("thumbnail_url") }.takeIf { it.isNotBlank() },
         caption = optString("caption"), views = optLong("views"), createdAt = optString("createdAt").ifBlank { optString("created_at") },
         user = User(uId, uName, uUsername, uAvatar),
-        liked = optBoolean("liked"), likes = optInt("likes"), comments = optInt("comments")
+        liked = optBoolean("liked"), likes = optInt("likes"), comments = optInt("comments"), saved = optBoolean("saved")
     )
+}
+
+private fun org.json.JSONObject.toVideoComment(): org.holidaylink.app.net.VideoComment {
+    val u = optJSONObject("user") ?: org.json.JSONObject()
+    val uid = u.optString("id")
+    val nm = u.optString("displayName").ifBlank { u.optString("display_name") }.ifBlank { "HolidayLink user" }
+    val un = u.optString("username").ifBlank { "user" }
+    val av = u.optString("avatarUrl").ifBlank { u.optString("avatar_url") }.takeIf { it.isNotBlank() }
+    return org.holidaylink.app.net.VideoComment(optString("id"), optString("body"), optString("created_at"), org.holidaylink.app.net.User(uid, nm, un, av))
 }
 
 }

@@ -200,10 +200,12 @@ async function runDatabaseMigrations() {
   const featureMigration = await fs.readFile(new URL('database/migrations/002_features.sql', root), 'utf8');
   const authVideoMigration = await fs.readFile(new URL('database/migrations/003_auth_videos.sql', root), 'utf8');
   const e2eeMigration = await fs.readFile(new URL('database/migrations/004_e2ee_and_calls.sql', root), 'utf8');
+  const channelsMigration = await fs.readFile(new URL('database/migrations/005_channels_saves.sql', root), 'utf8');
   await pool.query(schema);
   await pool.query(featureMigration);
   await pool.query(authVideoMigration);
   await pool.query(e2eeMigration);
+  await pool.query(channelsMigration);
   console.log('[db] schema and feature migrations are ready');
 }
 
@@ -736,6 +738,40 @@ app.post('/conversations/group', auth, async (req, res) => {
     client.release();
   }
 });
+
+// Channels (broadcast) + communities (group of groups) reuse conversations/members.
+// Channels: only owner/admin may post (enforced in features.js message send).
+// Communities: behave like groups; members can post.
+async function createCollectionConversation(req, res, kind) {
+  const title = String(req.body.title || '').trim();
+  const memberIds = Array.isArray(req.body.memberIds) ? req.body.memberIds : [];
+  const unique = [...new Set([req.user.sub, ...memberIds.map(String)])];
+  if (!title || unique.length < 1 || unique.length > 500) return res.status(400).json({ error: 'INVALID_TITLE' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const c = await client.query(
+      'INSERT INTO conversations(kind,title,created_by) VALUES($1,$2,$3) RETURNING id',
+      [kind, title, req.user.sub]
+    );
+    for (const id of unique) {
+      await client.query(
+        'INSERT INTO conversation_members(conversation_id,user_id,role) VALUES($1,$2,$3)',
+        [c.rows[0].id, id, id === req.user.sub ? 'owner' : 'member']
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ id: c.rows[0].id });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'CREATE_FAILED' });
+  } finally {
+    client.release();
+  }
+}
+
+app.post('/conversations/channel', auth, async (req, res) => createCollectionConversation(req, res, 'channel'));
+app.post('/conversations/community', auth, async (req, res) => createCollectionConversation(req, res, 'community'));
 
 // Message history, sending and editing live in features.js so attachment and reaction
 // handling stays in one place.

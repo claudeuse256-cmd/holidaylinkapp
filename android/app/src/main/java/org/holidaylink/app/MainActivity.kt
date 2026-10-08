@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -36,6 +37,8 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.AutoStories
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Contacts
@@ -49,10 +52,12 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -117,6 +122,9 @@ import org.holidaylink.app.ui.VideoHubScreen
 import org.holidaylink.app.ui.WebFeatureScreen
 import org.holidaylink.app.ui.HolidayFeature
 import org.holidaylink.app.ui.Avatar
+import org.holidaylink.app.ui.LoadingState
+import org.holidaylink.app.ui.EmptyState
+import org.holidaylink.app.ui.ErrorState
 
 /**
  * FragmentActivity, not ComponentActivity: the app-lock gate and Settings use
@@ -148,6 +156,9 @@ private sealed interface Destination {
     data class PersonProfile(val user: User) : Destination
     data object MyProfile : Destination
     data object NewChat : Destination
+    data object NewGroup : Destination
+    data object NewChannel : Destination
+    data object NewCommunity : Destination
     data object Search : Destination
     data object Notifications : Destination
     data object Settings : Destination
@@ -157,7 +168,8 @@ private sealed interface Destination {
     data class WebFeature(val title: String, val url: String) : Destination
     data object FeatureHub : Destination
     data object Videos : Destination
-    data object Status : Destination
+    data class Status(val startWithComposer: Boolean = false) : Destination
+    data object Store : Destination
 }
 
 /**
@@ -166,22 +178,22 @@ private sealed interface Destination {
  */
 private fun nativeDestinationFor(route: String): Destination = when {
     route == "native:calls" -> Destination.Calls
-    route == "native:status" || route == "status.html" -> Destination.Status
+    route == "native:status" || route == "status.html" -> Destination.Status(false)
     route == "native:videos" || route == "videos.html" -> Destination.Videos
     route == "native:ai" || route == "aihelp.html" -> Destination.Ai
     route == "native:users" -> Destination.Search
     route == "native:chats" -> Destination.Tabs
-    route == "native:store" -> Destination.Settings
+    route == "native:store" -> Destination.Store
     route == "native:invite" -> Destination.NewChat
-    route == "dashboard.html" || route.contains("dashboard") -> Destination.Status
-    route == "feed.html" -> Destination.Status
+    route == "dashboard.html" || route.contains("dashboard") -> Destination.Status(false)
+    route == "feed.html" -> Destination.Status(false)
     route == "events.html" -> Destination.Videos
     route == "quizzes.html" || route == "papers.html" -> Destination.Ai
-    route == "store.html" -> Destination.Settings
+    route == "store.html" -> Destination.Store
     route == "room.html" -> Destination.Tabs
     route == "invite.html" -> Destination.NewChat
     route.startsWith("http") -> Destination.WebFeature("HolidayLink", route)
-    route.endsWith(".html") -> Destination.Status
+    route.endsWith(".html") -> Destination.Status(false)
     else -> Destination.FeatureHub
 }
 
@@ -300,13 +312,17 @@ private fun SignedInApp(
             onAi = { push(Destination.Ai) },
             onOpenDirect = openDirectChat,
             onOpenVideos = { push(Destination.Videos) },
-            onOpenVideoLessons = { push(Destination.Status) },
+            onOpenVideoLessons = { push(Destination.Status(false)) },
             onOpenMenu = { push(Destination.FeatureHub) },
             onOpenFeature = { feature ->
                 push(nativeDestinationFor(feature.route))
             },
             onOpenProfileTab = { push(Destination.MyProfile) },
-            onOpenStatus = { push(Destination.Status) }
+            onOpenStatus = { push(Destination.Status(false)) },
+            onPostStatus = { push(Destination.Status(true)) },
+            onNewGroup = { push(Destination.NewGroup) },
+            onNewChannel = { push(Destination.NewChannel) },
+            onNewCommunity = { push(Destination.NewCommunity) }
         )
 
         is Destination.Chat -> ChatScreen(
@@ -343,6 +359,27 @@ private fun SignedInApp(
             onOpenChat = { push(Destination.Chat(it)) }
         )
 
+        Destination.NewGroup -> NewChatScreen(
+            api = api,
+            onBack = pop,
+            onOpenChat = { push(Destination.Chat(it)) },
+            initialMode = org.holidaylink.app.ui.NewChatMode.GROUP
+        )
+
+        Destination.NewChannel -> NewChatScreen(
+            api = api,
+            onBack = pop,
+            onOpenChat = { push(Destination.Chat(it)) },
+            initialMode = org.holidaylink.app.ui.NewChatMode.CHANNEL
+        )
+
+        Destination.NewCommunity -> NewChatScreen(
+            api = api,
+            onBack = pop,
+            onOpenChat = { push(Destination.Chat(it)) },
+            initialMode = org.holidaylink.app.ui.NewChatMode.COMMUNITY
+        )
+
         // Search results are already scoped to the signed-in user, so they open in place.
         Destination.Search -> SearchScreen(
             api = api,
@@ -377,10 +414,12 @@ private fun SignedInApp(
             api = api,
             onBack = pop,
             onOpenProfile = { push(Destination.PersonProfile(it)) },
-            onOpenLessons = { push(Destination.Status) }
+            onOpenLessons = { push(Destination.Status(false)) }
         )
 
-        Destination.Status -> StatusScreen(api = api, me = me)
+        Destination.Store -> org.holidaylink.app.ui.StoreScreen(api = api, onBack = pop)
+
+        is Destination.Status -> StatusScreen(api = api, me = me, startWithComposer = current.startWithComposer)
 
         is Destination.WebFeature -> WebFeatureScreen(
             url = current.url,
@@ -499,7 +538,11 @@ private fun TabShell(
     onOpenMenu: () -> Unit,
     onOpenFeature: (HolidayFeature) -> Unit,
     onOpenProfileTab: () -> Unit,
-    onOpenStatus: () -> Unit = {}
+    onOpenStatus: () -> Unit = {},
+    onPostStatus: () -> Unit = {},
+    onNewGroup: () -> Unit = {},
+    onNewChannel: () -> Unit = {},
+    onNewCommunity: () -> Unit = {}
 ) {
     val notificationPermission = rememberNotificationPermissionState()
     val glassBlue = Color(0xFF0B5CFF)
@@ -510,6 +553,7 @@ private fun TabShell(
     val pageBg = Brush.verticalGradient(
         listOf(scheme.background, scheme.surfaceContainerLow, scheme.background)
     )
+    var fabOpen by remember { mutableStateOf(false) }
 
     Scaffold(
         containerColor = scheme.background,
@@ -517,17 +561,26 @@ private fun TabShell(
             GlassBottomBar(tab = tab, onTab = onTab, onVideos = onOpenVideos, onMenu = onOpenMenu, onSettings = onSettings)
         },
         floatingActionButton = {
-            if (tab == Tab.Chats || tab == Tab.Users) {
+            // Telegram-style: + opens New chat / New group / New channel / New community.
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (fabOpen) {
+                    TelegramFabOption("New chat", Icons.Default.Chat) { fabOpen = false; onNewChat() }
+                    TelegramFabOption("New group", Icons.Default.Groups) { fabOpen = false; onNewGroup() }
+                    TelegramFabOption("New channel", Icons.Default.Campaign) { fabOpen = false; onNewChannel() }
+                    TelegramFabOption("Community", Icons.Default.Groups) { fabOpen = false; onNewCommunity() }
+                    if (tab == Tab.Videos) TelegramFabOption("Post video", Icons.Default.VideoLibrary) { fabOpen = false; onOpenVideos() }
+                    TelegramFabOption("Post status", Icons.Default.AutoStories) { fabOpen = false; onPostStatus() }
+                }
                 Box(
                     Modifier
                         .size(72.dp)
                         .clip(CircleShape)
                         .background(Brush.radialGradient(listOf(glassCyan.copy(alpha=.95f), glassBlue, glassPurple)))
                         .border(1.5.dp, glassCyan.copy(alpha=.8f), CircleShape)
-                        .clickable { onNewChat() },
+                        .clickable { fabOpen = !fabOpen },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Default.Add, "Start a new chat", tint = Color.White, modifier = Modifier.size(38.dp))
+                    Icon(if (fabOpen) Icons.Default.Close else Icons.Default.Add, "Create", tint = Color.White, modifier = Modifier.size(38.dp))
                 }
             }
         }
@@ -552,7 +605,8 @@ private fun TabShell(
             GlassStatusRow(
                 api = api,
                 me = me,
-                onOpenStatus = onOpenStatus
+                onOpenStatus = onOpenStatus,
+                onPostStatus = onPostStatus
             )
 
             GlassSearchBar(onClick = onSearch)
@@ -570,7 +624,13 @@ private fun TabShell(
                         onOpenChat = onOpenDirect,
                         onOpenProfile = onOpenProfile
                     )
-                    Tab.Channels -> ChannelsGlassScreen(onOpenFeature = onOpenFeature)
+                    Tab.Channels -> ChannelsScreen(
+                        api = api,
+                        onOpenChat = onOpenChat,
+                        onNewChannel = onNewChannel,
+                        onNewGroup = onNewGroup,
+                        onNewCommunity = onNewCommunity
+                    )
                     Tab.Settings -> SettingsHub(
                         api = api,
                         me = me,
@@ -637,11 +697,24 @@ private fun GlassCircleButton(icon: androidx.compose.ui.graphics.vector.ImageVec
 }
 
 @Composable
-private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit) {
+private fun TelegramFabOption(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Row(
+        Modifier.clip(RoundedCornerShape(24.dp)).background(scheme.surfaceContainerHigh.copy(alpha = 0.96f))
+            .border(1.dp, scheme.outlineVariant, RoundedCornerShape(24.dp)).clickable { onClick() }.padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = scheme.primary, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(8.dp)); Text(label, color = scheme.onSurface, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostStatus: () -> Unit = onOpenStatus) {
     val scheme = MaterialTheme.colorScheme
     var statuses by remember { mutableStateOf<List<org.holidaylink.app.net.StatusUpdate>>(emptyList()) }
     var postTick by remember { mutableStateOf(0) }
-    LaunchedEffect(postTick) { runCatching { statuses = api.statuses() } }
+    LaunchedEffect(postTick) { runCatching { api.statuses() } }
     val people = statuses.distinctBy { it.userId }.take(12)
     LazyRow(
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp),
@@ -649,7 +722,7 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit) {
         horizontalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onOpenStatus() }) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onPostStatus() }) {
                 Box(Modifier.size(64.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF7A2CFF)))).padding(3.dp), contentAlignment = Alignment.Center) {
                     Box(Modifier.fillMaxSize().clip(CircleShape).background(scheme.surfaceContainerHigh), contentAlignment = Alignment.Center) { Icon(Icons.Default.Add, "Your status", tint = scheme.primary, modifier = Modifier.size(30.dp)) }
                 }
@@ -719,29 +792,66 @@ private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onVideos: () -> Unit,
 }
 
 @Composable
-private fun ChannelsGlassScreen(onOpenFeature: (HolidayFeature) -> Unit) {
+private fun ChannelsScreen(
+    api: Api,
+    onOpenChat: (ChatItem) -> Unit,
+    onNewChannel: () -> Unit,
+    onNewGroup: () -> Unit,
+    onNewCommunity: () -> Unit
+) {
     val scheme = MaterialTheme.colorScheme
-    val channelFeatures = listOf(
-        "Home Feed" to "Announcements and HolidayLink updates",
-        "Daily Feed" to "Entertainment and student updates",
-        "Events" to "Discover HolidayLink events",
-        "Video Lessons" to "Educational broadcasts and lessons"
-    )
-    Column(Modifier.fillMaxSize().padding(18.dp)) {
+    var chats by remember { mutableStateOf<List<ChatItem>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf("") }
+    var reload by remember { mutableStateOf(0) }
+    var filter by remember { mutableStateOf("All") }
+    LaunchedEffect(reload) {
+        loading = chats.isEmpty()
+        try { chats = api.conversations(); error = "" } catch (e: Exception) { error = (e as? ApiException)?.message ?: "Couldn't load." }
+        loading = false
+    }
+    val groups = chats.filter { it.kind == "group" }
+    val channels = chats.filter { it.kind == "channel" }
+    val communities = chats.filter { it.kind == "community" }
+    val shown = when (filter) {
+        "Channels" -> channels
+        "Groups" -> groups
+        "Communities" -> communities
+        else -> channels + communities + groups
+    }
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Channels", color = scheme.onBackground, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-        Text("Follow public HolidayLink channels", color = scheme.onSurfaceVariant, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp, bottom = 14.dp))
-        channelFeatures.forEach { (title, subtitle) ->
-            Row(Modifier.fillMaxWidth().padding(vertical = 7.dp).clip(RoundedCornerShape(22.dp)).background(scheme.surfaceContainerHigh.copy(alpha = 0.9f)).border(1.dp, scheme.outlineVariant, RoundedCornerShape(22.dp)).clickable {
-                val feature = when(title) {
-                    "Events" -> HolidayFeature(title, subtitle, Icons.Default.Campaign, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:videos")
-                    "Video Lessons" -> HolidayFeature(title, subtitle, Icons.Default.VideoLibrary, listOf(Color(0xFF06B6D4), Color(0xFF7C3AED)), "native:videos")
-                    "Daily Feed" -> HolidayFeature(title, subtitle, Icons.Default.Campaign, listOf(Color(0xFFEC4899), Color(0xFF8B5CF6)), "native:status")
-                    else -> HolidayFeature(title, subtitle, Icons.Default.Campaign, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:status")
+        Text("Broadcast channels, groups and communities — same Postgres, WhatsApp/Telegram style", color = scheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp, bottom = 10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("All", "Channels", "Groups", "Communities").forEach { f ->
+                FilterChip(selected = filter == f, onClick = { filter = f }, label = { Text(f) })
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onNewChannel, modifier = Modifier.weight(1f)) { Text("New channel") }
+            OutlinedButton(onClick = onNewGroup, modifier = Modifier.weight(1f)) { Text("New group") }
+            OutlinedButton(onClick = onNewCommunity, modifier = Modifier.weight(1f)) { Text("Community") }
+        }
+        Spacer(Modifier.height(10.dp))
+        when {
+            loading -> LoadingState(label = "Loading channels…")
+            error.isNotBlank() && chats.isEmpty() -> ErrorState(error) { reload++ }
+            shown.isEmpty() -> EmptyState(icon = Icons.Default.Campaign, title = "Nothing here yet", subtitle = "Create the first $filter to get started.", action = { Button(onClick = onNewChannel) { Text("Create") } })
+            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(shown, key = { it.id }) { chat ->
+                    val badge = when (chat.kind) { "channel" -> "CHANNEL"; "community" -> "COMMUNITY"; else -> "GROUP" }
+                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(scheme.surfaceContainerHigh).border(1.dp, scheme.outlineVariant, RoundedCornerShape(18.dp)).clickable { onOpenChat(chat) }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(48.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF7A2CFF)))), contentAlignment = Alignment.Center) {
+                            Icon(when (chat.kind) { "channel" -> Icons.Default.Campaign; "community" -> Icons.Default.Groups; else -> Icons.Default.Group }, null, tint = Color.White)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(chat.title ?: chat.peer?.displayName ?: badge, fontWeight = FontWeight.Bold, color = scheme.onSurface)
+                            Text("$badge • ${chat.lastBody?.take(60) ?: "No messages yet"}", fontSize = 12.sp, color = scheme.onSurfaceVariant, maxLines = 1)
+                        }
+                    }
                 }
-                onOpenFeature(feature)
-            }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(50.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF7A2CFF)))), contentAlignment = Alignment.Center) { Icon(Icons.Default.Campaign, null, tint = Color.White) }
-                Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) { Text(title, color = scheme.onSurface, fontWeight = FontWeight.Bold); Text(subtitle, color = scheme.onSurfaceVariant, fontSize = 12.sp) }
             }
         }
     }

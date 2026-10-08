@@ -97,7 +97,8 @@ export function registerFeatures(app, ctx) {
                 u.display_name,u.username,u.avatar_url,
                 EXISTS(SELECT 1 FROM video_likes l WHERE l.video_id=v.id AND l.user_id=$1) AS liked,
                 (SELECT COUNT(*)::int FROM video_likes l2 WHERE l2.video_id=v.id) AS likes,
-                (SELECT COUNT(*)::int FROM video_comments c WHERE c.video_id=v.id) AS comments
+                (SELECT COUNT(*)::int FROM video_comments c WHERE c.video_id=v.id) AS comments,
+                EXISTS(SELECT 1 FROM video_saves s WHERE s.video_id=v.id AND s.user_id=$1) AS saved
          FROM videos v JOIN users u ON u.id=v.user_id
          ORDER BY v.created_at DESC LIMIT $2 OFFSET $3`,
         [req.user.sub, limit, offset]
@@ -106,7 +107,7 @@ export function registerFeatures(app, ctx) {
         id: row.id, userId: row.user_id, videoUrl: row.video_url, thumbnailUrl: row.thumbnail_url,
         caption: row.caption, views: Number(row.views || 0), createdAt: row.created_at,
         user: { id: row.user_id, displayName: row.display_name, username: row.username, avatarUrl: row.avatar_url },
-        liked: Boolean(row.liked), likes: Number(row.likes || 0), comments: Number(row.comments || 0)
+        liked: Boolean(row.liked), likes: Number(row.likes || 0), comments: Number(row.comments || 0), saved: Boolean(row.saved)
       })));
     } catch (err) { return fail(res, err, 'videos'); }
   });
@@ -190,6 +191,109 @@ export function registerFeatures(app, ctx) {
       if (!r.rowCount) return res.status(404).json({ error: 'VIDEO_NOT_FOUND' });
       res.json({ ok: true, views: Number(r.rows[0].views) });
     } catch (err) { return fail(res, err, 'view-video'); }
+  });
+
+  // Like toggle (heart). Favorites are separate bookmarks via /save.
+  app.post('/videos/:id/like', auth, async (req, res) => {
+    try {
+      const existing = await db('SELECT 1 FROM video_likes WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
+      let liked;
+      if (existing.rowCount) {
+        await db('DELETE FROM video_likes WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
+        liked = false;
+      } else {
+        await db('INSERT INTO video_likes(video_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [req.params.id, req.user.sub]);
+        liked = true;
+      }
+      const c = await db('SELECT COUNT(*)::int AS total FROM video_likes WHERE video_id=$1', [req.params.id]);
+      res.json({ ok: true, liked, likes: Number(c.rows[0]?.total || 0) });
+    } catch (err) { return fail(res, err, 'like-video'); }
+  });
+
+  // Favorite toggle (bookmark). Stored in video_saves, independent of likes.
+  app.post('/videos/:id/save', auth, async (req, res) => {
+    try {
+      const existing = await db('SELECT 1 FROM video_saves WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
+      let saved;
+      if (existing.rowCount) {
+        await db('DELETE FROM video_saves WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
+        saved = false;
+      } else {
+        await db('INSERT INTO video_saves(video_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [req.params.id, req.user.sub]);
+        saved = true;
+      }
+      res.json({ ok: true, saved });
+    } catch (err) { return fail(res, err, 'save-video'); }
+  });
+
+  app.get('/videos/:id/comments', auth, async (req, res) => {
+    try {
+      const r = await db(
+        `SELECT c.id,c.body,c.created_at,u.id AS user_id,u.display_name,u.username,u.avatar_url
+         FROM video_comments c JOIN users u ON u.id=c.user_id
+         WHERE c.video_id=$1 ORDER BY c.created_at ASC LIMIT 200`,
+        [req.params.id]
+      );
+      res.json(r.rows.map(row => ({
+        id: row.id, body: row.body, created_at: row.created_at,
+        user: { id: row.user_id, display_name: row.display_name, username: row.username, avatar_url: row.avatar_url }
+      })));
+    } catch (err) { return fail(res, err, 'video-comments'); }
+  });
+
+  app.post('/videos/:id/comments', auth, async (req, res) => {
+    try {
+      const body = String(req.body.body || '').trim().slice(0, 1000);
+      if (!body) return res.status(400).json({ error: 'INVALID_COMMENT', message: 'Write a comment first.' });
+      const v = await db('SELECT 1 FROM videos WHERE id=$1', [req.params.id]);
+      if (!v.rowCount) return res.status(404).json({ error: 'VIDEO_NOT_FOUND' });
+      const r = await db(
+        'INSERT INTO video_comments(video_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at',
+        [req.params.id, req.user.sub, body]
+      );
+      const me = await db('SELECT id,display_name,username,avatar_url FROM users WHERE id=$1', [req.user.sub]);
+      const u = me.rows[0] || {};
+      res.status(201).json({ ...r.rows[0], user: { id: u.id, display_name: u.display_name, username: u.username, avatar_url: u.avatar_url } });
+    } catch (err) { return fail(res, err, 'post-video-comment'); }
+  });
+
+  // Owner deletes their video (file + row cascade likes/comments/saves).
+  app.delete('/videos/:id', auth, async (req, res) => {
+    try {
+      const r = await db('SELECT user_id,video_url FROM videos WHERE id=$1', [req.params.id]);
+      if (!r.rowCount) return res.status(404).json({ error: 'VIDEO_NOT_FOUND' });
+      if (r.rows[0].user_id !== req.user.sub) return res.status(403).json({ error: 'NOT_OWNER', message: 'Only the creator can delete this video.' });
+      await db('DELETE FROM videos WHERE id=$1', [req.params.id]);
+      try {
+        const name = String(r.rows[0].video_url || '').split('/uploads/')[1];
+        if (name) fs.unlinkSync(path.join(UPLOAD_DIR, name));
+      } catch {}
+      res.json({ ok: true });
+    } catch (err) { return fail(res, err, 'delete-video'); }
+  });
+
+  // Manage screen: my uploads with progress counters.
+  app.get('/me/videos', auth, async (req, res) => {
+    try {
+      const r = await db(
+        `SELECT v.id,v.user_id,v.video_url,v.caption,v.views,v.created_at,
+                (SELECT COUNT(*)::int FROM video_likes l WHERE l.video_id=v.id) AS likes,
+                (SELECT COUNT(*)::int FROM video_comments c WHERE c.video_id=v.id) AS comments,
+                EXISTS(SELECT 1 FROM video_likes l2 WHERE l2.video_id=v.id AND l2.user_id=$1) AS liked,
+                EXISTS(SELECT 1 FROM video_saves s WHERE s.video_id=v.id AND s.user_id=$1) AS saved
+         FROM videos v WHERE v.user_id=$1 ORDER BY v.created_at DESC LIMIT 200`,
+        [req.user.sub]
+      );
+      const me = await db('SELECT id,display_name,username,avatar_url FROM users WHERE id=$1', [req.user.sub]);
+      const u = me.rows[0] || {};
+      res.json(r.rows.map(row => ({
+        id: row.id, user_id: row.user_id, video_url: row.video_url, videoUrl: row.video_url,
+        caption: row.caption, views: Number(row.views || 0), created_at: row.created_at,
+        likes: Number(row.likes || 0), comments: Number(row.comments || 0),
+        liked: Boolean(row.liked), saved: Boolean(row.saved),
+        user: { id: u.id, display_name: u.display_name, username: u.username, avatar_url: u.avatar_url }
+      })));
+    } catch (err) { return fail(res, err, 'my-videos'); }
   });
 
 
@@ -843,6 +947,11 @@ export function registerFeatures(app, ctx) {
           error: 'NOT_MEMBER',
           message: "You're no longer part of this chat."
         });
+      }
+      // Channels are broadcast: only owner/admin may post, members read.
+      const conv = await db('SELECT kind FROM conversations WHERE id=$1', [conversationId]);
+      if (conv.rowCount && conv.rows[0].kind === 'channel' && !['owner', 'admin'].includes(role)) {
+        return res.status(403).json({ error: 'CHANNEL_READ_ONLY', message: 'Only channel admins can post.' });
       }
 
       // A block stops messages in both directions, including in a chat that already exists.

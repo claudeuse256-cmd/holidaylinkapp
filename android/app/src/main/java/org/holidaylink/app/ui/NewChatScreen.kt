@@ -52,24 +52,25 @@ import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.User
 
-private enum class NewChatMode { DIRECT, GROUP }
+enum class NewChatMode { DIRECT, GROUP, CHANNEL, COMMUNITY }
 
 /**
  * "New chat" picker.
  *
  * Direct mode opens an existing one-to-one conversation (or creates it server-side).
- * Group mode creates a new group with the ticked members.
+ * Group / channel / community modes create that kind with ticked members.
  */
 @Composable
 fun NewChatScreen(
     api: Api,
     onBack: () -> Unit,
-    onOpenChat: (ChatItem) -> Unit
+    onOpenChat: (ChatItem) -> Unit,
+    initialMode: NewChatMode = NewChatMode.DIRECT
 ) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
 
-    var mode by remember { mutableStateOf(NewChatMode.DIRECT) }
+    var mode by remember(initialMode) { mutableStateOf(initialMode) }
     var query by remember { mutableStateOf("") }
     var users by remember { mutableStateOf<List<User>>(emptyList()) }
     var selected by remember { mutableStateOf(setOf<String>()) }
@@ -125,24 +126,34 @@ fun NewChatScreen(
                     label = { Text("Group") },
                     leadingIcon = { Icon(Icons.Default.Group, null, Modifier.size(18.dp)) }
                 )
+                FilterChip(
+                    selected = mode == NewChatMode.CHANNEL,
+                    onClick = { mode = NewChatMode.CHANNEL },
+                    label = { Text("Channel") }
+                )
+                FilterChip(
+                    selected = mode == NewChatMode.COMMUNITY,
+                    onClick = { mode = NewChatMode.COMMUNITY },
+                    label = { Text("Community") }
+                )
             }
 
             OutlinedTextField(
-                value = if (mode == NewChatMode.GROUP) title else query,
+                value = if (mode == NewChatMode.DIRECT) query else title,
                 onValueChange = {
-                    if (mode == NewChatMode.GROUP) title = it.take(60) else query = it
+                    if (mode == NewChatMode.DIRECT) query = it else title = it.take(60)
                 },
                 singleLine = true,
                 shape = RoundedCornerShape(26.dp),
                 label = {
-                    Text(if (mode == NewChatMode.GROUP) "Group name" else "Search people")
+                    Text(if (mode == NewChatMode.DIRECT) "Search people" else "Name your ${mode.name.lowercase()}")
                 },
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 6.dp)
             )
 
-            if (mode == NewChatMode.GROUP && selected.isNotEmpty()) {
+            if ((mode == NewChatMode.GROUP || mode == NewChatMode.CHANNEL || mode == NewChatMode.COMMUNITY) && selected.isNotEmpty()) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -208,7 +219,7 @@ fun NewChatScreen(
                                             }
                                         }
 
-                                        NewChatMode.GROUP -> {
+                                        NewChatMode.GROUP, NewChatMode.CHANNEL, NewChatMode.COMMUNITY -> {
                                             selected = if (checked) selected - user.id
                                             else selected + user.id
                                         }
@@ -232,7 +243,7 @@ fun NewChatScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                            if (mode == NewChatMode.GROUP) {
+                            if (mode == NewChatMode.GROUP || mode == NewChatMode.CHANNEL || mode == NewChatMode.COMMUNITY) {
                                 Checkbox(
                                     checked = checked,
                                     onCheckedChange = {
@@ -253,23 +264,30 @@ fun NewChatScreen(
                 }
             }
 
-            if (mode == NewChatMode.GROUP) {
+            if (mode == NewChatMode.GROUP || mode == NewChatMode.CHANNEL || mode == NewChatMode.COMMUNITY) {
+                val kindLabel = when (mode) { NewChatMode.CHANNEL -> "channel"; NewChatMode.COMMUNITY -> "community"; else -> "group" }
                 TextButton(
                     onClick = {
                         if (busy) return@TextButton
                         if (title.isBlank() || selected.isEmpty()) return@TextButton
                         busy = true
                         scope.launch {
-                            runCatching { api.createGroup(title.trim(), selected.toList()) }
+                            runCatching {
+                                when (mode) {
+                                    NewChatMode.CHANNEL -> api.createChannel(title.trim(), selected.toList())
+                                    NewChatMode.COMMUNITY -> api.createCommunity(title.trim(), selected.toList())
+                                    else -> api.createGroup(title.trim(), selected.toList())
+                                }
+                            }
                                 .onSuccess { id ->
                                     busy = false
-                                    onOpenChat(ChatItem(id, "group", title.trim(), null, null, null))
+                                    onOpenChat(ChatItem(id, kindLabel, title.trim(), null, null, null))
                                 }
                                 .onFailure { e ->
                                     busy = false
                                     snackbar.showSnackbar(
                                         (e as? ApiException)?.message
-                                            ?: "We couldn't create that group."
+                                            ?: "We couldn't create that $kindLabel."
                                     )
                                 }
                         }
@@ -279,7 +297,7 @@ fun NewChatScreen(
                         .fillMaxWidth()
                         .padding(16.dp)
                 ) {
-                    Text(if (busy) "Creating…" else "Create group")
+                    Text(if (busy) "Creating…" else "Create $kindLabel")
                 }
             }
         }
