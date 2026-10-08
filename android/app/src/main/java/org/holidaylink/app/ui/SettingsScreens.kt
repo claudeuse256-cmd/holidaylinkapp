@@ -284,10 +284,6 @@ fun SettingsHub(
             )
         }
         Spacer(Modifier.height(30.dp))
-
-        if (testing) {
-            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-        }
     }
 
     if (confirmLogout) {
