@@ -131,7 +131,7 @@ private fun AiThread(
                             messages = h
                         }
                     }
-                    is StudyBuddy.AiAction.OpenPage -> onOpenPage(action.page, action.presearch),
+                    is StudyBuddy.AiAction.OpenPage -> onOpenPage(action.page, action.presearch)
                     is StudyBuddy.AiAction.ClearHistory -> {
                         messages = emptyList()
                     }
