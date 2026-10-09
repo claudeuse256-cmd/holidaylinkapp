@@ -25,12 +25,16 @@ class VoiceRecorder(private val context: Context) {
     private var recorder: MediaRecorder? = null
     private var outputFile: File? = null
     private var startedAt = 0L
+    private var pausedTotalMs = 0L
+    private var pausedAtMs = 0L
     private val amplitudes = ArrayList<Int>()
 
     val isRecording: Boolean get() = recorder != null
+    var paused: Boolean = false
+        private set
 
-    /** Maximum length enforced so a forgotten recording cannot run forever. */
-    private val maxDurationMs = 120_000L
+    /** Maximum length: 60s keeps the Firestore blob under the 1 MiB document limit. */
+    private val maxDurationMs = 60_000L
 
     fun start(): Boolean {
         if (recorder != null) return true
@@ -56,6 +60,9 @@ class VoiceRecorder(private val context: Context) {
             recorder = instance
             outputFile = file
             startedAt = System.currentTimeMillis()
+            pausedTotalMs = 0L
+            pausedAtMs = 0L
+            paused = false
             amplitudes.clear()
             true
         } catch (e: Exception) {
@@ -85,13 +92,40 @@ class VoiceRecorder(private val context: Context) {
     fun isOvertime(): Boolean =
         recorder != null && System.currentTimeMillis() - startedAt > maxDurationMs
 
+    /** Pause/resume mid-recording (WhatsApp-style). API 24+, minSdk is 26. */
+    fun setPaused(pause: Boolean): Boolean {
+        val active = recorder ?: return false
+        return try {
+            if (pause) {
+                active.pause()
+                pausedAtMs = System.currentTimeMillis()
+            } else {
+                active.resume()
+                pausedTotalMs += System.currentTimeMillis() - pausedAtMs
+            }
+            paused = pause
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "could not pause recording: ${e.message}")
+            false
+        }
+    }
+
+    /** Elapsed recording time excluding pauses. */
+    fun elapsedMs(): Long =
+        if (recorder == null) 0L
+        else System.currentTimeMillis() - startedAt - pausedTotalMs -
+            (if (paused) System.currentTimeMillis() - pausedAtMs else 0L)
+
     fun stop(): VoiceClip? {
         val active = recorder ?: return null
         val file = outputFile
-        val duration = System.currentTimeMillis() - startedAt
+        val duration = elapsedMs()
         recorder = null
         outputFile = null
         startedAt = 0L
+        pausedTotalMs = 0L
+        paused = false
         return try {
             active.stop()
             active.release()

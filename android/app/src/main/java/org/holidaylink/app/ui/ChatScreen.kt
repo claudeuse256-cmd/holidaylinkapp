@@ -10,6 +10,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.tryAwaitRelease
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -93,6 +96,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -166,6 +170,10 @@ fun ChatScreen(
     var recorder by remember { mutableStateOf<VoiceRecorder?>(null) }
     var recordingMs by remember { mutableStateOf(0L) }
     var amplitude by remember { mutableIntStateOf(0) }
+    var recLocked by remember { mutableStateOf(false) }
+    var recPaused by remember { mutableStateOf(false) }
+    var voiceListenOnce by remember { mutableStateOf(false) }
+    var holding by remember { mutableStateOf(false) }
 
     val title = peerUser?.displayName?.takeIf { it.isNotBlank() }
         ?: chat.peer?.displayName?.takeIf { it.isNotBlank() }
@@ -306,31 +314,57 @@ fun ChatScreen(
     }
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
+            beginRecording(locked = true)
+        }
+    }
+
+    fun beginRecording(locked: Boolean) {
+        if (hasMicPermission(context)) {
             val instance = VoiceRecorder(context)
-            if (instance.start()) recorder = instance
-            else scope.launch { snackbar.showSnackbar("The microphone is unavailable right now.") }
+            if (instance.start()) {
+                recorder = instance
+                recordingMs = 0L
+                recLocked = locked
+                recPaused = false
+            } else {
+                scope.launch { snackbar.showSnackbar("The microphone is unavailable right now.") }
+            }
+        } else {
+            micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
         }
     }
 
     fun finishRecording(sendIt: Boolean) {
         val active = recorder ?: return
         recorder = null
-        val clip = active.stop() ?: return
-        if (!sendIt) {
-            runCatching { clip.file.delete() }
+        recLocked = false
+        recPaused = false
+        val clip = active.stop()
+        if (!sendIt || clip == null) {
+            if (clip != null) runCatching { clip.file.delete() }
             return
         }
+        val reply = replyingTo
         uploading = true
         scope.launch {
             try {
                 val bytes = clip.file.readBytes()
-                val path = "chat_voice/${chat.id}/${UUID.randomUUID()}.m4a"
-                val ref = com.google.firebase.storage.FirebaseStorage.getInstance().getReference(path)
-                ref.putBytes(bytes).await()
-                val url = ref.downloadUrl.await().toString()
-                FirestoreChat.send(chat.id, "", fileUrl = url, fileName = "Voice message", kind = "voice", durationMs = clip.durationMs)
+                if (bytes.size > 900_000) throw ApiException("Voice note too long (60s max).")
+                val blob = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                FirestoreChat.send(
+                    chat.id, "",
+                    fileName = "Voice message (${formatDuration(clip.durationMs)})",
+                    kind = "voice",
+                    durationMs = clip.durationMs,
+                    audioBlob = blob,
+                    viewOnce = voiceListenOnce,
+                    ttlSeconds = selfDestructSecs,
+                    replyToId = reply?.id,
+                    replyToBody = reply?.text?.take(120)?.ifBlank { "[photo]" }
+                )
+                replyingTo = null
             } catch (e: Exception) {
-                snackbar.showSnackbar("Voice message not sent.")
+                snackbar.showSnackbar((e as? ApiException)?.message ?: "Voice message not sent.")
             } finally {
                 uploading = false
                 runCatching { clip.file.delete() }
@@ -342,9 +376,11 @@ fun ChatScreen(
         while (recorder != null) {
             delay(120)
             val active = recorder ?: break
-            active.sample()
-            amplitude = active.amplitude()
-            recordingMs += 120
+            if (!active.paused) {
+                active.sample()
+                amplitude = active.amplitude()
+                recordingMs = active.elapsedMs()
+            }
             if (active.isOvertime()) {
                 finishRecording(sendIt = true)
                 break
@@ -436,22 +472,31 @@ fun ChatScreen(
                     recording = recorder != null,
                     recordingMs = recordingMs,
                     amplitude = amplitude,
+                    recLocked = recLocked,
+                    recPaused = recorder?.paused == true,
+                    listenOnce = voiceListenOnce,
+                    onListenOnceChange = { voiceListenOnce = it },
                     onAttach = { showAttach = true },
                     onEmoji = { showEmoji = !showEmoji },
                     onSend = { send() },
-                    onStartRecording = {
-                        if (hasMicPermission(context)) {
-                            val instance = VoiceRecorder(context)
-                            if (instance.start()) {
-                                recorder = instance
-                                recordingMs = 0L
-                            }
-                        } else {
-                            micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                    onStartRecording = { beginRecording(locked = true); holding = false },
+                    onHoldRecording = { beginRecording(locked = false); holding = true },
+                    onStopRecording = { finishRecording(sendIt = true) },
+                    onCancelRecording = { finishRecording(sendIt = false) },
+                    onTogglePause = {
+                        recorder?.let {
+                            if (it.setPaused(!it.paused)) recPaused = it.paused
                         }
                     },
-                    onStopRecording = { finishRecording(sendIt = true) },
-                    onCancelRecording = { finishRecording(sendIt = false) }
+                    onLockRecording = { recLocked = true },
+                    onReleaseHold = {
+                        if (holding && recorder != null && !recLocked) {
+                            holding = false
+                            finishRecording(sendIt = true)
+                        } else {
+                            holding = false
+                        }
+                    }
                 )
             }
         }
@@ -495,6 +540,11 @@ fun ChatScreen(
     val sheetMsg = sheetFor
     if (sheetMsg != null) {
         val mine = sheetMsg.senderId == uid
+        // WhatsApp rule: text messages editable within 2 minutes of sending.
+        val editable = mine && sheetMsg.type == "text" && runCatching {
+            val created = sheetMsg.createdAt?.seconds ?: 0
+            (System.currentTimeMillis() / 1000 - created) < 120
+        }.getOrDefault(false)
         ModalBottomSheet(
             onDismissRequest = { sheetFor = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -510,11 +560,13 @@ fun ChatScreen(
                         replyingTo = sheetMsg
                         sheetFor = null
                     })
-                    SheetAction("Edit", Icons.Default.Edit, {
-                        editingId = sheetMsg.id
-                        draft = sheetMsg.text
-                        sheetFor = null
-                    })
+                    if (editable) {
+                        SheetAction("Edit", Icons.Default.Edit, {
+                            editingId = sheetMsg.id
+                            draft = sheetMsg.text
+                            sheetFor = null
+                        })
+                    }
                     SheetAction("Delete", Icons.Default.Delete, {
                         scope.launch {
                             runCatching { FirestoreChat.deleteMessage(chat.id, sheetMsg.id) }
@@ -584,6 +636,8 @@ fun ChatScreen(
         SecureViewOnceDialog(
             imageUrl = onceTarget.imageUrl,
             fileUrl = onceTarget.fileUrl,
+            audioBlob = onceTarget.audioBlob,
+            audioId = onceTarget.id,
             onClose = {
                 viewOnceTarget = null
                 scope.launch {
@@ -698,8 +752,18 @@ private fun FsMessageBubble(
                         }
                     }
                 }
-                if (message.viewOnce && (message.imageUrl != null || message.fileUrl != null)) {
+                if (message.viewOnce && (message.imageUrl != null || message.fileUrl != null || message.audioBlob != null)) {
                     ViewOnceRow(mine = mine, onOpen = { onOpenViewOnce(message) })
+                } else if (message.audioBlob != null) {
+                    BlobVoicePlayer(
+                        messageId = message.id,
+                        blob = message.audioBlob,
+                        name = message.fileName ?: "Voice message (${formatDuration(message.durationMs ?: 0L)})"
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    if (message.text.isNotBlank()) {
+                        Text(message.text, style = MaterialTheme.typography.bodyMedium, color = textColor)
+                    }
                 } else {
                     message.imageUrl?.let { url ->
                         RemoteImage(
@@ -729,6 +793,14 @@ private fun FsMessageBubble(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            if (message.edited) {
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    "edited",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                )
+            }
             if (message.expiresAt != null) {
                 Spacer(Modifier.width(4.dp))
                 Icon(Icons.Default.Timer, "Self-destructs", Modifier.size(12.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -744,10 +816,6 @@ private fun FsMessageBubble(
 
 @Composable
 private fun FsFileRow(name: String, kind: String, url: String) {
-    if (kind == "voice") {
-        VoicePlayer(url = url, name = name)
-        return
-    }
     val context = LocalContext.current
     Row(
         Modifier.fillMaxWidth()
@@ -771,14 +839,42 @@ private fun FsFileRow(name: String, kind: String, url: String) {
 }
 
 @Composable
-private fun VoicePlayer(url: String, name: String) {
+private fun BlobVoicePlayer(messageId: String, blob: String, name: String) {
     val context = LocalContext.current
-    var playing by remember(url) { mutableStateOf(false) }
-    var progress by remember(url) { mutableFloatStateOf(0f) }
-    var duration by remember(url) { mutableIntStateOf(0) }
-    var position by remember(url) { mutableIntStateOf(0) }
-    val player = remember(url) { android.media.MediaPlayer() }
-    DisposableEffect(url) {
+    // Decoded once into the app cache: the note stays on this phone for replay.
+    val filePath = remember(messageId, blob.length) {
+        runCatching {
+            val dir = java.io.File(context.cacheDir, "voice").apply { mkdirs() }
+            val file = java.io.File(dir, "msg-$messageId.m4a")
+            if (!file.exists() || file.length() == 0L) {
+                val bytes = android.util.Base64.decode(blob, android.util.Base64.DEFAULT)
+                file.writeBytes(bytes)
+            }
+            file.absolutePath
+        }.getOrNull()
+    }
+    if (filePath == null) {
+        Text("Voice note couldn't be loaded.", style = MaterialTheme.typography.bodySmall)
+        return
+    }
+    VoicePlayer(filePath = filePath, name = name)
+}
+
+@Composable
+private fun VoicePlayer(url: String, name: String) {
+    VoicePlayer(filePath = null, streamUrl = url, name = name)
+}
+
+@Composable
+private fun VoicePlayer(filePath: String? = null, streamUrl: String? = null, name: String) {
+    val key = filePath ?: streamUrl.orEmpty()
+    var playing by remember(key) { mutableStateOf(false) }
+    var progress by remember(key) { mutableFloatStateOf(0f) }
+    var duration by remember(key) { mutableIntStateOf(0) }
+    var position by remember(key) { mutableIntStateOf(0) }
+    var failed by remember(key) { mutableStateOf(false) }
+    val player = remember(key) { android.media.MediaPlayer() }
+    DisposableEffect(key) {
         onDispose {
             runCatching { player.reset(); player.release() }
         }
@@ -808,6 +904,7 @@ private fun VoicePlayer(url: String, name: String) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(onClick = {
+            failed = false
             runCatching {
                 if (playing) {
                     player.pause()
@@ -815,14 +912,18 @@ private fun VoicePlayer(url: String, name: String) {
                 } else {
                     if (position <= 0) {
                         player.reset()
-                        player.setDataSource(url)
+                        when {
+                            filePath != null -> player.setDataSource(filePath)
+                            streamUrl != null -> player.setDataSource(streamUrl)
+                            else -> throw IllegalStateException("no audio source")
+                        }
                         player.prepare()
                         duration = player.duration
                     }
                     player.start()
                     playing = true
                 }
-            }
+            }.onFailure { failed = true }
         }) {
             Icon(
                 if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
@@ -837,6 +938,13 @@ private fun VoicePlayer(url: String, name: String) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+            if (failed) {
+                Text(
+                    "Couldn't play this note.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
             LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
             Text(
                 "${formatDuration(position.toLong())} / ${formatDuration(duration.toLong())}",
@@ -888,6 +996,8 @@ private fun ViewOnceRow(mine: Boolean, onOpen: () -> Unit) {
 private fun SecureViewOnceDialog(
     imageUrl: String?,
     fileUrl: String?,
+    audioBlob: String? = null,
+    audioId: String = "",
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
@@ -910,6 +1020,16 @@ private fun SecureViewOnceDialog(
                         url = imageUrl,
                         modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp).padding(16.dp)
                     )
+                } else if (audioBlob != null) {
+                    Box(Modifier.fillMaxWidth().padding(16.dp)) {
+                        BlobVoicePlayer(
+                            messageId = "once-$audioId",
+                            blob = audioBlob,
+                            name = "View-once voice note"
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text("Listen once — closing destroys it", color = Color.White)
                 } else {
                     Icon(Icons.Default.Movie, null, tint = Color.White, modifier = Modifier.size(64.dp))
                     Spacer(Modifier.height(12.dp))
@@ -981,6 +1101,8 @@ private fun AttachSheet(
 // ------------------------------------------------------------------ composer
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
 private fun ChatComposer(
     draft: String,
     onDraftChange: (String) -> Unit,
@@ -991,12 +1113,20 @@ private fun ChatComposer(
     recording: Boolean,
     recordingMs: Long,
     amplitude: Int,
+    recLocked: Boolean,
+    recPaused: Boolean,
+    listenOnce: Boolean,
+    onListenOnceChange: (Boolean) -> Unit,
     onAttach: () -> Unit,
     onEmoji: () -> Unit,
     onSend: () -> Unit,
     onStartRecording: () -> Unit,
+    onHoldRecording: () -> Unit,
+    onReleaseHold: () -> Unit,
     onStopRecording: () -> Unit,
-    onCancelRecording: () -> Unit
+    onCancelRecording: () -> Unit,
+    onTogglePause: () -> Unit,
+    onLockRecording: () -> Unit
 ) {
     Column(
         Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)
@@ -1023,6 +1153,98 @@ private fun ChatComposer(
                 }
             }
             Spacer(Modifier.height(6.dp))
+        }
+        if (recording) {
+            // WhatsApp-style bar: hold, or swipe up to lock, left to delete.
+            var dragX by remember { mutableStateOf(0f) }
+            var dragY by remember { mutableStateOf(0f) }
+            Row(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .pointerInput(Unit) {
+                        detectDragGestures(
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+                                dragX += dragAmount.x
+                                dragY += dragAmount.y
+                                if (dragX < -160) {
+                                    dragX = 0f; dragY = 0f
+                                    onCancelRecording()
+                                } else if (dragY < -160) {
+                                    dragY = 0f
+                                    onLockRecording()
+                                }
+                            },
+                            onDragEnd = { dragX = 0f; dragY = 0f }
+                        )
+                    }
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.Mic, null, tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "%d:%02d".format(recordingMs / 60000, (recordingMs / 1000) % 60),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = if (recPaused) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+                )
+                Spacer(Modifier.width(8.dp))
+                // Amplitude shimmer.
+                Box(
+                    Modifier.weight(1f).height(24.dp).clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    Box(
+                        Modifier.fillMaxWidth((amplitude / 100f).coerceIn(0.05f, 1f)).height(24.dp)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.45f))
+                    )
+                }
+                IconButton(onClick = onTogglePause) {
+                    Icon(
+                        if (recPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                        if (recPaused) "Resume" else "Pause"
+                    )
+                }
+                IconButton(
+                    onClick = { onListenOnceChange(!listenOnce) },
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Icon(
+                        Icons.Default.VisibilityOff, "Listen once",
+                        tint = if (listenOnce) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (recLocked) {
+                    IconButton(onClick = onStopRecording) {
+                        Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary)
+                    }
+                } else {
+                    Text(
+                        "release to send",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onCancelRecording) {
+                    Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
+                }
+            }
+            if (!recLocked) {
+                Text(
+                    "Hold to record • slide up to lock • slide left to delete",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 12.dp, top = 4.dp)
+                )
+            }
+            return
         }
         Row(verticalAlignment = Alignment.Bottom) {
             IconButton(onClick = onAttach) { Icon(Icons.Default.AttachFile, "Attach") }
@@ -1058,23 +1280,28 @@ private fun ChatComposer(
                 IconButton(onClick = onSend, enabled = !sending) {
                     Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary)
                 }
-            } else if (recording) {
-                IconButton(onClick = onStopRecording) {
-                    Icon(Icons.Default.KeyboardVoice, "Stop and send", tint = MaterialTheme.colorScheme.error)
-                }
             } else {
-                IconButton(onClick = onStartRecording) { Icon(Icons.Default.Mic, "Voice message") }
-            }
-        }
-        if (recording) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
-                Text(
-                    "Recording %d:%02d — tap voice to send".format(recordingMs / 60000, (recordingMs / 1000) % 60),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.weight(1f)
-                )
-                TextButton(onClick = onCancelRecording) { Text("Cancel") }
+                // Tap = locked hands-free, hold = push-to-talk (release sends).
+                Box(
+                    Modifier.size(48.dp).clip(androidx.compose.foundation.shape.CircleShape)
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onTap = { onStartRecording() },
+                                onLongPress = { onHoldRecording() },
+                                onPress = {
+                                    val released = try {
+                                        tryAwaitRelease()
+                                    } catch (_: Exception) {
+                                        false
+                                    }
+                                    if (released) onReleaseHold()
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.Mic, "Voice message")
+                }
             }
         }
     }

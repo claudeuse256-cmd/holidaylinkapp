@@ -129,7 +129,9 @@ object FirestoreChat {
         val expiresAt: Timestamp?,
         val replyToId: String? = null,
         val replyToBody: String? = null,
-        val replyToName: String? = null
+        val replyToName: String? = null,
+        val audioBlob: String? = null,
+        val edited: Boolean = false
     )
 
     fun messagesFlow(chatId: String): Flow<List<ChatMessage>> = callbackFlow {
@@ -152,7 +154,9 @@ object FirestoreChat {
                         expiresAt = d.getTimestamp("expiresAt"),
                         replyToId = d.getString("replyToId"),
                         replyToBody = d.getString("replyToBody"),
-                        replyToName = d.getString("replyToName")
+                        replyToName = d.getString("replyToName"),
+                        audioBlob = d.getString("audioBlob"),
+                        edited = d.getBoolean("edited") == true
                     )
                 } ?: emptyList()
                 trySend(rows)
@@ -172,7 +176,8 @@ object FirestoreChat {
         ttlSeconds: Long = 0,
         replyToId: String? = null,
         replyToBody: String? = null,
-        replyToName: String? = null
+        replyToName: String? = null,
+        audioBlob: String? = null
     ) {
         val uid = myUid()
         val now = Timestamp.now()
@@ -190,6 +195,8 @@ object FirestoreChat {
         replyToId?.let { data["replyToId"] = it }
         replyToBody?.let { data["replyToBody"] = it }
         replyToName?.let { data["replyToName"] = it }
+        // Voice blobs live in Firestore (no Storage): 60s cap keeps docs < 1 MiB.
+        audioBlob?.let { data["audioBlob"] = it }
         if (viewOnce) data["viewOnce"] = true
         if (ttlSeconds > 0) {
             data["expiresAt"] = Timestamp(now.seconds + ttlSeconds.coerceIn(5, 7 * 24 * 3600), 0)

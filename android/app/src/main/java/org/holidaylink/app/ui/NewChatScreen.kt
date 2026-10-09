@@ -33,6 +33,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -111,7 +113,16 @@ fun NewChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (mode == NewChatMode.DIRECT) "New chat" else "New group") },
+                title = {
+                    Text(
+                        when (mode) {
+                            NewChatMode.DIRECT -> "New chat"
+                            NewChatMode.GROUP -> "New group"
+                            NewChatMode.CHANNEL -> "New channel"
+                            NewChatMode.COMMUNITY -> "New community"
+                        }
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
@@ -170,6 +181,15 @@ fun NewChatScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 6.dp)
             )
+
+            if (mode != NewChatMode.DIRECT) {
+                Text(
+                    "Step 1: name it. Step 2: tap people below to add them, then press Create.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp)
+                )
+            }
 
             if ((mode == NewChatMode.GROUP || mode == NewChatMode.CHANNEL || mode == NewChatMode.COMMUNITY) && selected.isNotEmpty()) {
                 Row(
@@ -281,10 +301,10 @@ fun NewChatScreen(
 
             if (mode == NewChatMode.GROUP || mode == NewChatMode.CHANNEL || mode == NewChatMode.COMMUNITY) {
                 val kindLabel = when (mode) { NewChatMode.CHANNEL -> "channel"; NewChatMode.COMMUNITY -> "community"; else -> "group" }
-                TextButton(
+                Button(
                     onClick = {
-                        if (busy) return@TextButton
-                        if (title.isBlank() || selected.isEmpty()) return@TextButton
+                        if (busy) return@Button
+                        if (title.isBlank() || selected.isEmpty()) return@Button
                         busy = true
                         scope.launch {
                             runCatching {
@@ -300,16 +320,20 @@ fun NewChatScreen(
                                 }
                                 .onFailure {
                                     busy = false
-                                    snackbar.showSnackbar("We couldn't create that $kindLabel.")
+                                    snackbar.showSnackbar("We couldn't create that $kindLabel. Check your internet.")
                                 }
                         }
                     },
                     enabled = title.isNotBlank() && selected.isNotEmpty() && !busy,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(16.dp)
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
                 ) {
-                    Text(if (busy) "Creating…" else "Create $kindLabel")
+                    if (busy) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(if (busy) "Creating…" else "Create $kindLabel (${selected.size})")
                 }
             }
         }
