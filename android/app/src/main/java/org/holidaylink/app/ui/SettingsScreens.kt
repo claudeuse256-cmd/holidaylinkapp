@@ -90,6 +90,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AutoDownload
@@ -98,10 +99,13 @@ import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Audience
 import org.holidaylink.app.net.DeviceSession
+import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.FirestorePrefs
 import org.holidaylink.app.net.Me
 import org.holidaylink.app.net.NotificationSettings
 import org.holidaylink.app.net.PrivacySettings
 import org.holidaylink.app.net.StatusAudience
+import org.holidaylink.app.net.StudyBuddy
 import org.holidaylink.app.ui.theme.ChatDensity
 import org.holidaylink.app.ui.theme.ThemeMode
 
@@ -317,7 +321,15 @@ fun SettingsHub(
                         confirmDelete = false
                         deleting = true
                         scope.launch {
-                            runCatching { api.deleteAccount() }
+                            runCatching {
+                                val user = FirebaseBackend.currentUser
+                                    ?: throw ApiException("Sign in again first.")
+                                // Remove the profile doc, then the Auth account.
+                                // Chats already shared with others stay for them.
+                                FirebaseBackend.db.collection("users").document(user.uid)
+                                    .delete().await()
+                                user.delete().await()
+                            }
                                 .onSuccess {
                                     snackbar.showSnackbar("Account deleted.")
                                     onLoggedOut()
@@ -325,8 +337,8 @@ fun SettingsHub(
                                 .onFailure {
                                     deleting = false
                                     snackbar.showSnackbar(
-                                        (it as? ApiException)?.message
-                                            ?: "We couldn't delete your account right now."
+                                        "We couldn't delete your account. If you signed in a while ago, " +
+                                            "sign out and back in, then try again."
                                     )
                                 }
                         }
@@ -360,10 +372,10 @@ fun PrivacyScreen(api: Api, onBack: () -> Unit) {
 
     LaunchedEffect(Unit) {
         try {
-            settings = api.privacy()
+            settings = FirestorePrefs.loadPrivacy()
             error = ""
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "We couldn't load your privacy settings."
+            error = "We couldn't load your privacy settings. Check your internet."
         } finally {
             loading = false
         }
@@ -373,7 +385,7 @@ fun PrivacyScreen(api: Api, onBack: () -> Unit) {
         val previous = settings
         settings = next
         scope.launch {
-            runCatching { api.updatePrivacy(next) }
+            runCatching { FirestorePrefs.savePrivacy(next) }
                 .onSuccess {
                     settings = it
                     AppSettings.setReadReceipts(it.readReceipts)
@@ -384,7 +396,7 @@ fun PrivacyScreen(api: Api, onBack: () -> Unit) {
                 }
                 .onFailure {
                     settings = previous
-                    snackbar.showSnackbar((it as? ApiException)?.message ?: "Couldn't save that setting.")
+                    snackbar.showSnackbar("Couldn't save that setting. Check your internet.")
                 }
         }
     }
@@ -573,8 +585,6 @@ fun SecurityScreen(api: Api, onBack: () -> Unit, onOpenBlocked: () -> Unit) {
     var loadingSessions by remember { mutableStateOf(true) }
     var twoFactorEnabled by remember { mutableStateOf(false) }
     var twoFactorLoading by remember { mutableStateOf(true) }
-    var twoFactorDialog by remember { mutableStateOf(false) }
-    var twoFactorPassword by remember { mutableStateOf("") }
     var twoFactorBusy by remember { mutableStateOf(false) }
 
     var biometricSupported by remember {
@@ -585,10 +595,29 @@ fun SecurityScreen(api: Api, onBack: () -> Unit, onOpenBlocked: () -> Unit) {
         )
     }
 
+    suspend fun loadSessions(): List<DeviceSession> {
+        val uid = FirebaseBackend.uid.orEmpty()
+        val snap = FirebaseBackend.db.collection("sessions")
+            .whereEqualTo("userId", uid).get().await()
+        val myDevice = FirebaseBackend.deviceId(context)
+        return snap.documents.map { d ->
+            DeviceSession(
+                id = d.id,
+                label = d.getString("deviceLabel") ?: "Device",
+                platform = "android",
+                createdAt = d.getTimestamp("createdAt")?.toDate()?.toInstant()?.toString().orEmpty(),
+                lastSeenAt = d.getTimestamp("lastActiveAt")?.toDate()?.toInstant()?.toString(),
+                current = d.id == myDevice
+            )
+        }.sortedByDescending { it.current }
+    }
+
     LaunchedEffect(Unit) {
-        sessions = runCatching { api.sessions() }.getOrDefault(emptyList())
+        sessions = runCatching { loadSessions() }.getOrDefault(emptyList())
         loadingSessions = false
-        twoFactorEnabled = runCatching { api.twoFactorStatus().enabled }.getOrDefault(false)
+        twoFactorEnabled = runCatching {
+            FirebaseBackend.loadProfile(FirebaseBackend.uid.orEmpty())?.twoFactorEnabled == true
+        }.getOrDefault(false)
         twoFactorLoading = false
     }
 
@@ -657,31 +686,28 @@ fun SecurityScreen(api: Api, onBack: () -> Unit, onOpenBlocked: () -> Unit) {
 
             SettingsSection("Two-step login") {
                 SettingsSwitchRow(
-                    title = "2FA password login",
+                    title = "Approve new sign-ins",
                     icon = Icons.Default.VerifiedUser,
-                    subtitle = if (twoFactorEnabled) "Enabled. Sign in with your phone number + this password." else "Set a password for password-based sign-in after phone lookup.",
+                    subtitle = if (twoFactorEnabled) "On. New devices ask approval on a signed-in device." else "Off. Any verified SMS code signs in directly.",
                     checked = twoFactorEnabled,
                     enabled = !twoFactorLoading && !twoFactorBusy,
                     onCheckedChange = { want ->
-                        if (want) {
-                            twoFactorPassword = ""
-                            twoFactorDialog = true
-                        } else {
-                            twoFactorBusy = true
-                            scope.launch {
-                                runCatching { api.disableTwoFactorPassword() }
-                                    .onSuccess { twoFactorEnabled = false; snackbar.showSnackbar("2FA password login disabled.") }
-                                    .onFailure { snackbar.showSnackbar((it as? ApiException)?.message ?: "We couldn't disable 2FA right now.") }
-                                twoFactorBusy = false
+                        twoFactorBusy = true
+                        scope.launch {
+                            runCatching {
+                                val uid = FirebaseBackend.uid
+                                    ?: throw ApiException("Sign in again first.")
+                                FirebaseBackend.db.collection("users").document(uid)
+                                    .update("twoFactorEnabled", want).await()
                             }
+                                .onSuccess {
+                                    twoFactorEnabled = want
+                                    snackbar.showSnackbar(if (want) "2FA approval is on." else "2FA approval is off.")
+                                }
+                                .onFailure { snackbar.showSnackbar("We couldn't change that right now.") }
+                            twoFactorBusy = false
                         }
                     }
-                )
-                SettingsNavRow(
-                    title = if (twoFactorEnabled) "Change 2FA password" else "Set 2FA password",
-                    icon = Icons.Default.Lock,
-                    subtitle = "8–128 characters; separate from your app-lock PIN.",
-                    onClick = { twoFactorPassword = ""; twoFactorDialog = true }
                 )
             }
 
@@ -717,10 +743,18 @@ fun SecurityScreen(api: Api, onBack: () -> Unit, onOpenBlocked: () -> Unit) {
                         icon = Icons.AutoMirrored.Filled.Logout,
                         onClick = {
                             scope.launch {
-                                runCatching { api.logoutOtherSessions() }
+                                runCatching {
+                                    val uid = FirebaseBackend.uid.orEmpty()
+                                    val mine = FirebaseBackend.deviceId(context)
+                                    val others = FirebaseBackend.db.collection("sessions")
+                                        .whereEqualTo("userId", uid).get().await()
+                                    val batch = FirebaseBackend.db.batch()
+                                    others.documents.filter { it.id != mine }.forEach { batch.delete(it.reference) }
+                                    batch.commit().await()
+                                }
                                     .onSuccess {
                                         snackbar.showSnackbar("Other devices signed out.")
-                                        sessions = runCatching { api.sessions() }.getOrDefault(emptyList())
+                                        sessions = runCatching { loadSessions() }.getOrDefault(emptyList())
                                     }
                                     .onFailure { snackbar.showSnackbar("We couldn't sign out other devices.") }
                             }
@@ -740,48 +774,15 @@ fun SecurityScreen(api: Api, onBack: () -> Unit, onOpenBlocked: () -> Unit) {
 
             SettingsSection("Encryption note") {
                 Text(
-                    "Text messages use end-to-end encryption on supported chats. The server stores " +
-                        "encrypted envelopes and removes delivered message rows; your phone keeps " +
-                        "the local encrypted copy. Attachments are not yet E2EE.",
+                    "Messages sync through Firebase like the website, so they are readable " +
+                        "there too. Your phone also keeps an offline copy for when the " +
+                        "network is gone.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
                 )
             }
         }
-    }
-
-    if (twoFactorDialog) {
-        AlertDialog(
-            onDismissRequest = { if (!twoFactorBusy) twoFactorDialog = false },
-            title = { Text(if (twoFactorEnabled) "Change 2FA password" else "Set 2FA password") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("After HolidayLink checks your registered phone number, this password can be used instead of an SMS code.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    androidx.compose.material3.OutlinedTextField(
-                        value = twoFactorPassword,
-                        onValueChange = { twoFactorPassword = it },
-                        label = { Text("2FA password") },
-                        singleLine = true
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = twoFactorPassword.length in 8..128 && !twoFactorBusy,
-                    onClick = {
-                        twoFactorBusy = true
-                        scope.launch {
-                            runCatching { api.setTwoFactorPassword(twoFactorPassword) }
-                                .onSuccess { twoFactorEnabled = true; twoFactorDialog = false; twoFactorPassword = ""; snackbar.showSnackbar("2FA password login is enabled.") }
-                                .onFailure { snackbar.showSnackbar((it as? ApiException)?.message ?: "We couldn't enable 2FA right now.") }
-                            twoFactorBusy = false
-                        }
-                    }
-                ) { Text("Save") }
-            },
-            dismissButton = { TextButton(enabled = !twoFactorBusy, onClick = { twoFactorDialog = false }) { Text("Cancel") } }
-        )
     }
 
     if (enteringPin) {
@@ -869,13 +870,32 @@ fun BlockedScreen(api: Api, onBack: () -> Unit) {
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableStateOf(0) }
 
+    suspend fun loadBlocked(): List<org.holidaylink.app.net.User> {
+        val uid = FirebaseBackend.uid.orEmpty()
+        @Suppress("UNCHECKED_CAST")
+        val ids = (FirebaseBackend.db.collection("users").document(uid).get().await()
+            .get("blocked") as? List<String>).orEmpty()
+        return ids.mapNotNull { id ->
+            runCatching {
+                val d = FirebaseBackend.db.collection("users").document(id).get().await()
+                if (!d.exists()) return@runCatching null
+                org.holidaylink.app.net.User(
+                    id = d.id,
+                    displayName = d.getString("name")?.takeIf { it.isNotBlank() } ?: "HolidayLink user",
+                    username = d.getString("username").orEmpty(),
+                    avatarUrl = d.getString("profilePic")
+                )
+            }.getOrNull()
+        }
+    }
+
     LaunchedEffect(reload) {
         loading = true
         try {
-            blocked = api.blockedUsers()
+            blocked = loadBlocked()
             error = ""
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "We couldn't load your blocked list."
+            error = "We couldn't load your blocked list. Check your internet."
         } finally {
             loading = false
         }
@@ -914,12 +934,19 @@ fun BlockedScreen(api: Api, onBack: () -> Unit) {
                         OutlinedButton(
                             onClick = {
                                 scope.launch {
-                                    runCatching { api.setBlocked(user.id, false) }
+                                    runCatching {
+                                        FirebaseBackend.db.collection("users")
+                                            .document(FirebaseBackend.uid.orEmpty())
+                                            .update(
+                                                "blocked",
+                                                com.google.firebase.firestore.FieldValue.arrayRemove(user.id)
+                                            ).await()
+                                    }
                                         .onSuccess {
                                             snackbar.showSnackbar("${user.displayName} unblocked.")
                                             reload++
                                         }
-                                        .onFailure { snackbar.showSnackbar("Couldn't unblock.") }
+                                        .onFailure { snackbar.showSnackbar("Couldn't unblock. Check your internet.") }
                                 }
                             }
                         ) { Text("Unblock") }
@@ -942,7 +969,7 @@ fun NotificationsSettingsScreen(api: Api, onBack: () -> Unit) {
     var osAllowed by remember { mutableStateOf(hasNotificationPermission(context)) }
 
     LaunchedEffect(Unit) {
-        settings = runCatching { api.notificationSettings() }.getOrNull()
+        settings = runCatching { FirestorePrefs.loadNotif() }.getOrNull()
         loading = false
     }
 
@@ -950,11 +977,11 @@ fun NotificationsSettingsScreen(api: Api, onBack: () -> Unit) {
         val previous = settings
         settings = next
         scope.launch {
-            runCatching { api.updateNotificationSettings(next) }
+            runCatching { FirestorePrefs.saveNotif(next) }
                 .onSuccess { settings = it; snackbar.showSnackbar("Saved") }
                 .onFailure {
                     settings = previous
-                    snackbar.showSnackbar("Couldn't save that setting.")
+                    snackbar.showSnackbar("Couldn't save that setting. Check your internet.")
                 }
         }
     }
@@ -1377,9 +1404,10 @@ fun ChatSettingsScreen(api: Api, onBack: () -> Unit) {
                         AppSettings.setReadReceipts(it)
                         scope.launch {
                             runCatching {
-                                api.updatePrivacy(api.privacy().copy(readReceipts = it))
+                                val current = FirestorePrefs.loadPrivacy()
+                                FirestorePrefs.savePrivacy(current.copy(readReceipts = it))
                             }.onFailure {
-                                snackbar.showSnackbar("Saved on this device, but not on the server.")
+                                snackbar.showSnackbar("Saved on this device only. Check your internet.")
                             }
                         }
                     }
@@ -1393,9 +1421,10 @@ fun ChatSettingsScreen(api: Api, onBack: () -> Unit) {
                         AppSettings.setTypingIndicators(it)
                         scope.launch {
                             runCatching {
-                                api.updatePrivacy(api.privacy().copy(typingIndicators = it))
+                                val current = FirestorePrefs.loadPrivacy()
+                                FirestorePrefs.savePrivacy(current.copy(typingIndicators = it))
                             }.onFailure {
-                                snackbar.showSnackbar("Saved on this device, but not on the server.")
+                                snackbar.showSnackbar("Saved on this device only. Check your internet.")
                             }
                         }
                     }
@@ -1407,13 +1436,12 @@ fun ChatSettingsScreen(api: Api, onBack: () -> Unit) {
                     AppSettings.setDisappearing(chosen)
                     scope.launch {
                         runCatching {
-                            api.updatePrivacy(
-                                api.privacy().copy(disappearingSeconds = chosen.seconds)
-                            )
+                            val current = FirestorePrefs.loadPrivacy()
+                            FirestorePrefs.savePrivacy(current.copy(disappearingSeconds = chosen.seconds))
                         }.onSuccess {
                             snackbar.showSnackbar("New messages now disappear after ${chosen.label.lowercase()}.")
                         }.onFailure {
-                            snackbar.showSnackbar("Saved on this device, but not on the server.")
+                            snackbar.showSnackbar("Saved on this device only. Check your internet.")
                         }
                     }
                 }
@@ -1515,6 +1543,7 @@ private fun LanguageOption(
 
 @Composable
 fun AiSettingsScreen(api: Api, onBack: () -> Unit) {
+    val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val settings = AppSettings.state
@@ -1572,12 +1601,17 @@ fun AiSettingsScreen(api: Api, onBack: () -> Unit) {
                 SettingsNavRow(
                     title = "Clear AI history",
                     icon = Icons.Default.DeleteForever,
-                    subtitle = "Delete every saved HolidayLink AI conversation",
+                    subtitle = "Delete the HolidayLink AI chat on this device",
                     onClick = {
                         if (clearing) return@SettingsNavRow
                         clearing = true
                         scope.launch {
-                            runCatching { api.clearAiHistory() }
+                            runCatching {
+                                StudyBuddy.clearHistory(
+                                    context,
+                                    FirebaseBackend.uid.orEmpty()
+                                )
+                            }
                                 .onSuccess { snackbar.showSnackbar("AI history cleared.") }
                                 .onFailure { snackbar.showSnackbar("We couldn't clear the AI history.") }
                             clearing = false
@@ -1714,9 +1748,13 @@ fun ServerSettingsScreen(api: Api, onBack: () -> Unit) {
                         testing = true
                         status = ""
                         scope.launch {
-                            val info = api.health()
-                            status = if (info.ok) "Connected. Database: ${info.database}."
-                            else "Not reachable. ${info.detail}"
+                            val ok = runCatching {
+                                val uid = FirebaseBackend.uid.orEmpty()
+                                if (uid.isBlank()) throw ApiException("Not signed in.")
+                                FirebaseBackend.db.collection("users").document(uid).get().await()
+                            }.isSuccess
+                            status = if (ok) "Connected to HolidayLink."
+                            else "Not reachable. Check your internet."
                             testing = false
                         }
                     },

@@ -3,106 +3,323 @@ package org.holidaylink.app.net
 import android.content.Context
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
-import org.json.JSONObject
-import org.webrtc.*
-import okhttp3.*
-import java.util.concurrent.Executors
+import com.google.firebase.Timestamp
+import com.google.firebase.firestore.ListenerRegistration
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
+import org.webrtc.*
 
+/**
+ * Calls over Firestore signaling (same docs as the website room):
+ * calls/{id} {callerId, calleeId, kind, status, offer, answer},
+ * calls/{id}/callerCandidates + calleeCandidates {sdpMid, sdpMLineIndex, candidate}.
+ * WebRTC carries the media peer-to-peer; Firestore only signals.
+ */
 class CallManager(private val context: Context, private val api: Api) {
-    data class Incoming(val callId:String,val kind:String,val caller:User,val status:String)
-    var onIncoming: ((Incoming)->Unit)? = null
-    var onState: ((String)->Unit)? = null
-    var onRemote: ((VideoTrack?)->Unit)? = null
-    var onLocal: ((VideoTrack?)->Unit)? = null
-    private val executor=Executors.newSingleThreadExecutor()
-    private var ws: WebSocket?=null
-    private var pc: PeerConnection?=null
-    private var factory: PeerConnectionFactory?=null
-    private var localVideo: VideoTrack?=null
-    private var localAudio: AudioTrack?=null
-    private var currentCallId:String?=null
-    private var currentKind="audio"
-    private var accepted=false
+    data class Incoming(val callId: String, val kind: String, val caller: User, val status: String)
+    var onIncoming: ((Incoming) -> Unit)? = null
+    var onState: ((String) -> Unit)? = null
+    var onRemote: ((VideoTrack?) -> Unit)? = null
+    var onLocal: ((VideoTrack?) -> Unit)? = null
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val db get() = FirebaseBackend.db
+    private var incomingReg: ListenerRegistration? = null
+    private var callReg: ListenerRegistration? = null
+    private var candReg: ListenerRegistration? = null
+    private var pc: PeerConnection? = null
+    private var factory: PeerConnectionFactory? = null
+    private var localVideo: VideoTrack? = null
+    private var localAudio: AudioTrack? = null
+    private var currentCallId: String? = null
+    private var currentKind = "audio"
+    private var isCaller = false
+    private var answerApplied = false
+    private val seenCandidates = mutableSetOf<String>()
 
     fun connect() {
-        if (ws!=null) return
-        PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions())
-        factory=PeerConnectionFactory.builder().createPeerConnectionFactory()
-        ws=OkHttpClient().newWebSocket(Request.Builder().url(api.realtimeUrl()).build(), object:WebSocketListener(){
-            override fun onMessage(webSocket: WebSocket, text: String) { handleSignal(JSONObject(text)) }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { ws=null; onState?.invoke("offline") }
-            override fun onClosed(webSocket: WebSocket, code:Int, reason:String) { ws=null }
-        })
+        if (factory != null) return
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions()
+        )
+        factory = PeerConnectionFactory.builder().createPeerConnectionFactory()
+        val uid = FirebaseBackend.uid ?: return
+        // Ringing calls addressed to this device.
+        incomingReg?.remove()
+        incomingReg = db.collection("calls")
+            .whereEqualTo("calleeId", uid)
+            .whereEqualTo("status", "ringing")
+            .addSnapshotListener { snap, _ ->
+                snap?.documentChanges?.filter { it.type.name == "ADDED" }?.forEach { change ->
+                    val d = change.document
+                    val callerId = d.getString("callerId").orEmpty()
+                    scope.launch {
+                        val caller = runCatching { FirestoreChat.resolvePeer(callerId) }.getOrNull()
+                            ?: User(callerId, "HolidayLink user", "")
+                        onIncoming?.invoke(
+                            Incoming(d.id, d.getString("kind") ?: "audio", caller, "ringing")
+                        )
+                    }
+                }
+            }
     }
 
-    fun close(){ ws?.close(1000,"bye"); ws=null; pc?.close(); pc=null; factory?.dispose(); factory=null }
+    fun close() {
+        incomingReg?.remove(); incomingReg = null
+        callReg?.remove(); callReg = null
+        candReg?.remove(); candReg = null
+        pc?.close(); pc = null
+        factory?.dispose(); factory = null
+        currentCallId = null
+    }
 
-    private fun send(o:JSONObject){ ws?.send(o.toString()) }
-
-    suspend fun start(calleeId:String, kind:String):CallRecord {
-        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED || (kind=="video" && ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)) {
-            throw ApiException("Allow microphone${if(kind=="video") " and camera" else ""} permission, then try the call again.")
+    suspend fun start(calleeId: String, kind: String): CallRecord {
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
+            (kind == "video" && ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
+        ) {
+            throw ApiException("Allow microphone${if (kind == "video") " and camera" else ""} permission, then try the call again.")
         }
-        connect(); currentKind=kind
-        val call=api.startCall(calleeId,kind); currentCallId=call.id
-        createPeer(true)
-        return call
+        connect()
+        currentKind = kind
+        isCaller = true
+        val uid = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
+        val ref = db.collection("calls").add(
+            mapOf(
+                "callerId" to uid,
+                "calleeId" to calleeId,
+                "kind" to kind,
+                "status" to "ringing",
+                "createdAt" to Timestamp.now()
+            )
+        ).await()
+        currentCallId = ref.id
+        createPeer(offer = true)
+        watchCall(ref.id, caller = true)
+        val peer = runCatching { FirestoreChat.resolvePeer(calleeId) }.getOrNull()
+        return CallRecord(ref.id, peer, kind, "ringing", incoming = false, createdAt = "", durationSeconds = 0)
     }
 
-    fun accept(callId:String, kind:String){ currentCallId=callId; currentKind=kind; accepted=true; createPeer(false); apiScope { api.updateCall(callId,"accepted") } }
-    fun decline(callId:String){ apiScope { api.updateCall(callId,"declined") }; onState?.invoke("declined") }
-    fun end(){ currentCallId?.let { apiScope { api.updateCall(it,"ended") } }; pc?.close(); pc=null; onState?.invoke("ended") }
-    fun toggleMute(muted:Boolean){ localAudio?.setEnabled(!muted) }
-    fun toggleCamera(enabled:Boolean){ localVideo?.setEnabled(enabled) }
+    fun accept(callId: String, kind: String) {
+        currentCallId = callId
+        currentKind = kind
+        isCaller = false
+        scope.launch {
+            val snap = db.collection("calls").document(callId).get().await()
+            val offer = snap.get("offer") as? Map<String, String>
+            createPeer(offer = false)
+            val sdp = offer?.get("sdp").orEmpty()
+            if (sdp.isNotBlank()) {
+                pc?.setRemoteDescription(
+                    object : SdpObserverBase() {
+                        override fun onSetSuccess() {
+                            pc?.createAnswer(object : SdpObserverBase() {
+                                override fun onCreateSuccess(d: SessionDescription) {
+                                    pc?.setLocalDescription(this, d)
+                                    scope.launch {
+                                        db.collection("calls").document(callId)
+                                            .update(mapOf("answer" to mapOf("sdp" to d.description), "status" to "accepted"))
+                                            .await()
+                                    }
+                                }
+                            }, MediaConstraints())
+                        }
+                    },
+                    SessionDescription(SessionDescription.Type.OFFER, sdp)
+                )
+            } else {
+                db.collection("calls").document(callId).update("status", "accepted").await()
+            }
+        }
+        watchCall(callId, caller = false)
+    }
 
-    private fun apiScope(block:suspend()->Unit){ GlobalScope.launch(Dispatchers.IO) { runCatching { block() } } }
+    fun decline(callId: String) {
+        scope.launch {
+            runCatching { db.collection("calls").document(callId).update("status", "declined").await() }
+        }
+        onState?.invoke("declined")
+        cleanupCall()
+    }
 
-    private fun createPeer(offer:Boolean){
-        val f=factory ?: return
-        val rtc=PeerConnection.RTCConfiguration(listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
-        )).apply { sdpSemantics=PeerConnection.SdpSemantics.UNIFIED_PLAN }
-        pc=f.createPeerConnection(rtc, object:PeerConnection.Observer{
-            override fun onIceCandidate(c:IceCandidate){ send(JSONObject().put("type","call.signal").put("callId",currentCallId).put("signal",JSONObject().put("kind","candidate").put("sdpMid",c.sdpMid).put("sdpMLineIndex",c.sdpMLineIndex).put("candidate",c.sdp))) }
-            override fun onTrack(t:RtpTransceiver){ (t.receiver.track() as? VideoTrack)?.let{ onRemote?.invoke(it) } }
-            override fun onConnectionChange(s:PeerConnection.PeerConnectionState){ onState?.invoke(s.name.lowercase()) }
-            override fun onSignalingChange(p:PeerConnection.SignalingState) {}
-            override fun onIceConnectionChange(p:PeerConnection.IceConnectionState) {}
-            override fun onIceConnectionReceivingChange(b:Boolean) {}
-            override fun onIceGatheringChange(p:PeerConnection.IceGatheringState) {}
-            override fun onIceCandidatesRemoved(c:Array<IceCandidate>) {}
-            override fun onAddStream(s:MediaStream) {}
-            override fun onRemoveStream(s:MediaStream) {}
-            override fun onDataChannel(d:DataChannel) {}
+    fun end() {
+        val id = currentCallId
+        if (id != null) {
+            scope.launch {
+                runCatching {
+                    db.collection("calls").document(id)
+                        .update(mapOf("status" to "ended", "endedAt" to Timestamp.now())).await()
+                }
+            }
+        }
+        pc?.close(); pc = null
+        onState?.invoke("ended")
+        cleanupCall()
+    }
+
+    fun toggleMute(muted: Boolean) {
+        localAudio?.setEnabled(!muted)
+    }
+
+    fun toggleCamera(enabled: Boolean) {
+        localVideo?.setEnabled(enabled)
+    }
+
+    private fun cleanupCall() {
+        callReg?.remove(); callReg = null
+        candReg?.remove(); candReg = null
+        currentCallId = null
+        answerApplied = false
+        seenCandidates.clear()
+    }
+
+    private fun watchCall(callId: String, caller: Boolean) {
+        callReg?.remove()
+        callReg = db.collection("calls").document(callId)
+            .addSnapshotListener { snap, _ ->
+                val status = snap?.getString("status") ?: return@addSnapshotListener
+                onState?.invoke(status)
+                // Caller picks up the callee's answer from the call doc.
+                if (caller && !answerApplied) {
+                    @Suppress("UNCHECKED_CAST")
+                    val answer = snap.get("answer") as? Map<String, String>
+                    val sdp = answer?.get("sdp").orEmpty()
+                    if (sdp.isNotBlank()) {
+                        answerApplied = true
+                        pc?.setRemoteDescription(
+                            SdpObserverBase(),
+                            SessionDescription(SessionDescription.Type.ANSWER, sdp)
+                        )
+                    }
+                }
+                if (status == "declined" || status == "ended" || status == "missed") {
+                    pc?.close(); pc = null
+                    cleanupCall()
+                }
+            }
+        // Remote description + ICE from the other side.
+        candReg?.remove()
+        val remoteCol = if (caller) "calleeCandidates" else "callerCandidates"
+        candReg = db.collection("calls").document(callId).collection(remoteCol)
+            .addSnapshotListener { snap, _ ->
+                snap?.documentChanges?.filter { it.type.name == "ADDED" }?.forEach { change ->
+                    val key = change.document.id
+                    if (!seenCandidates.add(key)) return@forEach
+                    applyRemoteSignal(change.document.data)
+                }
+            }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun applyRemoteSignal(data: Map<String, Any?>) {
+        val p = pc ?: return
+        when (data["kind"] as? String) {
+            "answer" -> {
+                val sdp = data["sdp"] as? String ?: return
+                p.setRemoteDescription(SdpObserverBase(), SessionDescription(SessionDescription.Type.ANSWER, sdp))
+            }
+            "candidate" -> {
+                p.addIceCandidate(
+                    IceCandidate(
+                        data["sdpMid"] as? String,
+                        (data["sdpMLineIndex"] as? Long)?.toInt() ?: 0,
+                        data["candidate"] as? String ?: return
+                    )
+                )
+            }
+        }
+    }
+
+    private fun signalDoc(kind: String, sdp: String? = null, cand: IceCandidate? = null): Map<String, Any?> {
+        return when (kind) {
+            "offer", "answer" -> mapOf("kind" to kind, "sdp" to (sdp.orEmpty()))
+            else -> mapOf(
+                "kind" to "candidate",
+                "sdpMid" to (cand?.sdpMid ?: ""),
+                "sdpMLineIndex" to cand?.sdpMLineIndex,
+                "candidate" to (cand?.sdp ?: "")
+            )
+        }
+    }
+
+    private fun sendSignal(kind: String, sdp: String? = null, cand: IceCandidate? = null) {
+        val id = currentCallId ?: return
+        val col = if (isCaller) "callerCandidates" else "calleeCandidates"
+        // Offers/answers ride the call doc; ICE rides candidate subcollections.
+        if (kind == "offer") {
+            scope.launch {
+                db.collection("calls").document(id)
+                    .update("offer", mapOf("sdp" to (sdp.orEmpty()))).await()
+            }
+            return
+        }
+        scope.launch {
+            db.collection("calls").document(id).collection(col).add(signalDoc(kind, sdp, cand)).await()
+        }
+    }
+
+    private fun createPeer(offer: Boolean) {
+        val f = factory ?: return
+        val rtc = PeerConnection.RTCConfiguration(
+            listOf(
+                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
+            )
+        ).apply { sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN }
+        pc = f.createPeerConnection(rtc, object : PeerConnection.Observer {
+            override fun onIceCandidate(c: IceCandidate) {
+                sendSignal("candidate", cand = c)
+            }
+            override fun onTrack(t: RtpTransceiver) {
+                (t.receiver.track() as? VideoTrack)?.let { onRemote?.invoke(it) }
+            }
+            override fun onConnectionChange(s: PeerConnection.PeerConnectionState) {
+                onState?.invoke(s.name.lowercase())
+            }
+            override fun onSignalingChange(p: PeerConnection.SignalingState) {}
+            override fun onIceConnectionChange(p: PeerConnection.IceConnectionState) {}
+            override fun onIceConnectionReceivingChange(b: Boolean) {}
+            override fun onIceGatheringChange(p: PeerConnection.IceGatheringState) {}
+            override fun onIceCandidatesRemoved(c: Array<IceCandidate>) {}
+            override fun onAddStream(s: MediaStream) {}
+            override fun onRemoveStream(s: MediaStream) {}
+            override fun onDataChannel(d: DataChannel) {}
             override fun onRenegotiationNeeded() {}
-            override fun onAddTrack(r:RtpReceiver,m:Array<MediaStream>) {}
+            override fun onAddTrack(r: RtpReceiver, m: Array<MediaStream>) {}
         }) ?: return
-        val audio=f.createAudioSource(MediaConstraints()); localAudio=f.createAudioTrack("audio",audio); pc!!.addTrack(localAudio)
-        if(currentKind=="video"){
-            val egl=EglBase.create(); val capt=Camera2Enumerator(context).deviceNames.firstOrNull()?.let{ name-> Camera2Enumerator(context).createCapturer(name,null) }
-            if(capt!=null){ val src=f.createVideoSource(false); capt.initialize(SurfaceTextureHelper.create("HL-Cam",egl.eglBaseContext),context,src.capturerObserver); capt.startCapture(640,480,24); localVideo=f.createVideoTrack("video",src); pc!!.addTrack(localVideo); onLocal?.invoke(localVideo) }
+        val audio = f.createAudioSource(MediaConstraints())
+        localAudio = f.createAudioTrack("audio", audio)
+        pc!!.addTrack(localAudio)
+        if (currentKind == "video") {
+            val egl = EglBase.create()
+            val capt = Camera2Enumerator(context).deviceNames.firstOrNull()?.let { name ->
+                Camera2Enumerator(context).createCapturer(name, null)
+            }
+            if (capt != null) {
+                val src = f.createVideoSource(false)
+                capt.initialize(SurfaceTextureHelper.create("HL-Cam", egl.eglBaseContext), context, src.capturerObserver)
+                capt.startCapture(640, 480, 24)
+                localVideo = f.createVideoTrack("video", src)
+                pc!!.addTrack(localVideo)
+                onLocal?.invoke(localVideo)
+            }
         }
-        if(offer) pc!!.createOffer(object:SdpObserverBase(){ override fun onCreateSuccess(d:SessionDescription){ pc?.setLocalDescription(this,d); send(JSONObject().put("type","call.signal").put("callId",currentCallId).put("signal",JSONObject().put("kind","offer").put("sdp",d.description))) }}, MediaConstraints())
+        if (offer) {
+            pc!!.createOffer(object : SdpObserverBase() {
+                override fun onCreateSuccess(d: SessionDescription) {
+                    pc?.setLocalDescription(this, d)
+                    sendSignal("offer", sdp = d.description)
+                }
+            }, MediaConstraints())
+        }
     }
 
-    private fun handleSignal(o:JSONObject){
-        when(o.optString("type")){
-            "call.incoming" -> { val c=o.optJSONObject("caller") ?: return; onIncoming?.invoke(Incoming(o.optString("callId"),o.optString("kind","audio"),User(c.optString("id"),c.optString("displayName"),c.optString("username"),c.optString("avatarUrl").takeIf{it.isNotBlank()}),o.optString("status"))) }
-            "call.state" -> onState?.invoke(o.optString("status"))
-            "call.signal" -> handlePeerSignal(o.optJSONObject("signal") ?: return)
-        }
+    open class SdpObserverBase : SdpObserver {
+        override fun onCreateSuccess(d: SessionDescription) {}
+        override fun onSetSuccess() {}
+        override fun onCreateFailure(s: String) {}
+        override fun onSetFailure(s: String) {}
     }
-    private fun handlePeerSignal(s:JSONObject){
-        val p=pc ?: return
-        when(s.optString("kind")){
-            "offer" -> p.setRemoteDescription(object:SdpObserverBase(){ override fun onSetSuccess(){ p.createAnswer(object:SdpObserverBase(){ override fun onCreateSuccess(d:SessionDescription){ p.setLocalDescription(this,d); send(JSONObject().put("type","call.signal").put("callId",currentCallId).put("signal",JSONObject().put("kind","answer").put("sdp",d.description))) }},MediaConstraints()) }}, SessionDescription(SessionDescription.Type.OFFER,s.getString("sdp")))
-            "answer" -> p.setRemoteDescription(SdpObserverBase(),SessionDescription(SessionDescription.Type.ANSWER,s.getString("sdp")))
-            "candidate" -> p.addIceCandidate(IceCandidate(s.optString("sdpMid"),s.optInt("sdpMLineIndex"),s.getString("candidate")))
-        }
-    }
-    open class SdpObserverBase: SdpObserver { override fun onCreateSuccess(d:SessionDescription){}; override fun onSetSuccess(){}; override fun onCreateFailure(s:String){}; override fun onSetFailure(s:String){} }
 }

@@ -32,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -42,18 +43,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
-import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.CallRecord
+import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.User
 
 private val MissedRed = Color(0xFFDC2626)
 
 /**
- * Call history.
- *
- * Every row is a real call record written to /calls. Audio between two HolidayLink users is not
- * carried by this app yet, so the header says so plainly instead of pretending a dialler exists.
+ * Call history from Firestore (same docs as the website room).
  */
 @Composable
 fun CallsScreen(
@@ -66,14 +66,59 @@ fun CallsScreen(
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
     var filter by remember { mutableStateOf("all") }
+    val scope = rememberCoroutineScope()
+    val peerCache = remember { mutableStateMapOf<String, User>() }
+
+    suspend fun loadHistory(): List<CallRecord> {
+        val uid = FirebaseBackend.uid.orEmpty()
+        val out = mutableListOf<CallRecord>()
+        for (field in listOf("callerId", "calleeId")) {
+            val snap = FirebaseBackend.db.collection("calls")
+                .whereEqualTo(field, uid)
+                .orderBy("createdAt", com.google.firebase.firestore.Query.Direction.DESCENDING)
+                .limit(100).get().await()
+            snap.documents.forEach { d ->
+                val callerId = d.getString("callerId").orEmpty()
+                val calleeId = d.getString("calleeId").orEmpty()
+                val incoming = callerId != uid
+                val peerId = if (incoming) callerId else calleeId
+                val peer = peerCache.getOrPut(peerId) {
+                    runCatching { FirestoreChat.resolvePeer(peerId) }.getOrNull()
+                        ?: User(peerId, "Unknown number", "")
+                }
+                val created = d.getTimestamp("createdAt")
+                val ended = d.getTimestamp("endedAt")
+                val duration = if (created != null && ended != null) {
+                    ((ended.seconds - created.seconds).coerceAtLeast(0)).toInt()
+                } else 0
+                var status = d.getString("status") ?: "ended"
+                // An unanswered incoming ring older than a minute is a miss.
+                if (incoming && status == "ringing" && created != null &&
+                    (System.currentTimeMillis() / 1000 - created.seconds) > 60
+                ) {
+                    status = "missed"
+                }
+                out += CallRecord(
+                    id = d.id,
+                    peer = peer,
+                    kind = d.getString("kind") ?: "audio",
+                    status = status,
+                    incoming = incoming,
+                    createdAt = created?.toDate()?.toInstant()?.toString().orEmpty(),
+                    durationSeconds = duration
+                )
+            }
+        }
+        return out.sortedByDescending { it.createdAt }.distinctBy { it.id }
+    }
 
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
         try {
-            calls = api.callHistory()
+            calls = loadHistory()
             error = ""
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "We couldn't load your call history."
+            error = "We couldn't load your call history. Check your internet."
         } finally {
             loading = false
             refreshing = false
@@ -83,7 +128,7 @@ fun CallsScreen(
     LaunchedEffect(Unit) {
         while (true) {
             delay(30_000)
-            runCatching { calls = api.callHistory() }
+            runCatching { calls = loadHistory() }
         }
     }
 
@@ -190,8 +235,7 @@ fun CallsScreen(
             contentAlignment = Alignment.Center
         ) {
             Text(
-                "HolidayLink records who called, when, and for how long. Live audio between " +
-                    "HolidayLink users is not carried by this app yet.",
+                "HolidayLink records who called, when, and for how long.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

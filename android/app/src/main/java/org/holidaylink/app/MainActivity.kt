@@ -305,11 +305,11 @@ private fun SignedInApp(
         }
     }
 
-    val userId = me?.id ?: api.userId().orEmpty()
+    val userId = me?.id ?: FirebaseBackend.uid.orEmpty()
 
     val openDirectChat: (User) -> Unit = { user ->
         scope.launch {
-            runCatching { api.startDirect(user.id) }
+            runCatching { FirestoreChat.startDirect(user.id) }
                 .onSuccess { id ->
                     stack.add(Destination.Chat(ChatItem(id, "direct", null, user, null, null)))
                 }
@@ -480,26 +480,19 @@ private fun SignedInApp(
             me = me,
             onBack = pop,
             onAddAccount = {
-                me?.let { loaded ->
-                    api.sessionToken()?.let { token ->
-                        AccountStore.upsert(prefs, AccountStore.Account(loaded.id, token, loaded.phone, loaded.displayName, loaded.username))
-                    }
-                }
+                // Firebase Auth holds one session: adding means signing in again.
                 prefs.edit().remove("token").remove("userId").apply()
                 stack.clear()
                 stack.add(Destination.Tabs)
                 onLoggedOut()
             },
             onSwitchAccount = { account ->
-                prefs.edit()
-                    .putString("token", account.token)
-                    .putString("userId", account.userId)
-                    .putString("phone", account.phone)
-                    .apply()
+                // Stored Firebase sessions can't be restored silently; sign in again.
+                prefs.edit().remove("token").remove("userId").apply()
                 me = null
                 stack.clear()
                 stack.add(Destination.Tabs)
-                scope.launch { runCatching { api.me() }.onSuccess { me = it } }
+                onLoggedOut()
             },
             onLoggedOut = {
                 prefs.edit().remove("token").remove("userId").apply()
@@ -775,10 +768,26 @@ private fun TelegramFabOption(label: String, icon: androidx.compose.ui.graphics.
 @Composable
 private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostStatus: () -> Unit = onOpenStatus) {
     val scheme = MaterialTheme.colorScheme
-    var statuses by remember { mutableStateOf<List<org.holidaylink.app.net.StatusUpdate>>(emptyList()) }
-    var postTick by remember { mutableStateOf(0) }
-    LaunchedEffect(postTick) { runCatching { api.statuses() } }
-    val people = statuses.distinctBy { it.userId }.take(12)
+    var people by remember { mutableStateOf<List<Triple<String, String, String?>>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        runCatching {
+            val now = com.google.firebase.Timestamp.now()
+            val snap = FirebaseBackend.db.collection("statuses")
+                .whereGreaterThan("expiresAt", now).orderBy("expiresAt").limit(60).get().await()
+            val seen = linkedMapOf<String, Triple<String, String, String?>>()
+            snap.documents.forEach { d ->
+                val userId = d.getString("userId").orEmpty()
+                if (userId.isBlank() || seen.containsKey(userId)) return@forEach
+                val p = runCatching { FirebaseBackend.loadProfile(userId) }.getOrNull()
+                seen[userId] = Triple(
+                    userId,
+                    p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user",
+                    p?.profilePic
+                )
+            }
+            people = seen.values.take(12)
+        }
+    }
     LazyRow(
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 18.dp),
@@ -792,12 +801,12 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
                 Spacer(Modifier.height(4.dp)); Text("Your status", color = scheme.onBackground, fontSize = 11.sp)
             }
         }
-        items(people) { status ->
+        items(people) { person ->
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onOpenStatus() }) {
                 Box(Modifier.size(64.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF8B2DFF)))).padding(3.dp), contentAlignment = Alignment.Center) {
-                    Avatar(status.userName, photo = status.avatarUrl, size = 58.dp)
+                    Avatar(person.second, photo = person.third, size = 58.dp)
                 }
-                Spacer(Modifier.height(4.dp)); Text(status.userName.take(10), color = scheme.onBackground, fontSize = 11.sp, maxLines = 1)
+                Spacer(Modifier.height(4.dp)); Text(person.second.take(10), color = scheme.onBackground, fontSize = 11.sp, maxLines = 1)
             }
         }
     }

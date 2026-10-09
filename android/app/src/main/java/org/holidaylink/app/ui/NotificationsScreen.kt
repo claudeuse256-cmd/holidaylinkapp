@@ -46,9 +46,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
-import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.AppNotification
+import org.holidaylink.app.net.FirebaseBackend
 
 /**
  * The in-app notification history kept by the server.
@@ -74,7 +75,12 @@ fun NotificationListScreen(
     fun markReadAndOpen(notification: AppNotification) {
         if (!notification.read) {
             items = items.map { if (it.id == notification.id) it.copy(read = true) else it }
-            scope.launch { runCatching { api.markNotificationRead(notification.id) } }
+            scope.launch {
+                runCatching {
+                    FirebaseBackend.db.collection("notifications").document(notification.id)
+                        .update("read", true).await()
+                }
+            }
         }
         if (notification.type == "ai") {
             onOpenAi?.invoke()
@@ -84,13 +90,40 @@ fun NotificationListScreen(
         if (!conversationId.isNullOrBlank() && onOpenChat != null) onOpenChat(conversationId)
     }
 
+    suspend fun loadNotifications(): List<AppNotification> {
+        val uid = FirebaseBackend.uid.orEmpty()
+        val snap = FirebaseBackend.db.collection("notifications")
+            .whereEqualTo("userId", uid)
+            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .limit(100).get().await()
+        return snap.documents.map { d ->
+            val data = d.get("data")
+            AppNotification(
+                id = d.id,
+                type = d.getString("type") ?: "message",
+                title = d.getString("title") ?: "HolidayLink",
+                body = d.getString("message") ?: d.getString("body").orEmpty(),
+                read = d.getBoolean("read") == true,
+                createdAt = d.getTimestamp("timestamp")?.toDate()?.toInstant()?.toString(),
+                conversationId = when (data) {
+                    is Map<*, *> -> data["conversationId"] as? String
+                    else -> d.getString("conversationId")
+                },
+                senderId = when (data) {
+                    is Map<*, *> -> data["senderId"] as? String
+                    else -> d.getString("senderId")
+                }
+            )
+        }
+    }
+
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
         try {
-            items = api.notifications()
+            items = loadNotifications()
             error = ""
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "We couldn't load notifications."
+            error = "We couldn't load notifications. Check your internet."
         } finally {
             loading = false
             refreshing = false
@@ -111,7 +144,18 @@ fun NotificationListScreen(
                         IconButton(
                             onClick = {
                                 items = items.map { it.copy(read = true) }
-                                scope.launch { runCatching { api.markAllNotificationsRead() } }
+                                scope.launch {
+                                    runCatching {
+                                        val batch = FirebaseBackend.db.batch()
+                                        items.forEach {
+                                            batch.update(
+                                                FirebaseBackend.db.collection("notifications").document(it.id),
+                                                "read", true
+                                            )
+                                        }
+                                        batch.commit().await()
+                                    }
+                                }
                             }
                         ) {
                             Icon(Icons.Default.DoneAll, "Mark all as read")

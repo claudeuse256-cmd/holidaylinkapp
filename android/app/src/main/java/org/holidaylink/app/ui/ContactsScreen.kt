@@ -63,11 +63,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.net.Api
-import org.holidaylink.app.net.ApiException
-import org.holidaylink.app.net.ContactMatch
+import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.User
 import org.holidaylink.app.phone.ContactMatcher
 import org.holidaylink.app.phone.Countries
@@ -133,38 +133,48 @@ fun ContactsScreen(
             if (contacts.isEmpty()) return
 
             matching = true
-            val hashes = contacts
-                .flatMap { c -> c.phones.mapNotNull { it.hash } }
-                .distinct()
-                .take(ContactMatcher.MAX_HASHES)
-
-            val matches: List<ContactMatch> = try {
-                api.contactMatch(hashes)
-            } catch (e: ApiException) {
-                error = e.message.orEmpty()
-                emptyList()
+            // Match locally-computed canonical numbers against Firestore users.
+            // Only these exact numbers are queried; names and photos stay on device.
+            val numberToUser = HashMap<String, User>()
+            val allCandidates = contacts
+                .flatMap { c -> c.phones.flatMap { org.holidaylink.app.phone.PhoneNumbers.candidatesFor(it.raw, dialCodes) } }
+                .distinct().take(1000)
+            try {
+                for (chunk in allCandidates.chunked(10)) {
+                    if (chunk.isEmpty()) continue
+                    val snap = FirebaseBackend.db.collection("users").whereIn("phone", chunk).get().await()
+                    snap.documents.forEach { d ->
+                        val phone = d.getString("phone").orEmpty()
+                        val name = d.getString("name").orEmpty()
+                        if (phone.isBlank() || name.isBlank()) return@forEach
+                        numberToUser[phone] = User(
+                            id = d.id,
+                            displayName = name,
+                            username = d.getString("username").orEmpty(),
+                            avatarUrl = d.getString("profilePic"),
+                            online = d.getBoolean("online") == true
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                error = "Matching needs internet. Your contacts are still listed below."
             }
-
-            // Index matches by the hash the client sent, then attach each one to the exact
-            // device number that produced that hash. The server never returns phone numbers.
-            val byHash = HashMap<String, ContactMatch>(matches.size)
-            matches.forEach { m -> if (m.hash.isNotBlank()) byHash[m.hash] = m }
 
             rows = contacts.map { contact ->
                 var matchedUser: User? = null
                 var matchedNumber: String? = null
                 for (phone in contact.phones) {
-                    val hit = phone.hash?.let { byHash[it] }
+                    val candidates = org.holidaylink.app.phone.PhoneNumbers.candidatesFor(phone.raw, dialCodes)
+                    val hit = candidates.firstNotNullOfOrNull { numberToUser[it] }
                     if (hit != null && matchedUser == null) {
-                        matchedUser = hit.user
+                        matchedUser = hit
                         matchedNumber = phone.raw
                     }
                 }
                 ContactRow(contact, matchedUser, matchedNumber)
             }
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message
-                ?: "We couldn't read your contacts. Please try again."
+            error = "We couldn't read your contacts. Please try again."
         } finally {
             loading = false
             matching = false

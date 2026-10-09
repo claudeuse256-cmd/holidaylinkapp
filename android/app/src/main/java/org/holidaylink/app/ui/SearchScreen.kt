@@ -40,12 +40,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
-import org.holidaylink.app.net.AiConversation
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
-import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.ChatItem
+import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.Message
-import org.holidaylink.app.net.SearchResults
+import org.holidaylink.app.net.StudyBuddy
 import org.holidaylink.app.net.User
 
 /** One line of the search result list, flattened so the LazyColumn can render it directly. */
@@ -54,17 +55,14 @@ private sealed interface SearchRow {
 
     data class Header(override val key: String, val title: String, val count: Int) : SearchRow
     data class Person(override val key: String, val user: User) : SearchRow
-    data class Contact(override val key: String, val user: User) : SearchRow
     data class Conversation(override val key: String, val chat: ChatItem) : SearchRow
     data class Note(override val key: String, val message: Message) : SearchRow
-    data class Ai(override val key: String, val chat: AiConversation) : SearchRow
+    data class Ai(override val key: String, val title: String) : SearchRow
 }
 
 /**
- * Global search across chats, people, messages and HolidayLink AI history.
- *
- * The query goes to the server, which applies the same privacy rules as the rest of the API,
- * so results never contain anything you would not already be allowed to open.
+ * Global search across chats, people and messages — all on Firestore,
+ * so results never contain anything you could not already open.
  */
 @Composable
 fun SearchScreen(
@@ -74,8 +72,12 @@ fun SearchScreen(
     onOpenUser: (User) -> Unit,
     onOpenAiChat: (String) -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var query by remember { mutableStateOf("") }
-    var results by remember { mutableStateOf(SearchResults()) }
+    var people by remember { mutableStateOf<List<User>>(emptyList()) }
+    var chats by remember { mutableStateOf<List<ChatItem>>(emptyList()) }
+    var notes by remember { mutableStateOf<List<Message>>(emptyList()) }
+    var aiHits by remember { mutableStateOf<List<String>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var searched by remember { mutableStateOf(false) }
@@ -84,47 +86,119 @@ fun SearchScreen(
 
     LaunchedEffect(trimmed) {
         if (trimmed.length < 2) {
-            results = SearchResults()
+            people = emptyList(); chats = emptyList(); notes = emptyList(); aiHits = emptyList()
             searched = false
             searching = false
             error = ""
             return@LaunchedEffect
         }
         searching = true
-        // Debounce so typing does not fire a request per keystroke.
-        delay(280)
+        // Debounce so typing does not fire reads per keystroke.
+        delay(400)
         try {
-            results = api.search(trimmed)
+            val uid = FirebaseBackend.uid.orEmpty()
+            val needle = trimmed.lowercase()
+            val dir = FirebaseBackend.db.collection("users").limit(300).get().await()
+            people = dir.documents.filter { it.id != uid }.mapNotNull { d ->
+                val name = d.getString("name").orEmpty()
+                if (name.isBlank()) return@mapNotNull null
+                val username = d.getString("username").orEmpty()
+                if (!name.lowercase().contains(needle) && !username.lowercase().contains(needle)) return@mapNotNull null
+                User(
+                    id = d.id, displayName = name, username = username,
+                    avatarUrl = d.getString("profilePic"), online = d.getBoolean("online") == true
+                )
+            }.take(20)
+            val chatDocs = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().await()
+            val peerCache = mutableMapOf<String, User>()
+            val mapped = chatDocs.documents.mapNotNull { d ->
+                val users = (d.get("users") as? List<String>) ?: emptyList()
+                if (!users.contains(uid)) return@mapNotNull null
+                val isGroup = d.getBoolean("isGroup") == true
+                val kind = when {
+                    d.getBoolean("isCommunity") == true -> "community"
+                    d.getBoolean("isBroadcast") == true -> "channel"
+                    isGroup -> "group"
+                    else -> "direct"
+                }
+                val peer = if (!isGroup) {
+                    val pid = users.firstOrNull { it != uid }.orEmpty()
+                    peerCache.getOrPut(pid) {
+                        runCatching { FirestoreChat.resolvePeer(pid) }.getOrNull()
+                            ?: User(pid, "HolidayLink user", "")
+                    }
+                } else null
+                val title = if (isGroup) d.getString("groupName") else peer?.displayName
+                ChatItem(
+                    id = d.id, kind = kind, title = title, peer = peer,
+                    lastBody = d.getString("lastText"),
+                    lastAt = d.getTimestamp("lastAt")?.toDate()?.toInstant()?.toString(),
+                    unreadCount = 0, pinned = false, archived = false, peerTyping = false
+                )
+            }
+            chats = mapped.filter {
+                val title = it.peer?.displayName ?: it.title.orEmpty()
+                title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
+            }.take(20)
+            val hits = mutableListOf<Message>()
+            for (doc in chatDocs.documents.take(20)) {
+                if (hits.size >= 20) break
+                val msgs = runCatching {
+                    FirebaseBackend.db.collection("chats").document(doc.id).collection("messages")
+                        .orderBy("timestamp").limitToLast(50).get().await()
+                }.getOrDefault(null) ?: continue
+                val isGroup = doc.getBoolean("isGroup") == true
+                val peerName = if (!isGroup) {
+                    val pid = ((doc.get("users") as? List<String>) ?: emptyList()).firstOrNull { it != uid }
+                    peerCache[pid]?.displayName
+                } else doc.getString("groupName")
+                msgs.documents.forEach { m ->
+                    val body = m.getString("text").orEmpty()
+                    if (body.lowercase().contains(needle)) {
+                        hits += Message(
+                            id = m.id,
+                            senderId = m.getString("senderId").orEmpty(),
+                            body = body,
+                            createdAt = m.getTimestamp("timestamp")?.toDate()?.toInstant()?.toString().orEmpty(),
+                            conversationId = doc.id,
+                            conversationKind = if (isGroup) "group" else "direct",
+                            conversationTitle = doc.getString("groupName"),
+                            conversationPeerName = peerName
+                        )
+                    }
+                }
+            }
+            notes = hits.take(20)
+            val history = StudyBuddy.loadHistory(context, uid)
+            aiHits = history.filter { it.second.lowercase().contains(needle) }
+                .take(5).map { (role, text) -> "${if (role == "user") "You" else "AI"}: ${text.take(80)}" }
             error = ""
             searched = true
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "Search isn't available right now."
+            error = "Search isn't available right now. Check your internet."
         } finally {
             searching = false
         }
     }
 
-    val rows = remember(results, searched) {
+    val rows = remember(people, chats, notes, aiHits, searched) {
         val out = mutableListOf<SearchRow>()
         fun <T> addGroup(id: String, title: String, items: List<T>, map: (T) -> SearchRow) {
             if (items.isEmpty()) return
             out += SearchRow.Header("hdr-$id", title, items.size)
             items.forEach { out += map(it) }
         }
-        addGroup("people", "People", results.users) {
+        addGroup("people", "People", people) {
             SearchRow.Person("user-${it.id}", it)
         }
-        addGroup("contacts", "Contacts", results.contacts) {
-            SearchRow.Contact("contact-${it.id}", it)
-        }
-        addGroup("chats", "Chats", results.chats) {
+        addGroup("chats", "Chats", chats) {
             SearchRow.Conversation("chat-${it.id}", it)
         }
-        addGroup("messages", "Messages", results.messages) {
-            SearchRow.Note("msg-${it.id}", it)
+        addGroup("messages", "Messages", notes) {
+            SearchRow.Note("msg-${it.id}-${it.conversationId}", it)
         }
-        addGroup("ai", "HolidayLink AI", results.ai) {
-            SearchRow.Ai("ai-${it.id}", it)
+        addGroup("ai", "HolidayLink AI", aiHits) {
+            SearchRow.Ai("ai-${it.hashCode()}", it)
         }
         out
     }
@@ -194,12 +268,8 @@ fun SearchScreen(
                     when (row) {
                         is SearchRow.Header -> SectionHeader(row.title, row.count)
                         is SearchRow.Person -> SearchPersonRow(row.user) { onOpenUser(row.user) }
-                        is SearchRow.Contact -> SearchPersonRow(row.user) { onOpenUser(row.user) }
                         is SearchRow.Conversation -> SearchChatRow(row.chat) { onOpenChat(row.chat) }
                         is SearchRow.Note -> SearchMessageRow(row.message) {
-                            // The server sends the chat's kind, title and peer name with every hit,
-                            // so a message opens the right chat with the right header instead of a
-                            // placeholder that has to be resolved later.
                             row.message.conversationId?.let { id ->
                                 val hit = row.message
                                 onOpenChat(
@@ -208,8 +278,6 @@ fun SearchScreen(
                                         kind = hit.conversationKind ?: "direct",
                                         title = hit.conversationTitle,
                                         peer = if (hit.conversationKind == "direct") {
-                                            // A real peer id keeps the header's call and profile
-                                            // actions working instead of a dead placeholder.
                                             User(
                                                 id = hit.conversationPeerId.orEmpty(),
                                                 displayName = hit.conversationPeerName
@@ -226,7 +294,7 @@ fun SearchScreen(
                                 )
                             }
                         }
-                        is SearchRow.Ai -> SearchAiRow(row.chat) { onOpenAiChat(row.chat.id) }
+                        is SearchRow.Ai -> SearchAiRow(row.title) { onOpenAiChat("thread") }
                     }
                 }
             }
@@ -373,7 +441,7 @@ private fun SearchMessageRow(message: Message, onClick: () -> Unit) {
 }
 
 @Composable
-private fun SearchAiRow(chat: AiConversation, onClick: () -> Unit) {
+private fun SearchAiRow(title: String, onClick: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -396,13 +464,13 @@ private fun SearchAiRow(chat: AiConversation, onClick: () -> Unit) {
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(
-                chat.title,
+                title,
                 style = MaterialTheme.typography.bodyLarge,
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                "HolidayLink AI · ${friendlyWhen(chat.updatedAt)}",
+                "HolidayLink AI",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

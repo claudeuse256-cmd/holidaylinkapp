@@ -52,8 +52,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Profile
 import org.holidaylink.app.net.User
 import org.holidaylink.app.phone.PhoneNumbers
@@ -86,13 +88,40 @@ fun UserProfileScreen(
 
     suspend fun reload() {
         try {
-            profile = api.userProfile(user.id)
+            val me = FirebaseBackend.uid.orEmpty()
+            val snap = FirebaseBackend.db.collection("users").document(user.id).get().await()
+            if (!snap.exists()) throw ApiException("That profile no longer exists.")
+            val myBlocked = runCatching {
+                @Suppress("UNCHECKED_CAST")
+                (FirebaseBackend.db.collection("users").document(me).get().await().get("blocked") as? List<String>).orEmpty()
+            }.getOrDefault(emptyList())
+            @Suppress("UNCHECKED_CAST")
+            val theirBlocked = (snap.get("blocked") as? List<String>).orEmpty()
+            profile = Profile(
+                id = user.id,
+                displayName = snap.getString("name")?.takeIf { it.isNotBlank() } ?: "HolidayLink user",
+                username = snap.getString("username"),
+                avatarUrl = snap.getString("profilePic"),
+                about = snap.getString("bio"),
+                phone = snap.getString("phone"),
+                online = snap.getBoolean("online"),
+                lastSeen = snap.getTimestamp("lastSeen")?.toDate()?.toInstant()?.toString(),
+                isBlocked = myBlocked.contains(user.id),
+                blockedByThem = theirBlocked.contains(me)
+            )
             error = ""
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "We couldn't load that profile."
+            error = "We couldn't load that profile. Check your internet."
         } finally {
             loading = false
         }
+    }
+
+    suspend fun setBlocked(block: Boolean) {
+        val me = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
+        val ref = FirebaseBackend.db.collection("users").document(me)
+        if (block) ref.update("blocked", com.google.firebase.firestore.FieldValue.arrayUnion(user.id)).await()
+        else ref.update("blocked", com.google.firebase.firestore.FieldValue.arrayRemove(user.id)).await()
     }
 
     LaunchedEffect(user.id) { reload() }
@@ -269,17 +298,15 @@ fun UserProfileScreen(
                 TextButton(onClick = {
                     confirmBlock = false
                     scope.launch {
-                        runCatching { api.setBlocked(user.id, !blocked) }
+                        runCatching { setBlocked(!blocked) }
                             .onSuccess {
                                 snackbar.showSnackbar(
                                     if (blocked) "Unblocked." else "Blocked."
                                 )
                                 reload()
                             }
-                            .onFailure { e ->
-                                snackbar.showSnackbar(
-                                    (e as? ApiException)?.message ?: "That didn't work."
-                                )
+                            .onFailure {
+                                snackbar.showSnackbar("That didn't work. Check your internet.")
                             }
                     }
                 }) {
@@ -303,7 +330,16 @@ fun UserProfileScreen(
                 TextButton(onClick = {
                     confirmReport = false
                     scope.launch {
-                        runCatching { api.reportUser(user.id, "profile") }
+                        runCatching {
+                            FirebaseBackend.db.collection("reports").add(
+                                mapOf(
+                                    "reporterId" to (FirebaseBackend.uid.orEmpty()),
+                                    "reportedId" to user.id,
+                                    "reason" to "profile",
+                                    "createdAt" to com.google.firebase.Timestamp.now()
+                                )
+                            ).await()
+                        }
                             .onSuccess { snackbar.showSnackbar("Report sent. Thank you.") }
                             .onFailure {
                                 snackbar.showSnackbar("We couldn't send that report.")
