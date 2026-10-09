@@ -66,7 +66,6 @@ fun CallsScreen(
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
     var filter by remember { mutableStateOf("all") }
-    val scope = rememberCoroutineScope()
     val peerCache = remember { mutableStateMapOf<String, User>() }
 
     suspend fun loadHistory(): List<CallRecord> {

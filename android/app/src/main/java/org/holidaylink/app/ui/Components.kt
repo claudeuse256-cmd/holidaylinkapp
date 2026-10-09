@@ -738,3 +738,9 @@ fun longWhen(value: String?): String {
         .withZone(ZoneId.systemDefault())
         .format(instant)
 }
+
+/** m:ss duration label for calls and voice notes. */
+fun formatDuration(ms: Long): String {
+    val totalSeconds = (ms / 1000).coerceAtLeast(0)
+    return "%d:%02d".format(totalSeconds / 60, totalSeconds % 60)
+}

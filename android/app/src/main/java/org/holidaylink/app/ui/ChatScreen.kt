@@ -50,6 +50,8 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -616,6 +618,7 @@ private fun urlToStoragePath(url: String): String? {
 // ------------------------------------------------------------------ bubbles
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun FsMessageBubble(
     message: FirestoreChat.ChatMessage,
     mine: Boolean,
