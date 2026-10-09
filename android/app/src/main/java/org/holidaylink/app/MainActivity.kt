@@ -91,7 +91,9 @@ import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AccountStore
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.CallManager
 import org.holidaylink.app.ui.CallScreen
 import org.holidaylink.app.net.ChatItem
@@ -273,19 +275,32 @@ private fun SignedInApp(
     val pop: () -> Unit = { if (stack.size > 1) stack.removeAt(stack.lastIndex) }
 
     LaunchedEffect(Unit) {
-        runCatching { api.me() }.onSuccess { loaded ->
-            me = loaded
-            api.sessionToken()?.let { token ->
-                AccountStore.upsert(prefs, AccountStore.Account(loaded.id, token, loaded.phone, loaded.displayName, loaded.username))
-            }
-        }.onFailure { e ->
-            if ((e as? ApiException)?.code == "ACCOUNT_BANNED") onBanned(e.message ?: "This account was banned.")
+        runCatching {
+            val uid = FirebaseBackend.uid ?: return@runCatching
+            val profile = FirebaseBackend.loadProfile(uid) ?: return@runCatching
+            me = Me(
+                id = uid,
+                phone = profile.phone,
+                email = profile.email.takeIf { it.isNotBlank() },
+                displayName = profile.name.takeIf { it.isNotBlank() } ?: "HolidayLink user",
+                username = profile.username,
+                avatarUrl = profile.profilePic,
+                about = profile.bio.takeIf { it.isNotBlank() },
+                online = true
+            )
         }
         // A website-admin ban lands mid-session too: re-check quietly every minute.
         while (true) {
             delay(60_000)
-            runCatching { api.me() }.onFailure { e ->
-                if ((e as? ApiException)?.code == "ACCOUNT_BANNED") onBanned(e.message ?: "This account was banned.")
+            val uid = FirebaseBackend.uid
+            val banned = uid != null && runCatching {
+                FirebaseBackend.loadProfile(uid)?.banned == true
+            }.getOrDefault(false)
+            if (banned) {
+                val reason = runCatching { FirebaseBackend.loadProfile(uid!!)?.banReason }.getOrNull()
+                onBanned(reason?.takeIf { it.isNotBlank() }?.let { "This account was banned: $it" }
+                    ?: "This account was banned.")
+                break
             }
         }
     }
@@ -305,10 +320,28 @@ private fun SignedInApp(
     // real title, kind and peer instead of opening a header labelled "Group" for a direct chat.
     val openConversationById: (String) -> Unit = { conversationId ->
         scope.launch {
-            val chat = runCatching { api.conversations() }
-                .getOrNull()
-                ?.firstOrNull { it.id == conversationId }
-                ?: ChatItem(conversationId, "direct", null, null, null, null)
+            val doc = runCatching {
+                FirebaseBackend.db.collection("chats").document(conversationId).get().await()
+            }.getOrNull()
+            val chat = if (doc != null && doc.exists()) {
+                val users = (doc.get("users") as? List<String>) ?: emptyList()
+                val isGroup = doc.getBoolean("isGroup") == true
+                val me = FirebaseBackend.uid.orEmpty()
+                if (!isGroup) {
+                    val peerId = users.firstOrNull { it != me }.orEmpty()
+                    val peer = runCatching { FirestoreChat.resolvePeer(peerId) }.getOrNull()
+                    ChatItem(conversationId, "direct", null, peer, null, null)
+                } else {
+                    val kind = when {
+                        doc.getBoolean("isCommunity") == true -> "community"
+                        doc.getBoolean("isBroadcast") == true -> "channel"
+                        else -> "group"
+                    }
+                    ChatItem(conversationId, kind, doc.getString("groupName"), null, null, null)
+                }
+            } else {
+                ChatItem(conversationId, "direct", null, null, null, null)
+            }
             stack.add(Destination.Chat(chat))
         }
     }
@@ -829,28 +862,55 @@ private fun ChannelsScreen(
     onNewCommunity: () -> Unit
 ) {
     val scheme = MaterialTheme.colorScheme
-    var chats by remember { mutableStateOf<List<ChatItem>>(emptyList()) }
+    var rows by remember { mutableStateOf<List<FirestoreChat.ChatRow>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableStateOf(0) }
     var filter by remember { mutableStateOf("All") }
+    val uid = FirebaseBackend.uid.orEmpty()
     LaunchedEffect(reload) {
-        loading = chats.isEmpty()
-        try { chats = api.conversations(); error = "" } catch (e: Exception) { error = (e as? ApiException)?.message ?: "Couldn't load." }
+        loading = rows.isEmpty()
+        try {
+            rows = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().await()
+                .documents.mapNotNull { d ->
+                    val users = (d.get("users") as? List<String>) ?: emptyList()
+                    if (!users.contains(uid)) return@mapNotNull null
+                    FirestoreChat.ChatRow(
+                        id = d.id,
+                        isGroup = d.getBoolean("isGroup") == true,
+                        isBroadcast = d.getBoolean("isBroadcast") == true,
+                        isCommunity = d.getBoolean("isCommunity") == true,
+                        title = d.getString("groupName").orEmpty(),
+                        peerId = null,
+                        lastBody = d.getString("lastText"),
+                        lastAt = d.getTimestamp("lastAt"),
+                        unread = 0
+                    )
+                }
+            error = ""
+        } catch (e: Exception) { error = "Couldn't load. Check your internet." }
         loading = false
     }
-    val groups = chats.filter { it.kind == "group" }
-    val channels = chats.filter { it.kind == "channel" }
-    val communities = chats.filter { it.kind == "community" }
+    val groups = rows.filter { it.isGroup && !it.isBroadcast && !it.isCommunity }
+    val channels = rows.filter { it.isBroadcast }
+    val communities = rows.filter { it.isCommunity }
     val shown = when (filter) {
         "Channels" -> channels
         "Groups" -> groups
         "Communities" -> communities
         else -> channels + communities + groups
     }
+    fun toItem(row: FirestoreChat.ChatRow): ChatItem {
+        val kind = when {
+            row.isCommunity -> "community"
+            row.isBroadcast -> "channel"
+            else -> "group"
+        }
+        return ChatItem(row.id, kind, row.title.ifBlank { "Group" }, null, row.lastBody, row.lastAt?.toDate()?.toInstant()?.toString(), 0, false, false, false)
+    }
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Channels", color = scheme.onBackground, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-        Text("Broadcast channels, groups and communities — same Postgres, WhatsApp/Telegram style", color = scheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp, bottom = 10.dp))
+        Text("Broadcast channels, groups and communities — WhatsApp/Telegram style", color = scheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp, bottom = 10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("All", "Channels", "Groups", "Communities").forEach { f ->
                 FilterChip(selected = filter == f, onClick = { filter = f }, label = { Text(f) })
@@ -865,11 +925,16 @@ private fun ChannelsScreen(
         Spacer(Modifier.height(10.dp))
         when {
             loading -> LoadingState(label = "Loading channels…")
-            error.isNotBlank() && chats.isEmpty() -> ErrorState(error) { reload++ }
+            error.isNotBlank() && rows.isEmpty() -> ErrorState(error) { reload++ }
             shown.isEmpty() -> EmptyState(icon = Icons.Default.Campaign, title = "Nothing here yet", subtitle = "Create the first $filter to get started.", action = { Button(onClick = onNewChannel) { Text("Create") } })
             else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(shown, key = { it.id }) { chat ->
-                    val badge = when (chat.kind) { "channel" -> "CHANNEL"; "community" -> "COMMUNITY"; else -> "GROUP" }
+                items(shown, key = { it.id }) { row ->
+                    val chat = toItem(row)
+                    val badge = when {
+                        row.isCommunity -> "COMMUNITY"
+                        row.isBroadcast -> "CHANNEL"
+                        else -> "GROUP"
+                    }
                     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(scheme.surfaceContainerHigh).border(1.dp, scheme.outlineVariant, RoundedCornerShape(18.dp)).clickable { onOpenChat(chat) }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.size(48.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF7A2CFF)))), contentAlignment = Alignment.Center) {
                             Icon(when (chat.kind) { "channel" -> Icons.Default.Campaign; "community" -> Icons.Default.Groups; else -> Icons.Default.Group }, null, tint = Color.White)

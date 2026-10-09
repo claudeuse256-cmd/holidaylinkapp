@@ -38,13 +38,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 import org.holidaylink.app.net.Api
-import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.ChatItem
+import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.User
 import org.holidaylink.app.phone.ContactMatcher
 import org.holidaylink.app.phone.DeviceContacts
+import org.holidaylink.app.phone.PhoneNumbers
 
 /**
  * Users tab: WhatsApp-style small rows.
@@ -79,27 +83,51 @@ fun UsersScreen(
         loading = users.isEmpty()
         try {
             val ctx = api.appContextForCache()
-            // Phone-contact hashes stay on device except SHA-256 for matching.
-            val deviceHashes = runCatching {
-                val contacts = DeviceContacts.read(ctx, ContactMatcher.defaultDialCodes(ctx))
-                contacts.flatMap { c -> c.phones.mapNotNull { it.hash } }.distinct().take(ContactMatcher.MAX_HASHES)
+            val uid = FirebaseBackend.uid.orEmpty()
+            // Phone matching stays on-device in spirit: read the address book
+            // locally, then query Firestore only for those exact numbers.
+            val dialCodes = ContactMatcher.defaultDialCodes(ctx)
+            val deviceNumbers = runCatching {
+                withContext(Dispatchers.IO) { DeviceContacts.read(ctx, dialCodes) }
+                    .flatMap { c -> c.phones.flatMap { PhoneNumbers.candidatesFor(it.raw, dialCodes) } }
+                    .distinct().take(1000)
             }.getOrDefault(emptyList())
-            val matched = if (deviceHashes.isNotEmpty()) runCatching { api.contactMatch(deviceHashes) }.getOrDefault(emptyList()) else emptyList()
-            contactIds = matched.map { it.user.id }.toSet()
+            val foundIds = mutableSetOf<String>()
+            for (chunk in deviceNumbers.chunked(10)) {
+                if (chunk.isEmpty()) continue
+                val snap = FirebaseBackend.db.collection("users").whereIn("phone", chunk).get().await()
+                snap.documents.forEach { foundIds.add(it.id) }
+            }
+            contactIds = foundIds
 
-            val all = api.users("")
-            val chats = runCatching { api.conversations() }.getOrDefault(emptyList())
-            val directPeers = chats.filter { it.kind == "direct" }.mapNotNull { it.peer?.id }.toSet()
+            val dir = FirebaseBackend.db.collection("users").limit(300).get().await()
+            val all = dir.documents.filter { it.id != uid }.mapNotNull { d ->
+                val name = d.getString("name").orEmpty()
+                if (name.isBlank()) return@mapNotNull null
+                User(
+                    id = d.id,
+                    displayName = name,
+                    username = d.getString("username").orEmpty(),
+                    avatarUrl = d.getString("profilePic"),
+                    online = d.getBoolean("online") == true
+                )
+            }
+            val chatDocs = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().await()
+            val directPeers = chatDocs.documents
+                .filter { it.getBoolean("isGroup") != true }
+                .mapNotNull { doc ->
+                    ((doc.get("users") as? List<String>) ?: emptyList()).firstOrNull { it != uid }
+                }.toSet()
             friendIds = directPeers
             // Common ground: how many groups/channels/communities share each user.
             val counts = mutableMapOf<String, Int>()
-            val memberCache = mutableMapOf<String, Set<String>>()
-            for (chat in chats.filter { it.kind != "direct" }) {
-                val members = memberCache.getOrPut(chat.id) {
-                    runCatching { api.conversationMembers(chat.id) }.getOrDefault(emptyList()).toSet()
+            chatDocs.documents
+                .filter { it.getBoolean("isGroup") == true }
+                .forEach { doc ->
+                    val members = ((doc.get("members") as? List<String>)
+                        ?: (doc.get("users") as? List<String>)).orEmpty()
+                    members.filter { it != uid }.forEach { m -> counts[m] = (counts[m] ?: 0) + 1 }
                 }
-                for (m in members) counts[m] = (counts[m] ?: 0) + 1
-            }
             mutualCount = counts
             users = all
             // Offline cache for Users ordering.
@@ -108,7 +136,7 @@ fun UsersScreen(
         } catch (e: Exception) {
             val cached = runCatching { api.readUsersCache() }.getOrNull()
             if (cached != null && cached.isNotEmpty()) { users = cached; error = "" }
-            else error = (e as? ApiException)?.message ?: "Couldn't load people. Check your internet."
+            else error = "Couldn't load people. Check your internet."
         } finally { loading = false }
     }
 

@@ -68,12 +68,18 @@ object MediaPicker {
 
     /** Down-scales an image and returns it as a JPEG data URL, or null when it cannot be read. */
     fun imageDataUrl(context: Context, uri: Uri): String? = runCatching {
+        val bytes = imageJpegBytes(context, uri) ?: return@runCatching null
+        "data:image/jpeg;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+    }.onFailure { Log.w(TAG, "image encode failed: ${it.message}") }.getOrNull()
+
+    /** Down-scales an image and returns raw JPEG bytes, or null when it cannot be read. */
+    fun imageJpegBytes(context: Context, uri: Uri): ByteArray? = runCatching {
         val decoded = decodeDownscaled(context, uri, imageMaxDimension)
             ?: return@runCatching null
         val out = ByteArrayOutputStream()
         decoded.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out)
         decoded.recycle()
-        "data:image/jpeg;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        out.toByteArray()
     }.onFailure { Log.w(TAG, "image encode failed: ${it.message}") }.getOrNull()
 
     /** Reads a document / audio / video file verbatim as a data URL. */

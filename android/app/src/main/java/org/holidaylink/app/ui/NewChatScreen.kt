@@ -47,9 +47,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
-import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.ChatItem
+import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.User
 
 enum class NewChatMode { DIRECT, GROUP, CHANNEL, COMMUNITY }
@@ -81,10 +83,26 @@ fun NewChatScreen(
 
     LaunchedEffect(query) {
         try {
-            users = api.users(query.trim())
+            val snap = FirebaseBackend.db.collection("users").limit(200).get().await()
+            val needle = query.trim().lowercase()
+            val me = FirebaseBackend.uid.orEmpty()
+            users = snap.documents.filter { it.id != me }.mapNotNull { d ->
+                val name = d.getString("name").orEmpty()
+                if (name.isBlank()) return@mapNotNull null
+                User(
+                    id = d.id,
+                    displayName = name,
+                    username = d.getString("username").orEmpty(),
+                    avatarUrl = d.getString("profilePic"),
+                    online = d.getBoolean("online") == true
+                )
+            }.filter {
+                needle.isBlank() || it.displayName.lowercase().contains(needle) ||
+                    it.username.lowercase().contains(needle)
+            }
             error = ""
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "We couldn't load people."
+            error = "We couldn't load people. Check your internet."
         } finally {
             loading = false
         }
@@ -205,16 +223,13 @@ fun NewChatScreen(
                                             if (busy) return@clickable
                                             busy = true
                                             scope.launch {
-                                                runCatching { api.startDirect(user.id) }
+                                                runCatching { FirestoreChat.startDirect(user.id) }
                                                     .onSuccess { id ->
                                                         onOpenChat(ChatItem(id, "direct", null, user, null, null))
                                                     }
                                                     .onFailure { e ->
                                                         busy = false
-                                                        snackbar.showSnackbar(
-                                                            (e as? ApiException)?.message
-                                                                ?: "We couldn't open that chat."
-                                                        )
+                                                        snackbar.showSnackbar("We couldn't open that chat.")
                                                     }
                                             }
                                         }
@@ -274,21 +289,18 @@ fun NewChatScreen(
                         scope.launch {
                             runCatching {
                                 when (mode) {
-                                    NewChatMode.CHANNEL -> api.createChannel(title.trim(), selected.toList())
-                                    NewChatMode.COMMUNITY -> api.createCommunity(title.trim(), selected.toList())
-                                    else -> api.createGroup(title.trim(), selected.toList())
+                                    NewChatMode.CHANNEL -> FirestoreChat.createGroup(title.trim(), selected.toList(), broadcast = true)
+                                    NewChatMode.COMMUNITY -> FirestoreChat.createGroup(title.trim(), selected.toList(), community = true)
+                                    else -> FirestoreChat.createGroup(title.trim(), selected.toList())
                                 }
                             }
                                 .onSuccess { id ->
                                     busy = false
                                     onOpenChat(ChatItem(id, kindLabel, title.trim(), null, null, null))
                                 }
-                                .onFailure { e ->
+                                .onFailure {
                                     busy = false
-                                    snackbar.showSnackbar(
-                                        (e as? ApiException)?.message
-                                            ?: "We couldn't create that $kindLabel."
-                                    )
+                                    snackbar.showSnackbar("We couldn't create that $kindLabel.")
                                 }
                         }
                     },

@@ -60,8 +60,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.Imgbb
 import org.holidaylink.app.net.Me
 import org.holidaylink.app.phone.Countries
 import org.holidaylink.app.phone.PhoneNumbers
@@ -94,17 +97,37 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
     suspend fun reload() {
         loading = me == null
         try {
-            val fresh = api.me()
+            val uid = FirebaseBackend.uid ?: throw org.holidaylink.app.net.ApiException("Sign in again first.")
+            val p = FirebaseBackend.loadProfile(uid)
+                ?: throw org.holidaylink.app.net.ApiException("We couldn't load your profile.")
+            val fresh = Me(
+                id = uid,
+                phone = p.phone,
+                email = p.email.takeIf { it.isNotBlank() },
+                displayName = p.name.takeIf { it.isNotBlank() } ?: "HolidayLink user",
+                username = p.username,
+                avatarUrl = p.profilePic,
+                about = p.bio.takeIf { it.isNotBlank() }
+            )
             me = fresh
             displayName = fresh.displayName
             username = fresh.username
             about = fresh.about.orEmpty()
             error = ""
         } catch (e: Exception) {
-            error = (e as? org.holidaylink.app.net.ApiException)?.message
-                ?: "We couldn't load your profile."
+            error = "We couldn't load your profile. Check your internet."
         } finally {
             loading = false
+        }
+    }
+
+    suspend fun saveAvatarUrl(url: String?) {
+        val uid = FirebaseBackend.uid ?: throw org.holidaylink.app.net.ApiException("Sign in again first.")
+        if (url == null) {
+            FirebaseBackend.db.collection("users").document(uid)
+                .update("profilePic", com.google.firebase.firestore.FieldValue.delete()).await()
+        } else {
+            FirebaseBackend.db.collection("users").document(uid).update("profilePic", url).await()
         }
     }
 
@@ -116,20 +139,20 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
         if (uri != null) {
             scope.launch {
                 saving = true
-                val dataUrl = MediaPicker.imageDataUrl(context, uri)
-                if (dataUrl == null) {
+                val bytes = MediaPicker.imageJpegBytes(context, uri)
+                if (bytes == null) {
                     snackbar.showSnackbar("That image couldn't be read. Try another one.")
                 } else {
-                    runCatching { api.updateProfile(avatarDataUrl = dataUrl) }
+                    runCatching {
+                        val url = Imgbb.uploadJpeg(bytes)
+                        saveAvatarUrl(url)
+                        reload()
+                    }
                         .onSuccess {
-                            me = it
                             snackbar.showSnackbar("Profile photo updated.")
                         }
                         .onFailure {
-                            snackbar.showSnackbar(
-                                (it as? org.holidaylink.app.net.ApiException)?.message
-                                    ?: "We couldn't update your photo."
-                            )
+                            snackbar.showSnackbar("We couldn't update your photo. Check your internet.")
                         }
                 }
                 saving = false
@@ -256,20 +279,24 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                                     saving = true
                                     scope.launch {
                                         runCatching {
-                                            api.updateProfile(
-                                                displayName = displayName.trim(),
-                                                username = username.trim(),
-                                                about = about.trim()
-                                            )
+                                            val uid = FirebaseBackend.uid
+                                                ?: throw org.holidaylink.app.net.ApiException("Sign in again first.")
+                                            val cleanName = displayName.trim().take(120)
+                                            val cleanUsername = username.trim().lowercase()
+                                                .filter { it.isLetterOrDigit() || it == '_' }.take(32)
+                                            if (cleanName.isBlank() || cleanUsername.length < 3) {
+                                                throw org.holidaylink.app.net.ApiException("Enter a display name and a 3+ character username.")
+                                            }
+                                            if (FirebaseBackend.isUsernameTaken(cleanUsername, uid)) {
+                                                throw org.holidaylink.app.net.ApiException("That @username is already taken.")
+                                            }
+                                            FirebaseBackend.saveProfile(uid, cleanName, cleanUsername, about.trim().take(140))
+                                            reload()
                                         }.onSuccess {
-                                            me = it
                                             editing = false
                                             snackbar.showSnackbar("Profile saved.")
-                                        }.onFailure { e ->
-                                            snackbar.showSnackbar(
-                                                (e as? org.holidaylink.app.net.ApiException)?.message
-                                                    ?: "We couldn't save your profile."
-                                            )
+                                        }.onFailure {
+                                            snackbar.showSnackbar("We couldn't save your profile. Check your internet.")
                                         }
                                         saving = false
                                     }
@@ -387,9 +414,8 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                 TextButton(onClick = {
                     confirmRemovePhoto = false
                     scope.launch {
-                        runCatching { api.updateProfile(removeAvatar = true) }
+                        runCatching { saveAvatarUrl(null); reload() }
                             .onSuccess {
-                                me = it
                                 snackbar.showSnackbar("Profile photo removed.")
                             }
                             .onFailure { snackbar.showSnackbar("We couldn't remove that photo.") }

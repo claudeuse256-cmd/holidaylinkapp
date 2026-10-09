@@ -57,8 +57,11 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.Imgbb
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Me
 import org.holidaylink.app.net.StatusUpdate
@@ -87,10 +90,10 @@ fun StatusScreen(
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
         try {
-            statuses = api.statuses()
+            statuses = loadFirestoreStatuses()
             error = ""
         } catch (e: Exception) {
-            error = (e as? ApiException)?.message ?: "We couldn't load status updates."
+            error = "We couldn't load status updates. Check your internet."
         } finally {
             loading = false
             refreshing = false
@@ -100,7 +103,7 @@ fun StatusScreen(
     LaunchedEffect(Unit) {
         while (true) {
             kotlinx.coroutines.delay(30_000)
-            runCatching { statuses = api.statuses() }
+            runCatching { statuses = loadFirestoreStatuses() }
         }
     }
 
@@ -402,23 +405,76 @@ private fun StatusComposer(
                     posting = true
                     error = ""
                     scope.launch {
-                        runCatching { api.createStatus(text.trim(), media) }
+                        runCatching { postFirestoreStatus(text.trim(), media) }
                             .onSuccess {
                                 onPosted()
                             }
-                            .onFailure { e ->
+                            .onFailure {
                                 posting = false
-                                error = (e as? ApiException)?.message
-                                    ?: "We couldn't post that status."
+                                error = "We couldn't post that status. Check your internet."
                             }
                     }
                 },
-                // The server accepts a photo on its own, so a text-less post is allowed too.
+                // A photo on its own is allowed too.
                 enabled = (text.isNotBlank() || media != null) && !posting && !encoding
             ) { Text(if (posting) "Posting…" else "Post") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
+}
+
+/** Firestore statuses: same docs as the website (24h expiry, imgbb photos). */
+private suspend fun loadFirestoreStatuses(): List<StatusUpdate> {
+    val now = com.google.firebase.Timestamp.now()
+    val snap = FirebaseBackend.db.collection("statuses")
+        .whereGreaterThan("expiresAt", now)
+        .orderBy("expiresAt")
+        .limit(200).get().await()
+    val docs = snap.documents.sortedByDescending { it.getTimestamp("createdAt")?.seconds ?: 0 }
+    val authors = mutableMapOf<String, Pair<String, String?>>()
+    return docs.mapNotNull { d ->
+        val userId = d.getString("userId").orEmpty()
+        if (userId.isBlank()) return@mapNotNull null
+        val author = authors.getOrPut(userId) {
+            val p = runCatching { FirebaseBackend.loadProfile(userId) }.getOrNull()
+            (p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user") to p?.profilePic
+        }
+        StatusUpdate(
+            id = d.id,
+            userId = userId,
+            userName = author.first,
+            avatarUrl = author.second,
+            kind = if (d.getString("mediaUrl").isNullOrBlank() && d.getString("imageUrl").isNullOrBlank()) "text" else "image",
+            body = d.getString("body") ?: d.getString("caption"),
+            mediaUrl = d.getString("mediaUrl") ?: d.getString("imageUrl"),
+            createdAt = (d.getTimestamp("createdAt")?.toDate()?.toInstant()?.toString()).orEmpty(),
+            viewerCount = 0,
+            seenByMe = false
+        )
+    }
+}
+
+/** Post text + optional photo (imgbb, like the website) with 24h expiry. */
+private suspend fun postFirestoreStatus(text: String, mediaDataUrl: String?) {
+    val uid = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
+    var mediaUrl: String? = null
+    if (!mediaDataUrl.isNullOrBlank() && mediaDataUrl.startsWith("data:")) {
+        val base64 = mediaDataUrl.substringAfter(",", "")
+        if (base64.isBlank()) throw ApiException("That photo couldn't be read.")
+        val bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
+        mediaUrl = Imgbb.uploadJpeg(bytes)
+    }
+    val now = com.google.firebase.Timestamp.now()
+    FirebaseBackend.db.collection("statuses").add(
+        mapOf(
+            "userId" to uid,
+            "kind" to if (mediaUrl != null) "image" else "text",
+            "body" to text,
+            "mediaUrl" to mediaUrl,
+            "createdAt" to now,
+            "expiresAt" to com.google.firebase.Timestamp(now.seconds + 24 * 3600, 0)
+        )
+    ).await()
 }
 
 /** Horizontal strip of people who have a status, shown above the list. */

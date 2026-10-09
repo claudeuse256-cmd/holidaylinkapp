@@ -57,9 +57,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
-import org.holidaylink.app.net.AiBot
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.FirestoreBots
+import org.holidaylink.app.net.FirestoreBots.StudyBot
 
 /**
  * HolidayLink AI profile: tappable identity like a user profile.
@@ -75,18 +76,18 @@ fun AiProfileScreen(
 ) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
-    var bots by remember { mutableStateOf<List<AiBot>>(emptyList()) }
+    var bots by remember { mutableStateOf<List<StudyBot>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var creating by remember { mutableStateOf(false) }
     var botName by remember { mutableStateOf("") }
     var botUsername by remember { mutableStateOf("") }
     var botInstructions by remember { mutableStateOf("") }
-    var confirmDelete by remember { mutableStateOf<AiBot?>(null) }
+    var confirmDelete by remember { mutableStateOf<StudyBot?>(null) }
 
     suspend fun reload() {
         loading = bots.isEmpty()
         try {
-            bots = api.aiBots()
+            bots = FirestoreBots.list()
         } catch (e: Exception) {
             snackbar.showSnackbar((e as? ApiException)?.message ?: "Couldn't load bots.")
         } finally {
@@ -162,7 +163,7 @@ fun AiProfileScreen(
                 Button(
                     onClick = {
                         scope.launch {
-                            runCatching { api.createBot(botUsername.trim(), botName.trim(), botInstructions.trim()) }
+                            runCatching { FirestoreBots.create(botUsername.trim(), botName.trim(), botInstructions.trim()) }
                                 .onSuccess {
                                     bots = listOf(it) + bots
                                     botName = ""; botUsername = ""; botInstructions = ""; creating = false
@@ -234,7 +235,7 @@ fun AiProfileScreen(
                 TextButton(onClick = {
                     confirmDelete = null
                     scope.launch {
-                        runCatching { api.deleteBot(doomed.id) }
+                        runCatching { FirestoreBots.delete(doomed) }
                             .onSuccess { bots = bots.filterNot { it.id == doomed.id } }
                             .onFailure { scope.launch { snackbar.showSnackbar("Couldn't delete that bot.") } }
                     }

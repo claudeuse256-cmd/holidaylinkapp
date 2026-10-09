@@ -1,6 +1,5 @@
 package org.holidaylink.app.ui
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -29,10 +28,12 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,12 +41,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ChatItem
+import org.holidaylink.app.net.FirestoreChat
+import org.holidaylink.app.net.User
 
-/** Recent conversations with pinned-first ordering, unread badges, mute and preview. */
+/** Recent conversations from Firestore (same docs as the website), realtime. */
 @Composable
 fun ChatsScreen(
     api: Api,
@@ -53,46 +56,53 @@ fun ChatsScreen(
     onOpenChat: (ChatItem) -> Unit,
     showChrome: Boolean = true
 ) {
-    var chats by remember { mutableStateOf<List<ChatItem>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
-    var refreshing by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf("") }
+    val uid = currentUserId.ifBlank { FirestoreChat.myUid() }
     var query by remember { mutableStateOf("") }
-    var reload by remember { mutableIntStateOf(0) }
+    var error by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    val peerCache = remember { mutableStateMapOf<String, User>() }
 
-    LaunchedEffect(reload) {
-        if (reload > 0) refreshing = true
-        try {
-            chats = api.conversations()
-            error = ""
-        } catch (e: Exception) {
-            error = (e as? org.holidaylink.app.net.ApiException)?.message
-                ?: "We couldn't load your chats."
-        } finally {
-            loading = false
-            refreshing = false
-        }
-    }
+    val rows by remember(uid) { FirestoreChat.chatsFlow(uid) }
+        .collectAsState(initial = emptyList())
 
-    // Light polling keeps presence and new messages fresh without a WebSocket client.
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(20_000)
-            if (error.isBlank()) {
-                runCatching { chats = api.conversations() }
+    // Realtime flow never "loads" via try/catch; surface listener liveness.
+    var firstSnapshot by remember { mutableStateOf(false) }
+    LaunchedEffect(rows) { if (rows.isNotEmpty() || error.isNotBlank()) firstSnapshot = true }
+
+    // Resolve peer names for direct chats (cached per session).
+    LaunchedEffect(rows) {
+        rows.mapNotNull { it.peerId }.filter { !peerCache.containsKey(it) }.take(30).forEach { pid ->
+            scope.launch {
+                runCatching { FirestoreChat.resolvePeer(pid) }.onSuccess { peerCache[pid] = it }
             }
         }
     }
 
-    val visible = remember(chats, query) {
+    fun toItem(row: FirestoreChat.ChatRow): ChatItem {
+        val peer = row.peerId?.let { peerCache[it] }
+        val kind = when {
+            row.isCommunity -> "community"
+            row.isBroadcast -> "channel"
+            row.isGroup -> "group"
+            else -> "direct"
+        }
+        val title = if (row.isGroup || row.isBroadcast || row.isCommunity) {
+            row.title.ifBlank { "Group" }
+        } else null
+        return ChatItem(
+            row.id, kind, title, peer,
+            row.lastBody, row.lastAt?.toDate()?.toInstant()?.toString(),
+            row.unread, false, false, false
+        )
+    }
+
+    val visible = remember(rows, query, peerCache) {
         val needle = query.trim().lowercase()
-        val filtered = if (needle.isBlank()) chats else chats.filter {
+        val mapped = rows.map { toItem(it) }
+        if (needle.isBlank()) mapped else mapped.filter {
             val title = it.peer?.displayName ?: it.title.orEmpty()
             title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
         }
-        filtered.sortedWith(
-            compareByDescending<ChatItem> { it.pinned }.thenByDescending { it.lastAt.orEmpty() }
-        )
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -109,7 +119,7 @@ fun ChatsScreen(
                     style = MaterialTheme.typography.headlineSmall,
                     modifier = Modifier.weight(1f)
                 )
-                RefreshButton { reload++ }
+                RefreshButton { /* realtime: nothing to do */ }
             }
 
             OutlinedTextField(
@@ -134,34 +144,27 @@ fun ChatsScreen(
         }
 
         when {
-            loading -> LoadingState(label = "Loading chats…")
-            error.isNotBlank() -> ErrorState(error) { reload++ }
-            chats.isEmpty() -> EmptyState(
+            error.isNotBlank() && visible.isEmpty() -> ErrorState(error) { error = "" }
+            visible.isEmpty() -> EmptyState(
                 icon = Icons.Default.ChatBubbleOutline,
                 title = "No chats yet",
                 subtitle = "Tap Contacts or the new-chat button to start a conversation."
             )
 
-            else -> PullToRefreshContainer(
-                refreshing = refreshing,
-                onRefresh = { reload++ },
-                modifier = Modifier.fillMaxSize()
+            else -> LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 24.dp)
             ) {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 24.dp)
-                ) {
-                    if (query.isNotBlank() && visible.isEmpty()) {
-                        item { NoChatsFound(query) }
-                    }
-                    items(visible, key = { it.id }) { chat ->
-                        ChatRow(
-                            chat = chat,
-                            currentUserId = currentUserId,
-                            muted = AppSettings.isChatMuted(chat.id),
-                            onClick = { onOpenChat(chat) }
-                        )
-                    }
+                if (query.isNotBlank() && visible.isEmpty()) {
+                    item { NoChatsFound(query) }
+                }
+                items(visible, key = { it.id }) { chat ->
+                    ChatRow(
+                        chat = chat,
+                        currentUserId = uid,
+                        muted = AppSettings.isChatMuted(chat.id),
+                        onClick = { onOpenChat(chat) }
+                    )
                 }
             }
         }
