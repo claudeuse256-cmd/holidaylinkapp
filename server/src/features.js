@@ -13,7 +13,6 @@ import express from 'express';
  */
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
-const MAX_VIDEO_BYTES = Math.max(1, Number(process.env.MAX_VIDEO_MB || 100)) * 1024 * 1024;
 const AUDIENCES = ['everyone', 'contacts', 'nobody'];
 const STATUS_AUDIENCES = ['everyone', 'contacts', 'contacts_except', 'only_share_with'];
 const AI_SYSTEM_PROMPT = [
@@ -84,218 +83,8 @@ export function registerFeatures(app, ctx) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d', fallthrough: true }));
 
-  // ---------------------------------------------------------------- social videos
-  // Videos are stored as files; PostgreSQL stores metadata and social relationships.
-  // Render's local filesystem is a temporary fallback. For production, configure persistent
-  // object storage and replace the storage adapter without changing the database/API contract.
-  app.get('/videos', auth, async (req, res) => {
-    try {
-      const limit = Math.min(50, Math.max(1, Number(req.query.limit || 20)));
-      const offset = Math.max(0, Number(req.query.offset || 0));
-      const r = await db(
-        `SELECT v.id,v.user_id,v.video_url,v.thumbnail_url,v.caption,v.views,v.created_at,
-                u.display_name,u.username,u.avatar_url,
-                EXISTS(SELECT 1 FROM video_likes l WHERE l.video_id=v.id AND l.user_id=$1) AS liked,
-                (SELECT COUNT(*)::int FROM video_likes l2 WHERE l2.video_id=v.id) AS likes,
-                (SELECT COUNT(*)::int FROM video_comments c WHERE c.video_id=v.id) AS comments,
-                EXISTS(SELECT 1 FROM video_saves s WHERE s.video_id=v.id AND s.user_id=$1) AS saved
-         FROM videos v JOIN users u ON u.id=v.user_id
-         ORDER BY v.created_at DESC LIMIT $2 OFFSET $3`,
-        [req.user.sub, limit, offset]
-      );
-      res.json(r.rows.map(row => ({
-        id: row.id, userId: row.user_id, videoUrl: row.video_url, thumbnailUrl: row.thumbnail_url,
-        caption: row.caption, views: Number(row.views || 0), createdAt: row.created_at,
-        user: { id: row.user_id, displayName: row.display_name, username: row.username, avatarUrl: row.avatar_url },
-        liked: Boolean(row.liked), likes: Number(row.likes || 0), comments: Number(row.comments || 0), saved: Boolean(row.saved)
-      })));
-    } catch (err) { return fail(res, err, 'videos'); }
-  });
 
-  app.get('/users/:id/videos', auth, async (req, res) => {
-    try {
-      const r = await db(
-        `SELECT v.id,v.user_id,v.video_url,v.thumbnail_url,v.caption,v.views,v.created_at,
-                u.display_name,u.username,u.avatar_url,
-                (SELECT COUNT(*)::int FROM video_likes l WHERE l.video_id=v.id) AS likes,
-                (SELECT COUNT(*)::int FROM video_comments c WHERE c.video_id=v.id) AS comments
-         FROM videos v JOIN users u ON u.id=v.user_id
-         WHERE v.user_id=$1 ORDER BY v.created_at DESC LIMIT 100`, [req.params.id]
-      );
-      res.json(r.rows.map(row => ({ id: row.id, userId: row.user_id, videoUrl: row.video_url,
-        thumbnailUrl: row.thumbnail_url, caption: row.caption, views: Number(row.views || 0), createdAt: row.created_at,
-        user: { id: row.user_id, displayName: row.display_name, username: row.username, avatarUrl: row.avatar_url },
-        likes: Number(row.likes || 0), comments: Number(row.comments || 0) })));
-    } catch (err) { return fail(res, err, 'user-videos'); }
-  });
-
-  app.post('/videos', auth, async (req, res) => {
-    const declared = Number(req.headers['content-length'] || 0);
-    if (declared > MAX_VIDEO_BYTES) {
-      return res.status(413).json({ error: 'VIDEO_TOO_LARGE', message: 'Videos must be 100 MB or smaller.' });
-    }
-    const mime = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
-    if (!mime.startsWith('video/')) return res.status(400).json({ error: 'INVALID_VIDEO', message: 'Only video files can be posted.' });
-    const originalName = String(req.headers['x-video-name'] || 'video.mp4').replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 120);
-    const ext = path.extname(originalName).toLowerCase() || (mime === 'video/3gpp' ? '.3gp' : '.mp4');
-    const filename = `video-${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
-    const target = path.join(UPLOAD_DIR, filename);
-    const caption = String(req.query.caption || '').trim().slice(0, 1000);
-    let size = 0;
-    let rejected = false;
-    const output = fs.createWriteStream(target, { flags: 'wx' });
-    try {
-      await new Promise((resolve, reject) => {
-        req.on('data', chunk => {
-          size += chunk.length;
-          if (size > MAX_VIDEO_BYTES && !rejected) {
-            rejected = true;
-            req.destroy();
-            output.destroy();
-            reject(Object.assign(new Error('VIDEO_TOO_LARGE'), { code: 'VIDEO_TOO_LARGE' }));
-          }
-        });
-        req.on('error', reject);
-        output.on('error', reject);
-        output.on('finish', resolve);
-        req.pipe(output);
-      });
-      if (rejected || size > MAX_VIDEO_BYTES) throw Object.assign(new Error('VIDEO_TOO_LARGE'), { code: 'VIDEO_TOO_LARGE' });
-      const url = `${baseUrl(req)}/uploads/${filename}`;
-      const r = await db(
-        `INSERT INTO videos(user_id,video_url,caption) VALUES($1,$2,$3)
-         RETURNING id,user_id,video_url,caption,views,created_at`,
-        [req.user.sub, url, caption]
-      );
-      const author = await db('SELECT id,display_name,username,avatar_url FROM users WHERE id=$1', [req.user.sub]);
-      const row = r.rows[0];
-      const u = author.rowCount ? author.rows[0] : { id: req.user.sub, display_name: 'HolidayLink user', username: 'user', avatar_url: null };
-      res.status(201).json({
-        id: row.id, user_id: row.user_id, userId: row.user_id,
-        video_url: row.video_url, videoUrl: url,
-        caption: row.caption, views: Number(row.views || 0), created_at: row.created_at, createdAt: row.created_at,
-        sizeBytes: size, maxVideoBytes: MAX_VIDEO_BYTES,
-        likes: 0, comments: 0, liked: false,
-        user: { id: u.id, display_name: u.display_name, displayName: u.display_name, username: u.username, avatar_url: u.avatar_url, avatarUrl: u.avatar_url }
-      });
-    } catch (err) {
-      try { fs.unlinkSync(target); } catch {}
-      if (err?.code === 'VIDEO_TOO_LARGE') return res.status(413).json({ error: 'VIDEO_TOO_LARGE', message: 'Videos must be 100 MB or smaller.' });
-      return fail(res, err, 'create-video');
-    }
-  });
-
-  app.post('/videos/:id/view', auth, async (req, res) => {
-    try {
-      const r = await db('UPDATE videos SET views=views+1,updated_at=NOW() WHERE id=$1 RETURNING views', [req.params.id]);
-      if (!r.rowCount) return res.status(404).json({ error: 'VIDEO_NOT_FOUND' });
-      res.json({ ok: true, views: Number(r.rows[0].views) });
-    } catch (err) { return fail(res, err, 'view-video'); }
-  });
-
-  // Like toggle (heart). Favorites are separate bookmarks via /save.
-  app.post('/videos/:id/like', auth, async (req, res) => {
-    try {
-      const existing = await db('SELECT 1 FROM video_likes WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
-      let liked;
-      if (existing.rowCount) {
-        await db('DELETE FROM video_likes WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
-        liked = false;
-      } else {
-        await db('INSERT INTO video_likes(video_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [req.params.id, req.user.sub]);
-        liked = true;
-      }
-      const c = await db('SELECT COUNT(*)::int AS total FROM video_likes WHERE video_id=$1', [req.params.id]);
-      res.json({ ok: true, liked, likes: Number(c.rows[0]?.total || 0) });
-    } catch (err) { return fail(res, err, 'like-video'); }
-  });
-
-  // Favorite toggle (bookmark). Stored in video_saves, independent of likes.
-  app.post('/videos/:id/save', auth, async (req, res) => {
-    try {
-      const existing = await db('SELECT 1 FROM video_saves WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
-      let saved;
-      if (existing.rowCount) {
-        await db('DELETE FROM video_saves WHERE video_id=$1 AND user_id=$2', [req.params.id, req.user.sub]);
-        saved = false;
-      } else {
-        await db('INSERT INTO video_saves(video_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [req.params.id, req.user.sub]);
-        saved = true;
-      }
-      res.json({ ok: true, saved });
-    } catch (err) { return fail(res, err, 'save-video'); }
-  });
-
-  app.get('/videos/:id/comments', auth, async (req, res) => {
-    try {
-      const r = await db(
-        `SELECT c.id,c.body,c.created_at,u.id AS user_id,u.display_name,u.username,u.avatar_url
-         FROM video_comments c JOIN users u ON u.id=c.user_id
-         WHERE c.video_id=$1 ORDER BY c.created_at ASC LIMIT 200`,
-        [req.params.id]
-      );
-      res.json(r.rows.map(row => ({
-        id: row.id, body: row.body, created_at: row.created_at,
-        user: { id: row.user_id, display_name: row.display_name, username: row.username, avatar_url: row.avatar_url }
-      })));
-    } catch (err) { return fail(res, err, 'video-comments'); }
-  });
-
-  app.post('/videos/:id/comments', auth, async (req, res) => {
-    try {
-      const body = String(req.body.body || '').trim().slice(0, 1000);
-      if (!body) return res.status(400).json({ error: 'INVALID_COMMENT', message: 'Write a comment first.' });
-      const v = await db('SELECT 1 FROM videos WHERE id=$1', [req.params.id]);
-      if (!v.rowCount) return res.status(404).json({ error: 'VIDEO_NOT_FOUND' });
-      const r = await db(
-        'INSERT INTO video_comments(video_id,user_id,body) VALUES($1,$2,$3) RETURNING id,body,created_at',
-        [req.params.id, req.user.sub, body]
-      );
-      const me = await db('SELECT id,display_name,username,avatar_url FROM users WHERE id=$1', [req.user.sub]);
-      const u = me.rows[0] || {};
-      res.status(201).json({ ...r.rows[0], user: { id: u.id, display_name: u.display_name, username: u.username, avatar_url: u.avatar_url } });
-    } catch (err) { return fail(res, err, 'post-video-comment'); }
-  });
-
-  // Owner deletes their video (file + row cascade likes/comments/saves).
-  app.delete('/videos/:id', auth, async (req, res) => {
-    try {
-      const r = await db('SELECT user_id,video_url FROM videos WHERE id=$1', [req.params.id]);
-      if (!r.rowCount) return res.status(404).json({ error: 'VIDEO_NOT_FOUND' });
-      if (r.rows[0].user_id !== req.user.sub) return res.status(403).json({ error: 'NOT_OWNER', message: 'Only the creator can delete this video.' });
-      await db('DELETE FROM videos WHERE id=$1', [req.params.id]);
-      try {
-        const name = String(r.rows[0].video_url || '').split('/uploads/')[1];
-        if (name) fs.unlinkSync(path.join(UPLOAD_DIR, name));
-      } catch {}
-      res.json({ ok: true });
-    } catch (err) { return fail(res, err, 'delete-video'); }
-  });
-
-  // Manage screen: my uploads with progress counters.
-  app.get('/me/videos', auth, async (req, res) => {
-    try {
-      const r = await db(
-        `SELECT v.id,v.user_id,v.video_url,v.caption,v.views,v.created_at,
-                (SELECT COUNT(*)::int FROM video_likes l WHERE l.video_id=v.id) AS likes,
-                (SELECT COUNT(*)::int FROM video_comments c WHERE c.video_id=v.id) AS comments,
-                EXISTS(SELECT 1 FROM video_likes l2 WHERE l2.video_id=v.id AND l2.user_id=$1) AS liked,
-                EXISTS(SELECT 1 FROM video_saves s WHERE s.video_id=v.id AND s.user_id=$1) AS saved
-         FROM videos v WHERE v.user_id=$1 ORDER BY v.created_at DESC LIMIT 200`,
-        [req.user.sub]
-      );
-      const me = await db('SELECT id,display_name,username,avatar_url FROM users WHERE id=$1', [req.user.sub]);
-      const u = me.rows[0] || {};
-      res.json(r.rows.map(row => ({
-        id: row.id, user_id: row.user_id, video_url: row.video_url, videoUrl: row.video_url,
-        caption: row.caption, views: Number(row.views || 0), created_at: row.created_at,
-        likes: Number(row.likes || 0), comments: Number(row.comments || 0),
-        liked: Boolean(row.liked), saved: Boolean(row.saved),
-        user: { id: u.id, display_name: u.display_name, username: u.username, avatar_url: u.avatar_url }
-      })));
-    } catch (err) { return fail(res, err, 'my-videos'); }
-  });
-
+  // Videos feed removed. Chat video attachments still use /uploads + message_attachments.
 
   // ---------------------------------------------------------------- shared helpers
 
@@ -381,11 +170,33 @@ export function registerFeatures(app, ctx) {
     return `${proto}://${req.get('host')}`;
   };
 
+  // Same key the website uses for every upload, overridable per deployment.
+  const IMGBB_KEY = String(process.env.IMGBB_API_KEY || '004a77cb11087502ad96cdf0555781e7').trim();
+
+  const uploadToImgbb = async (buffer, mime) => {
+    if (!IMGBB_KEY) return null;
+    try {
+      const form = new FormData();
+      form.append('image', buffer.toString('base64'));
+      const res = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(IMGBB_KEY)}`, {
+        method: 'POST',
+        body: form
+      });
+      const body = await res.json().catch(() => null);
+      const url = body?.data?.url;
+      return typeof url === 'string' && url ? url : null;
+    } catch (err) {
+      console.warn('[imgbb] upload failed, falling back to local disk:', err.message);
+      return null;
+    }
+  };
+
   /**
-   * Writes an uploaded data URL to disk and returns its public URL. Image and file bytes never
-   * go into PostgreSQL; the database only ever stores the resulting URL.
+   * Stores an uploaded data URL and returns its public URL. Images go to imgbb
+   * exactly like the website; anything else (or imgbb failure) stays on local
+   * disk under /uploads. Image bytes never go into PostgreSQL.
    */
-  const storeDataUrl = (req, dataUrl, kind) => {
+  const storeDataUrl = async (req, dataUrl, kind) => {
     const match = /^data:([^;,]*)((?:;[^;,]+)*),(.*)$/s.exec(String(dataUrl || ''));
     if (!match) return null;
     const mime = (match[1] || 'application/octet-stream').toLowerCase();
@@ -401,6 +212,10 @@ export function registerFeatures(app, ctx) {
     if (buffer.length === 0 || buffer.length > MAX_UPLOAD_BYTES) return null;
 
     const name = `${kind}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}${EXTENSION_BY_MIME[mime] || '.bin'}`;
+    if (mime.startsWith('image/')) {
+      const hosted = await uploadToImgbb(buffer, mime);
+      if (hosted) return { url: hosted, name, sizeBytes: buffer.length, buffer, mime };
+    }
     fs.writeFileSync(path.join(UPLOAD_DIR, name), buffer);
     return { url: `${baseUrl(req)}/uploads/${name}`, name, sizeBytes: buffer.length, buffer, mime };
   };
@@ -497,6 +312,7 @@ export function registerFeatures(app, ctx) {
         created_at: row.created_at,
         edited_at: row.edited_at,
         expires_at: row.expires_at,
+        view_once: Boolean(row.view_once),
         pinned: Boolean(row.pinned),
         reply_to_id: row.reply_to || null,
         reply_to_body: row.reply_to_body || null,
@@ -511,12 +327,19 @@ export function registerFeatures(app, ctx) {
     });
   };
 
-  /** Hides messages whose disappearing timer has run out. */
+  /** Hides messages whose disappearing timer has run out (self-destruct). */
   const purgeExpired = async conversationId => {
     await db(
       `UPDATE messages SET body='', message_type='text'
        WHERE conversation_id=$1 AND expires_at IS NOT NULL AND expires_at<=NOW()
          AND deleted_at IS NULL`,
+      [conversationId]
+    );
+    // Self-destruct removes media too, Telegram-style.
+    await db(
+      `DELETE FROM message_attachments WHERE message_id IN
+        (SELECT id FROM messages WHERE conversation_id=$1 AND expires_at IS NOT NULL
+          AND expires_at<=NOW() AND deleted_at IS NULL)`,
       [conversationId]
     );
   };
@@ -536,6 +359,48 @@ export function registerFeatures(app, ctx) {
       return fail(res, err, 'delete-account');
     }
     });
+
+  // Website admin panel control: ban/unban/kick by user id. Guarded by a shared
+  // ADMIN_API_KEY env secret (set the same value in the website admin config).
+  const adminAuth = (req, res) => {
+    const key = String(process.env.ADMIN_API_KEY || '');
+    if (!key) return res.status(503).json({ error: 'ADMIN_DISABLED', message: 'Admin API is not configured.' }), false;
+    if (req.get('x-admin-key') !== key) return res.status(403).json({ error: 'FORBIDDEN' }), false;
+    return true;
+  };
+
+  app.post('/admin/ban', async (req, res) => {
+    try {
+      if (!adminAuth(req, res)) return;
+      const userId = String(req.body.userId || '');
+      const reason = String(req.body.reason || '').slice(0, 300);
+      if (!userId) return res.status(400).json({ error: 'INVALID_USER' });
+      const r = await db(
+        'UPDATE users SET banned=true, ban_reason=NULLIF($2,\'\'), banned_at=NOW(), updated_at=NOW() WHERE id=$1',
+        [userId, reason]
+      );
+      if (!r.rowCount) return res.status(404).json({ error: 'USER_NOT_FOUND' });
+      res.json({ ok: true, banned: true });
+    } catch (err) {
+      return fail(res, err, 'admin-ban');
+    }
+  });
+
+  app.post('/admin/unban', async (req, res) => {
+    try {
+      if (!adminAuth(req, res)) return;
+      const userId = String(req.body.userId || '');
+      if (!userId) return res.status(400).json({ error: 'INVALID_USER' });
+      const r = await db(
+        'UPDATE users SET banned=false, ban_reason=NULL, banned_at=NULL, updated_at=NOW() WHERE id=$1',
+        [userId]
+      );
+      if (!r.rowCount) return res.status(404).json({ error: 'USER_NOT_FOUND' });
+      res.json({ ok: true, banned: false });
+    } catch (err) {
+      return fail(res, err, 'admin-unban');
+    }
+  });
 
   app.patch('/me/profile', auth, async (req, res) => {
     try {
@@ -593,7 +458,7 @@ export function registerFeatures(app, ctx) {
         set('avatar_url', null);
         params.push(null); updates.push(`avatar_data=$${params.length}`);
       } else if (req.body.avatarDataUrl) {
-        const stored = storeDataUrl(req, req.body.avatarDataUrl, 'avatar');
+        const stored = await storeDataUrl(req, req.body.avatarDataUrl, 'avatar');
         if (!stored) {
           return res.status(400).json({
             error: 'INVALID_IMAGE',
@@ -1015,7 +880,7 @@ export function registerFeatures(app, ctx) {
 
       let stored = null;
       if (dataUrl) {
-        stored = storeDataUrl(req, dataUrl, 'attachment');
+        stored = await storeDataUrl(req, dataUrl, 'attachment');
         if (!stored) {
           return res.status(400).json({
             error: 'INVALID_ATTACHMENT',
@@ -1025,19 +890,27 @@ export function registerFeatures(app, ctx) {
       }
 
       const privacy = await privacyOf(req.user.sub);
-      const ttl = Number(privacy?.disappearing_seconds || 0);
+      // Telegram-style self-destruct: per-message timer overrides the chat default.
+      // Allowed: 0 (off/chat default), 5s..7d. View-once needs an attachment.
+      const viewOnce = Boolean(req.body.viewOnce) && Boolean(dataUrl);
+      let ttl = Number(privacy?.disappearing_seconds || 0);
+      const askedTtl = Number(req.body.ttlSeconds);
+      if (Number.isFinite(askedTtl) && askedTtl > 0) {
+        ttl = Math.min(7 * 24 * 3600, Math.max(5, Math.floor(askedTtl)));
+      }
       const message = await db(
-        `INSERT INTO messages(conversation_id,sender_id,body,message_type,reply_to,expires_at)
+        `INSERT INTO messages(conversation_id,sender_id,body,message_type,reply_to,expires_at,view_once)
          VALUES($1,$2,$3,$4,$5::uuid,
-                CASE WHEN $6::bigint>0 THEN NOW()+($6::bigint * INTERVAL '1 second') ELSE NULL END)
-         RETURNING id,conversation_id,sender_id,body,message_type,reply_to,created_at,expires_at`,
+                CASE WHEN $6::bigint>0 THEN NOW()+($6::bigint * INTERVAL '1 second') ELSE NULL END,$7)
+         RETURNING id,conversation_id,sender_id,body,message_type,reply_to,created_at,expires_at,view_once`,
         [
           conversationId,
           req.user.sub,
           body || (stored ? stored.name : ''),
           kind,
           replyToId || null,
-          String(ttl)
+          String(ttl),
+          viewOnce
         ]
       );
 
@@ -1170,6 +1043,29 @@ export function registerFeatures(app, ctx) {
       res.json({ ok: true });
     } catch (err) {
       return fail(res, err, 'delete-message');
+    }
+  });
+
+  // View-once: recipient opens the media once, then it is destroyed server-side.
+  app.post('/conversations/:id/messages/:messageId/viewed', auth, async (req, res) => {
+    try {
+      if (!(await roleIn(req.params.id, req.user.sub))) {
+        return res.status(403).json({ error: 'NOT_MEMBER' });
+      }
+      const r = await db(
+        'SELECT id,sender_id,view_once,deleted_at FROM messages WHERE id=$1 AND conversation_id=$2',
+        [req.params.messageId, req.params.id]
+      );
+      if (!r.rowCount || r.rows[0].deleted_at) return res.status(404).json({ error: 'MESSAGE_NOT_FOUND' });
+      const message = r.rows[0];
+      if (!message.view_once) return res.json({ ok: true, destroyed: false });
+      if (message.sender_id === req.user.sub) return res.json({ ok: true, destroyed: false });
+      await db('DELETE FROM message_attachments WHERE message_id=$1', [req.params.messageId]);
+      await db('UPDATE messages SET body=\'\',message_type=\'text\',deleted_at=NOW() WHERE id=$1', [req.params.messageId]);
+      broadcast(req.params.id, { type: 'message.deleted', messageId: req.params.messageId });
+      res.json({ ok: true, destroyed: true });
+    } catch (err) {
+      return fail(res, err, 'view-once');
     }
   });
 
@@ -1434,7 +1330,7 @@ export function registerFeatures(app, ctx) {
       }
       let mediaUrl = null;
       if (mediaDataUrl) {
-        const stored = storeDataUrl(req, mediaDataUrl, 'status');
+        const stored = await storeDataUrl(req, mediaDataUrl, 'status');
         if (!stored) {
           return res.status(400).json({
             error: 'INVALID_IMAGE',
@@ -2030,6 +1926,50 @@ CASE WHEN c.kind='direct' THEN (
   });
 
   /**
+   * Shared Gemini call used by chat + send-on-behalf. Returns {ok, text} or
+   * {ok:false, timeout, status}. The key never leaves the server.
+   */
+  const askGemini = async (systemText, contents) => {
+    let text = '';
+    let answered = false;
+    let timedOut = false;
+    let lastStatus = 0;
+    for (const model of GEMINI_MODELS) {
+      const attempt = new AbortController();
+      const timer = setTimeout(() => attempt.abort(), AI_MODEL_TIMEOUT_MS);
+      let upstream;
+      try {
+        upstream = await fetch(`${GEMINI_ENDPOINT}/${model}:generateContent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
+          signal: attempt.signal,
+          body: JSON.stringify({ systemInstruction: { parts: [{ text: systemText }] }, contents })
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        timedOut = Boolean(err) && (err.name === 'AbortError' || err.name === 'TimeoutError');
+        console.error('[ai] model', model, timedOut ? 'timed out' : String((err && err.message) || err));
+        continue;
+      }
+      clearTimeout(timer);
+      if (upstream.ok) {
+        const payload = await upstream.json().catch(() => null);
+        text = String(
+          payload?.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('') || ''
+        ).trim();
+        answered = true;
+        console.log('[ai] answered by', model);
+        break;
+      }
+      lastStatus = upstream.status;
+      const detail = await upstream.text().catch(() => '');
+      console.error('[ai] model', model, lastStatus, detail.slice(0, 300));
+      if (lastStatus === 400 || lastStatus === 401 || lastStatus === 403) break;
+    }
+    return { ok: answered, text, timedOut, status: lastStatus };
+  };
+
+  /**
    * The only place Gemini is ever called. The key stays in the server environment, so the Android
    * package contains no credential and nothing can be lifted off a device.
    */
@@ -2189,6 +2129,115 @@ CASE WHEN c.kind='direct' THEN (
         });
       }
       return fail(res, err, 'ai-chat');
+    }
+  });
+
+  // ---------------------------------------------------------------- user bots (Telegram-style)
+
+  app.get('/ai/bots', auth, async (req, res) => {
+    try {
+      const r = await db(
+        `SELECT b.id,b.username,b.display_name,b.owner_id,b.created_at,u.display_name AS owner_name
+         FROM ai_bots b JOIN users u ON u.id=b.owner_id
+         ORDER BY b.created_at DESC LIMIT 200`
+      );
+      res.json(r.rows.map(row => ({
+        id: row.id, username: row.username, display_name: row.display_name,
+        owner_id: row.owner_id, owner_name: row.owner_name, created_at: row.created_at,
+        mine: row.owner_id === req.user.sub
+      })));
+    } catch (err) {
+      return fail(res, err, 'ai-bots');
+    }
+  });
+
+  app.post('/ai/bots', auth, async (req, res) => {
+    try {
+      const username = String(req.body.username || '').trim().replace(/^@/, '').toLowerCase();
+      const displayName = String(req.body.displayName || '').trim();
+      const instructions = String(req.body.instructions || '').trim().slice(0, 2000);
+      if (!/^[a-z0-9_]{3,32}$/.test(username)) {
+        return res.status(400).json({ error: 'INVALID_USERNAME', message: 'Bot username must be 3-32 characters: letters, numbers or underscore.' });
+      }
+      if (!displayName || displayName.length > 120) {
+        return res.status(400).json({ error: 'INVALID_DISPLAY_NAME', message: 'Give the bot a display name up to 120 characters.' });
+      }
+      const clash = await db(
+        'SELECT 1 FROM users WHERE LOWER(username)=LOWER($1) UNION SELECT 1 FROM ai_bots WHERE LOWER(username)=LOWER($1)',
+        [username]
+      );
+      if (clash.rowCount) {
+        return res.status(409).json({ error: 'USERNAME_TAKEN', message: 'That @name is already taken.' });
+      }
+      const r = await db(
+        'INSERT INTO ai_bots(owner_id,username,display_name,instructions) VALUES($1,$2,$3,$4) RETURNING id,username,display_name,created_at',
+        [req.user.sub, username, displayName, instructions]
+      );
+      res.status(201).json({ ...r.rows[0], owner_id: req.user.sub, mine: true });
+    } catch (err) {
+      return fail(res, err, 'create-bot');
+    }
+  });
+
+  app.delete('/ai/bots/:id', auth, async (req, res) => {
+    try {
+      const r = await db('DELETE FROM ai_bots WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.sub]);
+      if (!r.rowCount) return res.status(404).json({ error: 'NOT_FOUND' });
+      res.json({ ok: true });
+    } catch (err) {
+      return fail(res, err, 'delete-bot');
+    }
+  });
+
+  /**
+   * Instruct the AI to send a message on your behalf (website send_message parity).
+   * The message is stored as your own message in the conversation, never as a bot.
+   */
+  app.post('/ai/send', auth, async (req, res) => {
+    try {
+      const conversationId = String(req.body.conversationId || '');
+      const prompt = String(req.body.prompt || '').trim();
+      const botId = String(req.body.botId || '');
+      if (!conversationId || !prompt || prompt.length > 4000) {
+        return res.status(400).json({ error: 'INVALID_MESSAGE', message: 'Write an instruction up to 4000 characters.' });
+      }
+      if (!(await roleIn(conversationId, req.user.sub))) {
+        return res.status(403).json({ error: 'NOT_MEMBER', message: "You're no longer part of this chat." });
+      }
+      if (!GEMINI_KEY) {
+        return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: 'HolidayLink AI is not available right now. Please try again shortly.' });
+      }
+      if (!aiRateOk(req.user.sub)) {
+        return res.status(429).json({ error: 'AI_RATE_LIMITED', message: "You're asking HolidayLink AI too quickly. Take a short break." });
+      }
+      let systemText = `${AI_SYSTEM_PROMPT} ${AI_RESPONSE_STYLES.balanced} You are sending this message on the user's behalf into their chat. Write ONLY the message text, no preamble, no quotes.`;
+      if (botId) {
+        const bot = await db('SELECT display_name,instructions FROM ai_bots WHERE id=$1', [botId]);
+        if (bot.rowCount) {
+          systemText = `${AI_SYSTEM_PROMPT} You are ${bot.rows[0].display_name}. ${bot.rows[0].instructions || ''} You are sending this message on the user's behalf into their chat. Write ONLY the message text, no preamble, no quotes.`;
+        }
+      }
+      const result = await askGemini(systemText, [{ role: 'user', parts: [{ text: prompt }] }]);
+      if (!result.ok) {
+        return res.status(result.status === 429 ? 429 : 502).json({
+          error: result.status === 429 ? 'AI_RATE_LIMITED' : 'AI_UPSTREAM_ERROR',
+          message: 'HolidayLink AI could not answer just now. Please try again.'
+        });
+      }
+      const answer = result.text || 'HolidayLink AI could not answer that. Try rephrasing.';
+      const inserted = await db(
+        `INSERT INTO messages(conversation_id,sender_id,body,message_type)
+         VALUES($1,$2,$3,'text') RETURNING id,conversation_id,sender_id,body,message_type,created_at`,
+        [conversationId, req.user.sub, answer]
+      );
+      const [hydrated] = await hydrateMessages(
+        [{ ...inserted.rows[0], sender_name: null, sender_username: null, sender_avatar_url: null }],
+        req.user.sub
+      );
+      broadcast(conversationId, { type: 'message', message: hydrated });
+      res.json({ ok: true, message: hydrated, text: answer });
+    } catch (err) {
+      return fail(res, err, 'ai-send');
     }
   });
 

@@ -170,22 +170,31 @@ function auth(req, res, next) {
   }
   req.user = claims;
   // A session revoked from Settings must stop working immediately, not when the token expires.
-  // Skipped when the sessions table is unavailable so the app still runs on an older database.
-  if (claims.sid) {
-    db('SELECT revoked FROM user_sessions WHERE session_key=$1', [claims.sid])
-      .then(r => {
-        if (r.rowCount && r.rows[0].revoked) {
-          return res.status(401).json({
-            error: 'UNAUTHORIZED',
-            message: 'This device was signed out.'
-          });
-        }
-        next();
-      })
-      .catch(() => next());
-  } else {
+  // Banned accounts are rejected everywhere too, so a website-admin ban takes effect at once.
+  // Skipped when the tables are unavailable so the app still runs on an older database.
+  const checkSession = claims.sid
+    ? db('SELECT revoked FROM user_sessions WHERE session_key=$1', [claims.sid])
+    : Promise.resolve(null);
+  Promise.all([
+    checkSession,
+    db('SELECT banned, ban_reason FROM users WHERE id=$1', [claims.sub]).catch(() => null)
+  ]).then(([session, user]) => {
+    if (session && session.rowCount && session.rows[0].revoked) {
+      return res.status(401).json({
+        error: 'UNAUTHORIZED',
+        message: 'This device was signed out.'
+      });
+    }
+    if (user && user.rowCount && user.rows[0].banned) {
+      return res.status(403).json({
+        error: 'ACCOUNT_BANNED',
+        message: user.rows[0].ban_reason
+          ? `This account was banned: ${user.rows[0].ban_reason}`
+          : 'This account was banned.'
+      });
+    }
     next();
-  }
+  }).catch(() => next());
 }
 
 async function db(text, params = []) {
@@ -201,11 +210,15 @@ async function runDatabaseMigrations() {
   const authVideoMigration = await fs.readFile(new URL('database/migrations/003_auth_videos.sql', root), 'utf8');
   const e2eeMigration = await fs.readFile(new URL('database/migrations/004_e2ee_and_calls.sql', root), 'utf8');
   const channelsMigration = await fs.readFile(new URL('database/migrations/005_channels_saves.sql', root), 'utf8');
+  const viewonceMigration = await fs.readFile(new URL('database/migrations/006_viewonce_bans.sql', root), 'utf8');
+  const botsMigration = await fs.readFile(new URL('database/migrations/007_ai_bots.sql', root), 'utf8');
   await pool.query(schema);
   await pool.query(featureMigration);
   await pool.query(authVideoMigration);
   await pool.query(e2eeMigration);
   await pool.query(channelsMigration);
+  await pool.query(viewonceMigration);
+  await pool.query(botsMigration);
   console.log('[db] schema and feature migrations are ready');
 }
 
@@ -398,12 +411,18 @@ app.post('/auth/verify-otp', async (req, res) => {
     clearFailedAttempts(phone);
 
     const existing = await db(
-      'SELECT id,phone,email,display_name,username,avatar_url,bio FROM users WHERE phone=$1',
+      'SELECT id,phone,email,display_name,username,avatar_url,bio,banned,ban_reason FROM users WHERE phone=$1',
       [phone]
     );
 
     if (existing.rowCount) {
       const user = existing.rows[0];
+      if (user.banned) {
+        return res.status(403).json({
+          error: 'ACCOUNT_BANNED',
+          message: user.ban_reason ? `This account was banned: ${user.ban_reason}` : 'This account was banned.'
+        });
+      }
       const { token, sessionKey } = signUser(user);
       await db(
         'UPDATE users SET online=true,last_seen=NOW(),updated_at=NOW() WHERE id=$1',
@@ -428,11 +447,17 @@ app.post('/auth/login-2fa', async (req, res) => {
       return res.status(400).json({ error: 'INVALID_2FA_PASSWORD', message: 'Enter your phone number and 2FA password.' });
     }
     const r = await db(
-      `SELECT id,phone,email,display_name,username,avatar_url,bio,two_factor_enabled,two_factor_password_hash
+      `SELECT id,phone,email,display_name,username,avatar_url,bio,two_factor_enabled,two_factor_password_hash,banned,ban_reason
        FROM users WHERE phone=$1`, [phone]
     );
     if (!r.rowCount || !r.rows[0].two_factor_enabled || !r.rows[0].two_factor_password_hash) {
       return res.status(401).json({ error: '2FA_NOT_ENABLED', message: '2FA password login is not enabled for this number.' });
+    }
+    if (r.rows[0].banned) {
+      return res.status(403).json({
+        error: 'ACCOUNT_BANNED',
+        message: r.rows[0].ban_reason ? `This account was banned: ${r.rows[0].ban_reason}` : 'This account was banned.'
+      });
     }
     const valid = await bcrypt.compare(password, r.rows[0].two_factor_password_hash);
     if (!valid) return res.status(401).json({ error: 'INVALID_2FA_PASSWORD', message: 'That 2FA password is incorrect.' });

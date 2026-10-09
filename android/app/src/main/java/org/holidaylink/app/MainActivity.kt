@@ -34,7 +34,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.AutoStories
 import androidx.compose.material.icons.filled.Close
@@ -100,6 +100,7 @@ import org.holidaylink.app.phone.Countries
 import org.holidaylink.app.phone.CountryCode
 import org.holidaylink.app.phone.PhoneNumbers
 import org.holidaylink.app.ui.AiChatScreen
+import org.holidaylink.app.ui.AiProfileScreen
 import org.holidaylink.app.ui.AppLockGate
 import org.holidaylink.app.ui.CallsScreen
 import org.holidaylink.app.ui.ChatScreen
@@ -119,7 +120,7 @@ import org.holidaylink.app.ui.UserProfileScreen
 import org.holidaylink.app.ui.rememberNotificationPermissionState
 import org.holidaylink.app.ui.theme.HolidayLinkTheme
 import org.holidaylink.app.ui.FeatureHubScreen
-import org.holidaylink.app.ui.VideoHubScreen
+import org.holidaylink.app.ui.StoreScreen
 import org.holidaylink.app.ui.WebFeatureScreen
 import org.holidaylink.app.ui.HolidayFeature
 import org.holidaylink.app.ui.Avatar
@@ -146,7 +147,6 @@ private enum class Tab(val title: String) {
     Users("Users"),
     Channels("Channels"),
     Settings("Settings"),
-    Videos("Videos"),
     Menu("Menu")
 }
 
@@ -165,10 +165,10 @@ private sealed interface Destination {
     data object Settings : Destination
     data object Ai : Destination
     data class AiChat(val conversationId: String) : Destination
+    data object AiProfile : Destination
     data object Calls : Destination
     data class WebFeature(val title: String, val url: String) : Destination
     data object FeatureHub : Destination
-    data object Videos : Destination
     data class Status(val startWithComposer: Boolean = false) : Destination
     data object Store : Destination
 }
@@ -180,7 +180,6 @@ private sealed interface Destination {
 private fun nativeDestinationFor(route: String): Destination = when {
     route == "native:calls" -> Destination.Calls
     route == "native:status" || route == "status.html" -> Destination.Status(false)
-    route == "native:videos" || route == "videos.html" -> Destination.Videos
     route == "native:ai" || route == "aihelp.html" -> Destination.Ai
     route == "native:users" -> Destination.Search
     route == "native:chats" -> Destination.Tabs
@@ -188,7 +187,7 @@ private fun nativeDestinationFor(route: String): Destination = when {
     route == "native:invite" -> Destination.NewChat
     route == "dashboard.html" || route.contains("dashboard") -> Destination.Status(false)
     route == "feed.html" -> Destination.Status(false)
-    route == "events.html" -> Destination.Videos
+    route == "events.html" -> Destination.Status(false)
     route == "quizzes.html" || route == "papers.html" -> Destination.Ai
     route == "store.html" -> Destination.Store
     route == "room.html" -> Destination.Tabs
@@ -214,11 +213,20 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
     ) {
         AppLockGate {
             var signedIn by remember { mutableStateOf(api.sessionToken() != null) }
-            if (signedIn) {
+            var bannedMsg by remember { mutableStateOf<String?>(null) }
+            val banMsg = bannedMsg
+            if (banMsg != null) {
+                BannedScreen(message = banMsg, onSwitchNumber = {
+                    prefs.edit().remove("token").remove("userId").apply()
+                    bannedMsg = null
+                    signedIn = false
+                })
+            } else if (signedIn) {
                 SignedInApp(
                     api = api,
                     prefs = prefs,
-                    onLoggedOut = { signedIn = false }
+                    onLoggedOut = { signedIn = false },
+                    onBanned = { bannedMsg = it }
                 )
             } else {
                 AuthFlow(api, prefs) { signedIn = true }
@@ -238,7 +246,8 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
 private fun SignedInApp(
     api: Api,
     prefs: SharedPreferences,
-    onLoggedOut: () -> Unit
+    onLoggedOut: () -> Unit,
+    onBanned: (String) -> Unit
 ) {
     val context = LocalContext.current
     var me by remember { mutableStateOf<Me?>(null) }
@@ -263,6 +272,15 @@ private fun SignedInApp(
             me = loaded
             api.sessionToken()?.let { token ->
                 AccountStore.upsert(prefs, AccountStore.Account(loaded.id, token, loaded.phone, loaded.displayName, loaded.username))
+            }
+        }.onFailure { e ->
+            if ((e as? ApiException)?.code == "ACCOUNT_BANNED") onBanned(e.message ?: "This account was banned.")
+        }
+        // A website-admin ban lands mid-session too: re-check quietly every minute.
+        while (true) {
+            delay(60_000)
+            runCatching { api.me() }.onFailure { e ->
+                if ((e as? ApiException)?.code == "ACCOUNT_BANNED") onBanned(e.message ?: "This account was banned.")
             }
         }
     }
@@ -312,8 +330,6 @@ private fun SignedInApp(
             onSettings = { push(Destination.Settings) },
             onAi = { push(Destination.Ai) },
             onOpenDirect = openDirectChat,
-            onOpenVideos = { push(Destination.Videos) },
-            onOpenVideoLessons = { push(Destination.Status(false)) },
             onOpenMenu = { push(Destination.FeatureHub) },
             onOpenFeature = { feature ->
                 push(nativeDestinationFor(feature.route))
@@ -411,13 +427,6 @@ private fun SignedInApp(
             }
         )
 
-        Destination.Videos -> VideoHubScreen(
-            api = api,
-            onBack = pop,
-            onOpenProfile = { push(Destination.PersonProfile(it)) },
-            onOpenLessons = { push(Destination.Status(false)) }
-        )
-
         Destination.Store -> org.holidaylink.app.ui.StoreScreen(api = api, onBack = pop)
 
         is Destination.Status -> StatusScreen(api = api, me = me, startWithComposer = current.startWithComposer)
@@ -467,7 +476,14 @@ private fun SignedInApp(
             api = api,
             conversationId = null,
             onOpenConversation = { push(Destination.AiChat(it)) },
+            onOpenProfile = { push(Destination.AiProfile) },
             onBack = pop
+        )
+
+        Destination.AiProfile -> AiProfileScreen(
+            api = api,
+            onBack = pop,
+            onStartChat = { push(Destination.Ai) }
         )
 
         is Destination.AiChat -> AiChatScreen(
@@ -477,6 +493,7 @@ private fun SignedInApp(
                 while (stack.size > 1) stack.removeAt(stack.lastIndex)
                 stack.add(Destination.AiChat(id))
             },
+            onOpenProfile = { push(Destination.AiProfile) },
             onBack = pop
         )
     }
@@ -534,8 +551,6 @@ private fun TabShell(
     onSettings: () -> Unit,
     onAi: () -> Unit,
     onOpenDirect: (User) -> Unit,
-    onOpenVideos: () -> Unit,
-    onOpenVideoLessons: () -> Unit,
     onOpenMenu: () -> Unit,
     onOpenFeature: (HolidayFeature) -> Unit,
     onOpenProfileTab: () -> Unit,
@@ -559,7 +574,7 @@ private fun TabShell(
     Scaffold(
         containerColor = scheme.background,
         bottomBar = {
-            GlassBottomBar(tab = tab, onTab = onTab, onVideos = onOpenVideos, onMenu = onOpenMenu, onSettings = onSettings)
+            GlassBottomBar(tab = tab, onTab = onTab, onMenu = onOpenMenu, onSettings = onSettings)
         },
         floatingActionButton = {
             // Telegram-style: + opens New chat / New group / New channel / New community.
@@ -569,7 +584,6 @@ private fun TabShell(
                     TelegramFabOption("New group", Icons.Default.Groups) { fabOpen = false; onNewGroup() }
                     TelegramFabOption("New channel", Icons.Default.Campaign) { fabOpen = false; onNewChannel() }
                     TelegramFabOption("Community", Icons.Default.Groups) { fabOpen = false; onNewCommunity() }
-                    if (tab == Tab.Videos) TelegramFabOption("Post video", Icons.Default.VideoLibrary) { fabOpen = false; onOpenVideos() }
                     TelegramFabOption("Post status", Icons.Default.AutoStories) { fabOpen = false; onPostStatus() }
                 }
                 Box(
@@ -639,12 +653,6 @@ private fun TabShell(
                         me = me,
                         onOpen = { route -> onSettings() },
                         onLoggedOut = {}
-                    )
-                    Tab.Videos -> VideoHubScreen(
-                        api = api,
-                        onBack = { onTab(Tab.Chats) },
-                        onOpenLessons = onOpenVideoLessons,
-                        onOpenProfile = onOpenProfile
                     )
                     Tab.Menu -> FeatureHubScreen(onBack = { onTab(Tab.Chats) }, onOpen = onOpenFeature)
                 }
@@ -761,7 +769,7 @@ private fun GlassSearchBar(onClick: () -> Unit) {
 }
 
 @Composable
-private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onVideos: () -> Unit, onMenu: () -> Unit, onSettings: () -> Unit) {
+private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onMenu: () -> Unit, onSettings: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     val shape = RoundedCornerShape(32.dp)
     Row(
@@ -775,7 +783,6 @@ private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onVideos: () -> Unit,
             Triple(Tab.Users, Icons.Default.Contacts, "Users"),
             Triple(Tab.Channels, Icons.Default.Campaign, "Channels"),
             Triple(Tab.Settings, Icons.Default.Settings, "Settings"),
-            Triple(Tab.Videos, Icons.Default.VideoLibrary, "Videos"),
             Triple(Tab.Menu, Icons.Default.Menu, "Menu")
         )
         items.forEach { (entry, icon, title) ->
@@ -783,7 +790,7 @@ private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onVideos: () -> Unit,
             Column(
                 Modifier.weight(1f).clip(RoundedCornerShape(22.dp))
                     .background(if (selected) Brush.horizontalGradient(listOf(Color(0xFF1152C8).copy(alpha=.75f), Color(0xFF5B2CFF).copy(alpha=.55f))) else Brush.linearGradient(listOf(Color.Transparent, Color.Transparent)))
-                    .clickable { when (entry) { Tab.Videos -> onVideos(); Tab.Menu -> onMenu(); Tab.Settings -> onSettings(); else -> onTab(entry) } }
+                    .clickable { when (entry) { Tab.Menu -> onMenu(); Tab.Settings -> onSettings(); else -> onTab(entry) } }
                     .padding(vertical = 7.dp), horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Icon(icon, null, tint = if (selected) scheme.primary else scheme.onSurfaceVariant, modifier = Modifier.size(24.dp))
@@ -894,6 +901,24 @@ private fun OverflowMenu(onSettings: () -> Unit, onMyProfile: () -> Unit) {
                 }
             )
         }
+    }
+}
+
+@Composable
+private fun BannedScreen(message: String, onSwitchNumber: () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Column(
+        Modifier.fillMaxSize().background(scheme.background).padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(Icons.Default.Block, null, tint = scheme.error, modifier = Modifier.size(72.dp))
+        Spacer(Modifier.height(20.dp))
+        Text("Account banned", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(10.dp))
+        Text(message, style = MaterialTheme.typography.bodyMedium, color = scheme.onSurfaceVariant)
+        Spacer(Modifier.height(24.dp))
+        Button(onClick = onSwitchNumber) { Text("Use a different number") }
     }
 }
 

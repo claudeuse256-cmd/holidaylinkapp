@@ -1,9 +1,12 @@
 package org.holidaylink.app.ui
 
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -52,6 +55,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -85,6 +89,7 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
     var displayName by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
     var about by remember { mutableStateOf("") }
+    var showQr by remember { mutableStateOf(false) }
 
     suspend fun reload() {
         loading = me == null
@@ -357,9 +362,8 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                                 SettingsNavRow(
                                     title = "My QR code",
                                     icon = Icons.Default.QrCode2,
-                                    subtitle = "Not available yet",
-                                    enabled = false,
-                                    onClick = {}
+                                    subtitle = if (profile.username.isNotBlank()) "@${profile.username}" else "Show your code",
+                                    onClick = { showQr = true }
                                 )
                             }
                         }
@@ -368,6 +372,10 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    if (showQr && me != null) {
+        QrCodeDialog(me = me!!, onDismiss = { showQr = false })
     }
 
     if (confirmRemovePhoto) {
@@ -442,4 +450,54 @@ private fun shareProfile(context: android.content.Context, me: Me?) {
     runCatching {
         context.startActivity(Intent.createChooser(intent, "Share profile"))
     }
+}
+
+/** Renders text as a black-on-white QR bitmap, or null when it cannot be encoded. */
+private fun qrBitmap(text: String, sizePx: Int = 640): Bitmap? = runCatching {
+    val matrix = com.google.zxing.qrcode.QRCodeWriter().encode(
+        text, com.google.zxing.BarcodeFormat.QR_CODE, sizePx, sizePx
+    )
+    val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.RGB_565)
+    for (x in 0 until sizePx) {
+        for (y in 0 until sizePx) {
+            bmp.setPixel(x, y, if (matrix.get(x, y)) AndroidColor.BLACK else AndroidColor.WHITE)
+        }
+    }
+    bmp
+}.getOrNull()
+
+@Composable
+private fun QrCodeDialog(me: Me, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val payload = "https://holidaylink.org/@${me.username.ifBlank { me.id }}"
+    val bitmap = remember(payload) { qrBitmap(payload) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(me.displayName) },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "Profile QR code",
+                        modifier = Modifier.size(240.dp).clip(RoundedCornerShape(12.dp)).background(androidx.compose.ui.graphics.Color.White).padding(8.dp)
+                    )
+                } else {
+                    Text("QR code unavailable.", style = MaterialTheme.typography.bodyMedium)
+                }
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "@${me.username.ifBlank { me.id }}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { shareProfile(context, me); onDismiss() }) { Text("Share") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
 }

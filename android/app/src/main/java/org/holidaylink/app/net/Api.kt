@@ -141,6 +141,7 @@ data class Message(
     val status: String = "sent",
     val pinned: Boolean = false,
     val expiresAt: String? = null,
+    val viewOnce: Boolean = false,
     /** Present on search results, where the server tells us which chat a hit belongs to. */
     val conversationId: String? = null,
     val conversationKind: String? = null,
@@ -185,17 +186,6 @@ data class VerifyResult(
 data class AuthResult(
     val token: String,
     val userId: String
-)
-
-data class VideoPost(
-    val id: String, val userId: String, val videoUrl: String, val thumbnailUrl: String? = null,
-    val caption: String = "", val views: Long = 0, val createdAt: String = "",
-    val user: User, val liked: Boolean = false, val likes: Int = 0, val comments: Int = 0,
-    val saved: Boolean = false
-)
-
-data class VideoComment(
-    val id: String, val body: String, val createdAt: String, val user: User
 )
 
 data class StoreItem(
@@ -290,6 +280,16 @@ data class AiReply(
     val conversationId: String,
     val messageId: String,
     val text: String
+)
+
+data class AiBot(
+    val id: String,
+    val username: String,
+    val displayName: String,
+    val ownerId: String,
+    val ownerName: String? = null,
+    val mine: Boolean = false,
+    val createdAt: String? = null
 )
 
 /** One bucket of the global search screen. */
@@ -418,63 +418,12 @@ class Api(context: Context) {
         )
     }
 
-    suspend fun videos(): List<VideoPost> {
-        return cachedList("cache.videos", 60_000) { getArray("videos") }
-            .map { i -> i.toVideoPost() }
-    }
-
-    private suspend fun cachedList(key: String, ttlMs: Long, fetch: suspend () -> org.json.JSONArray): List<org.json.JSONObject> {
-        val now = System.currentTimeMillis()
-        val at = prefs.getLong("$key.at", 0L)
-        try {
-            val array = fetch()
-            prefs.edit().putString(key, array.toString()).putLong("$key.at", now).apply()
-            return (0 until array.length()).map { array.getJSONObject(it) }
-        } catch (e: Exception) {
-            // Offline: serve stale cache regardless of age; fresh fetch wins when online.
-            val raw = prefs.getString(key, null) ?: throw e
-            if (raw.isBlank() || (now - at > ttlMs && raw.isBlank())) throw e
-            val array = org.json.JSONArray(raw)
-            return (0 until array.length()).map { array.getJSONObject(it) }
-        }
-    }
-
     suspend fun statusesCached(): List<StatusUpdate> {
         return try { statuses() } catch (e: Exception) {
             val raw = prefs.getString("cache.statuses", null) ?: throw e
             val array = org.json.JSONArray(raw)
             (0 until array.length()).map { array.getJSONObject(it).toStatus() }
         }
-    }
-
-    suspend fun markVideoViewed(videoId: String) {
-        runCatching { postJson("videos/${enc(videoId)}/view", JSONObject()) }
-    }
-
-    suspend fun toggleVideoLike(videoId: String): Pair<Boolean, Int> {
-        val o = postJson("videos/${enc(videoId)}/like", JSONObject())
-        return Pair(o.optBoolean("liked"), o.optInt("likes"))
-    }
-
-    suspend fun toggleVideoSave(videoId: String): Boolean {
-        val o = postJson("videos/${enc(videoId)}/save", JSONObject())
-        return o.optBoolean("saved")
-    }
-
-    suspend fun videoComments(videoId: String): List<VideoComment> {
-        val array = getArray("videos/${enc(videoId)}/comments")
-        return (0 until array.length()).map { array.getJSONObject(it).toVideoComment() }
-    }
-
-    suspend fun postVideoComment(videoId: String, body: String): VideoComment {
-        return postJson("videos/${enc(videoId)}/comments", JSONObject().put("body", body)).toVideoComment()
-    }
-
-    suspend fun deleteVideo(videoId: String) { deleteJson("videos/${enc(videoId)}") }
-
-    suspend fun myVideos(): List<VideoPost> {
-        val array = getArray("me/videos")
-        return (0 until array.length()).map { array.getJSONObject(it).toVideoPost() }
     }
 
     suspend fun createChannel(title: String, memberIds: List<String>): String =
@@ -514,40 +463,7 @@ class Api(context: Context) {
         }
     }
 
-    suspend fun uploadVideo(uri: Uri, name: String?, sizeBytes: Long, caption: String): VideoPost = withContext(Dispatchers.IO) {
-        if (sizeBytes <= 0L || sizeBytes > 100L * 1024 * 1024) throw ApiException("Videos must be 100 MB or smaller.")
-        val resolver = appContext.contentResolver
-        val mime = resolver.getType(uri) ?: "video/mp4"
-        val requestBody = object : RequestBody() {
-            override fun contentType() = mime.toMediaType()
-            override fun contentLength() = sizeBytes
-            override fun writeTo(sink: okio.BufferedSink) {
-                resolver.openInputStream(uri)?.use { input ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (true) {
-                        val n = input.read(buffer)
-                        if (n < 0) break
-                        if (n > 0) sink.write(buffer, 0, n)
-                    }
-                } ?: throw IOException("Unable to read selected video")
-            }
-        }
-        val captionEncoded = URLEncoder.encode(caption, "UTF-8")
-        val request = authorized(
-            Request.Builder()
-                .url(baseUrl() + "/videos?caption=$captionEncoded")
-                .addHeader("Content-Type", mime)
-                .addHeader("X-Video-Name", name ?: "video.mp4")
-                .post(requestBody)
-        ).build()
-        client.newCall(request).execute().use { response ->
-            val raw = response.body?.string().orEmpty()
-            if (!response.isSuccessful) throw httpError(response.code, raw)
-            JSONObject(raw).toVideoPost()
-        }
-    }
-
-    /** Used by the Settings screen "Test connection" button. Never throws. */
+    /** Used by the hidden diagnostics screen. Never throws. */
     suspend fun health(): HealthInfo = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder().url(baseUrl() + "/health").get().build()
@@ -721,7 +637,9 @@ class Api(context: Context) {
         name: String?,
         dataUrl: String,
         durationMs: Long = 0,
-        waveform: String? = null
+        waveform: String? = null,
+        viewOnce: Boolean = false,
+        ttlSeconds: Long = 0
     ): Message {
         val payload = JSONObject()
             .put("body", "")
@@ -730,7 +648,13 @@ class Api(context: Context) {
             .put("attachmentDataUrl", dataUrl)
         if (durationMs > 0) payload.put("durationMs", durationMs)
         waveform?.let { payload.put("waveform", it) }
+        if (viewOnce) payload.put("viewOnce", true)
+        if (ttlSeconds > 0) payload.put("ttlSeconds", ttlSeconds)
         return postJson("conversations/${enc(conversationId)}/messages", payload).toMessage()
+    }
+
+    suspend fun markMessageViewed(conversationId: String, messageId: String) {
+        runCatching { postJson("conversations/${enc(conversationId)}/messages/${enc(messageId)}/viewed", JSONObject()) }
     }
 
     suspend fun editMessage(conversationId: String, messageId: String, body: String): Message =
@@ -970,6 +894,46 @@ class Api(context: Context) {
         deleteJson("ai/conversations")
     }
 
+    suspend fun aiBots(): List<AiBot> {
+        val array = getArray("ai/bots")
+        return (0 until array.length()).map { i ->
+            val o = array.getJSONObject(i)
+            AiBot(
+                id = o.optString("id"),
+                username = o.optString("username"),
+                displayName = str(o, "display_name") ?: "Bot",
+                ownerId = str(o, "owner_id").orEmpty(),
+                ownerName = str(o, "owner_name"),
+                mine = o.optBoolean("mine"),
+                createdAt = str(o, "created_at")
+            )
+        }
+    }
+
+    suspend fun createBot(username: String, displayName: String, instructions: String): AiBot {
+        val o = postJson(
+            "ai/bots",
+            JSONObject().put("username", username).put("displayName", displayName).put("instructions", instructions)
+        )
+        return AiBot(
+            id = o.optString("id"),
+            username = o.optString("username"),
+            displayName = str(o, "display_name") ?: displayName,
+            ownerId = str(o, "owner_id").orEmpty(),
+            mine = true
+        )
+    }
+
+    suspend fun deleteBot(botId: String) { deleteJson("ai/bots/${enc(botId)}") }
+
+    /** Instruct the AI to write a message and post it into the chat as your own message. */
+    suspend fun aiSend(conversationId: String, prompt: String, botId: String? = null): Message {
+        val payload = JSONObject().put("conversationId", conversationId).put("prompt", prompt)
+        botId?.takeIf { it.isNotBlank() }?.let { payload.put("botId", it) }
+        return postJson("ai/send", payload).optJSONObject("message")?.toMessage()
+            ?: throw ApiException("HolidayLink AI couldn't answer just now. Please try again.")
+    }
+
     // ---------------------------------------------------------------- global search
 
     suspend fun search(query: String): SearchResults {
@@ -1110,6 +1074,7 @@ class Api(context: Context) {
                 "HolidayLink AI couldn't answer just now. Please try again."
             "AI_TIMEOUT" -> "HolidayLink AI took too long to answer. Please try again."
             "UNAUTHORIZED" -> "Your session has expired. Please sign in again."
+            "ACCOUNT_BANNED" -> serverMessage.ifBlank { "This account was banned." }
             "DATABASE_UNAVAILABLE", "SERVICE_UNAVAILABLE" ->
                 "HolidayLink is temporarily unavailable. Please try again shortly."
             "TIMEOUT" -> "The server took too long to respond. Please try again."
@@ -1222,6 +1187,7 @@ class Api(context: Context) {
                 status = optString("status", "sent"),
                 pinned = optBoolean("pinned"),
                 expiresAt = str(this, "expires_at") ?: str(this, "expiresAt"),
+                viewOnce = optBoolean("view_once") || optBoolean("viewOnce"),
                 conversationId = str(this, "conversation_id") ?: str(this, "conversationId"),
                 conversationKind = str(this, "conversation_kind") ?: str(this, "conversationKind"),
                 conversationTitle = str(this, "conversation_title") ?: str(this, "conversationTitle"),
@@ -1284,32 +1250,5 @@ class Api(context: Context) {
             return (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
         }
     }
-
-private fun JSONObject.toVideoPost(): VideoPost {
-    val u = optJSONObject("user") ?: JSONObject()
-    // Server sends snake_case (display_name/avatar_url); POST /videos also sends camelCase.
-    // Accept both so TikTok feed never shows "HolidayLink user"/blank avatar.
-    val uName = u.optString("displayName").ifBlank { u.optString("display_name") }.ifBlank { "HolidayLink user" }
-    val uUsername = u.optString("username").ifBlank { "user" }
-    val uAvatar = u.optString("avatarUrl").ifBlank { u.optString("avatar_url") }.takeIf { it.isNotBlank() }
-    val uId = u.optString("id").ifBlank { optString("userId") }.ifBlank { optString("user_id") }
-    return VideoPost(
-        id = optString("id"), userId = uId,
-        videoUrl = optString("videoUrl").ifBlank { optString("video_url") },
-        thumbnailUrl = optString("thumbnailUrl").ifBlank { optString("thumbnail_url") }.takeIf { it.isNotBlank() },
-        caption = optString("caption"), views = optLong("views"), createdAt = optString("createdAt").ifBlank { optString("created_at") },
-        user = User(uId, uName, uUsername, uAvatar),
-        liked = optBoolean("liked"), likes = optInt("likes"), comments = optInt("comments"), saved = optBoolean("saved")
-    )
-}
-
-private fun org.json.JSONObject.toVideoComment(): org.holidaylink.app.net.VideoComment {
-    val u = optJSONObject("user") ?: org.json.JSONObject()
-    val uid = u.optString("id")
-    val nm = u.optString("displayName").ifBlank { u.optString("display_name") }.ifBlank { "HolidayLink user" }
-    val un = u.optString("username").ifBlank { "user" }
-    val av = u.optString("avatarUrl").ifBlank { u.optString("avatar_url") }.takeIf { it.isNotBlank() }
-    return org.holidaylink.app.net.VideoComment(optString("id"), optString("body"), optString("created_at"), org.holidaylink.app.net.User(uid, nm, un, av))
-}
 
 }

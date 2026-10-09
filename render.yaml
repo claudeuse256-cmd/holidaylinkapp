@@ -31,6 +31,10 @@ services:
         sync: false
       - key: GEMINI_MODELS
         value: "gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
+      - key: IMGBB_API_KEY
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
       - key: UPLOAD_DIR
         value: "./uploads"
       - key: CONTENT_SOURCE

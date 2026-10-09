@@ -27,6 +27,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -72,6 +73,7 @@ fun AiChatScreen(
     api: Api,
     conversationId: String?,
     onOpenConversation: (String) -> Unit,
+    onOpenProfile: () -> Unit = {},
     onBack: () -> Unit
 ) {
     var composingNewChat by remember { mutableStateOf(false) }
@@ -81,6 +83,7 @@ fun AiChatScreen(
             api = api,
             onOpenConversation = onOpenConversation,
             onNewConversation = { composingNewChat = true },
+            onOpenProfile = onOpenProfile,
             onBack = onBack
         )
         return
@@ -93,6 +96,7 @@ fun AiChatScreen(
             composingNewChat = false
             onOpenConversation(id)
         },
+        onOpenProfile = onOpenProfile,
         onBack = {
             // Going back from a brand new chat returns to the list instead of leaving AI.
             if (composingNewChat) composingNewChat = false else onBack()
@@ -146,6 +150,7 @@ private fun AiConversationList(
     api: Api,
     onOpenConversation: (String) -> Unit,
     onNewConversation: () -> Unit,
+    onOpenProfile: () -> Unit,
     onBack: () -> Unit
 ) {
     var conversations by remember { mutableStateOf<List<AiConversation>>(emptyList()) }
@@ -168,6 +173,9 @@ private fun AiConversationList(
 
     Column(Modifier.fillMaxSize()) {
         AiTopBar("HolidayLink AI", onBack) {
+            IconButton(onClick = onOpenProfile) {
+                Icon(Icons.Default.Person, "AI profile")
+            }
             IconButton(onClick = { onNewConversation() }) {
                 Icon(Icons.Default.Add, "New AI chat")
             }
@@ -298,6 +306,7 @@ private fun AiConversationView(
     api: Api,
     conversationId: String?,
     onOpenConversation: (String) -> Unit,
+    onOpenProfile: () -> Unit,
     onBack: () -> Unit
 ) {
     var messages by remember { mutableStateOf<List<AiMessage>>(emptyList()) }
@@ -352,6 +361,9 @@ private fun AiConversationView(
             if (sending) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(12.dp))
+            }
+            IconButton(onClick = onOpenProfile) {
+                Icon(Icons.Default.Person, "AI profile")
             }
         }
 

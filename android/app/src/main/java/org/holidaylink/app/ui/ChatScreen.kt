@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CleaningServices
@@ -63,6 +65,8 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -77,12 +81,18 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.FilterChip
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -109,6 +119,7 @@ import kotlinx.coroutines.withContext
 import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.DisappearingDuration
 import org.holidaylink.app.media.MediaPicker
+import org.holidaylink.app.net.AiBot
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Attachment
@@ -155,6 +166,10 @@ fun ChatScreen(
 
     var sheetFor by remember { mutableStateOf<Message?>(null) }
     var showAttach by remember { mutableStateOf(false) }
+    // Telegram-style sending options, kept sticky like the timer.
+    var viewOnceSend by remember { mutableStateOf(false) }
+    var selfDestructSecs by remember { mutableLongStateOf(0L) }
+    var viewOnceTarget by remember { mutableStateOf<Message?>(null) }
     var showEmoji by remember { mutableStateOf(false) }
     var showSearch by remember { mutableStateOf(false) }
     var showPinned by remember { mutableStateOf(false) }
@@ -165,6 +180,24 @@ fun ChatScreen(
     var recordingMs by remember { mutableLongStateOf(0L) }
     var amplitude by remember { mutableIntStateOf(0) }
     var micDenied by remember { mutableStateOf(false) }
+    var aiBots by remember { mutableStateOf<List<AiBot>>(emptyList()) }
+    var aiSending by remember { mutableStateOf(false) }
+
+    // @ai / @bot mentions for the Meta-AI style assistant. Loaded once per chat.
+    LaunchedEffect(chat.id) {
+        runCatching { aiBots = api.aiBots() }
+    }
+
+    /** Returns (handle, botId?, instruction) when the draft mentions the assistant. */
+    fun parseMention(text: String): Triple<String, String?, String>? {
+        val match = Regex("@([A-Za-z0-9_]{2,32})\\s+([^\\n]+)").find(text) ?: return null
+        val handle = match.groupValues[1].lowercase()
+        val instruction = match.groupValues[2].trim()
+        if (instruction.isEmpty()) return null
+        if (handle == "ai") return Triple("@ai", null, instruction)
+        val bot = aiBots.firstOrNull { it.username.lowercase() == handle } ?: return null
+        return Triple("@${bot.username}", bot.id, instruction)
+    }
 
     val title = chat.peer?.displayName ?: chat.title ?: "Group"
     val settings = AppSettings.state
@@ -242,6 +275,8 @@ fun ChatScreen(
 
     fun sendAttachment(uri: Uri, kind: String) {
         sending = true
+        val once = viewOnceSend && (kind == "image" || kind == "video")
+        val ttl = selfDestructSecs
         scope.launch {
             try {
                 val picked = MediaPicker.inspect(context, uri)
@@ -252,7 +287,7 @@ fun ChatScreen(
                 if (dataUrl == null) {
                     snackbar.showSnackbar("That file is too large to send (max 20 MB).")
                 } else {
-                    api.sendAttachment(chat.id, kind, picked.name, dataUrl)
+                    api.sendAttachment(chat.id, kind, picked.name, dataUrl, viewOnce = once, ttlSeconds = ttl)
                     reloadMessages()
                 }
             } catch (e: Exception) {
@@ -409,7 +444,44 @@ fun ChatScreen(
         },
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
-            ChatComposer(
+            val mention = remember(draft, aiBots) { parseMention(draft) }
+            Column {
+                if (mention != null && !sending && !aiSending) {
+                    val (handle, botId, instruction) = mention
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.primaryContainer)
+                            .clickable {
+                                aiSending = true
+                                scope.launch {
+                                    runCatching { api.aiSend(chat.id, instruction, botId) }
+                                        .onSuccess {
+                                            draft = ""
+                                            reloadMessages()
+                                            snackbar.showSnackbar("Sent via $handle")
+                                        }
+                                        .onFailure {
+                                            snackbar.showSnackbar((it as? ApiException)?.message ?: "HolidayLink AI couldn't answer.")
+                                        }
+                                    aiSending = false
+                                }
+                            }
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "Send via $handle",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (aiSending) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    }
+                }
+                ChatComposer(
                 draft = draft,
                 onDraftChange = { draft = it },
                 editingId = editingId,
@@ -429,7 +501,8 @@ fun ChatScreen(
                 onStartRecording = { beginRecording() },
                 onStopRecording = { finishRecording(send = true) },
                 onCancelRecording = { finishRecording(send = false) }
-            )
+                )
+            }
         }
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
@@ -464,7 +537,14 @@ fun ChatScreen(
                                 MessageBubble(
                                     message = message,
                                     mine = message.senderId == currentUserId,
-                                    onLongPress = { sheetFor = message }
+                                    onLongPress = { sheetFor = message },
+                                    onOpenViewOnce = { target ->
+                                        if (target.senderId == currentUserId) {
+                                            scope.launch { snackbar.showSnackbar("View-once: the recipient opens it one time.") }
+                                        } else {
+                                            viewOnceTarget = target
+                                        }
+                                    }
                                 )
                             }
                             if (peerTyping) {
@@ -548,6 +628,10 @@ fun ChatScreen(
             sheetState = rememberModalBottomSheetState()
         ) {
             AttachSheet(
+                viewOnce = viewOnceSend,
+                onViewOnceChange = { viewOnceSend = it },
+                selfDestructSecs = selfDestructSecs,
+                onSelfDestructChange = { selfDestructSecs = it },
                 onImage = {
                     showAttach = false
                     imagePicker.launch(
@@ -588,6 +672,22 @@ fun ChatScreen(
                 showEmoji = false
             }
         }
+    }
+
+    val onceTarget = viewOnceTarget
+    if (onceTarget?.attachment != null) {
+        SecureViewOnceDialog(
+            attachment = onceTarget.attachment,
+            onClose = {
+                viewOnceTarget = null
+                // Destroy server-side after the single opening, then drop the local copy.
+                scope.launch {
+                    runCatching { api.markMessageViewed(chat.id, onceTarget.id) }
+                    messages = messages.filterNot { it.id == onceTarget.id }
+                    reloadMessages()
+                }
+            }
+        )
     }
 
     if (showSearch) {
@@ -661,7 +761,12 @@ fun ChatScreen(
 // ------------------------------------------------------------------ bubbles
 
 @Composable
-private fun MessageBubble(message: Message, mine: Boolean, onLongPress: () -> Unit) {
+private fun MessageBubble(
+    message: Message,
+    mine: Boolean,
+    onLongPress: () -> Unit,
+    onOpenViewOnce: (Message) -> Unit
+) {
     val compact = AppSettings.state.chatDensity == org.holidaylink.app.ui.theme.ChatDensity.COMPACT
     val bubbleColor = if (mine) {
         MaterialTheme.colorScheme.primaryContainer
@@ -725,7 +830,12 @@ private fun MessageBubble(message: Message, mine: Boolean, onLongPress: () -> Un
                     }
                 }
 
-                message.attachment?.let { AttachmentView(it) }
+                if (message.viewOnce && message.attachment != null) {
+                    // Never render the bytes inline: one protected opening only.
+                    ViewOnceRow(mine = mine, onOpen = { onOpenViewOnce(message) })
+                } else {
+                    message.attachment?.let { AttachmentView(it) }
+                }
 
                 if (message.body.isNotBlank()) {
                     Text(
@@ -755,6 +865,15 @@ private fun MessageBubble(message: Message, mine: Boolean, onLongPress: () -> Un
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            if (message.expiresAt != null) {
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    Icons.Default.Timer,
+                    "Self-destructs",
+                    Modifier.size(12.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             if (message.pinned) {
                 Spacer(Modifier.width(4.dp))
                 Icon(
@@ -809,6 +928,76 @@ private fun StatusTick(status: String) {
         modifier = Modifier.size(14.dp),
         tint = tint
     )
+}
+
+@Composable
+private fun ViewOnceRow(mine: Boolean, onOpen: () -> Unit) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onOpen() }
+            .padding(horizontal = 4.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            Icons.Default.VisibilityOff,
+            null,
+            Modifier.size(22.dp),
+            tint = MaterialTheme.colorScheme.primary
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(
+            if (mine) "View-once sent" else "View once — tap to open",
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+/**
+ * Fullscreen view-once viewer. FLAG_SECURE blocks screenshots and screen
+ * recording while open (a physical camera photo is still possible).
+ * Closing destroys the message server-side via markMessageViewed.
+ */
+@Composable
+private fun SecureViewOnceDialog(
+    attachment: Attachment,
+    onClose: () -> Unit
+) {
+    val context = LocalContext.current
+    val activity = context as? FragmentActivity ?: context as? android.app.Activity
+    DisposableEffect(activity) {
+        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        onDispose { activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
+    }
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .clickable { onClose() },
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                RemoteImage(
+                    url = attachment.url.orEmpty(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 520.dp)
+                        .padding(16.dp)
+                )
+                Text(
+                    "Screenshot and recording are blocked • closes after viewing",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.75f),
+                    modifier = Modifier.padding(bottom = 24.dp)
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -1202,16 +1391,54 @@ private fun SheetAction(text: String, icon: androidx.compose.ui.graphics.vector.
 
 @Composable
 private fun AttachSheet(
+    viewOnce: Boolean,
+    onViewOnceChange: (Boolean) -> Unit,
+    selfDestructSecs: Long,
+    onSelfDestructChange: (Long) -> Unit,
     onImage: () -> Unit,
     onVideo: () -> Unit,
     onDocument: () -> Unit,
     onCamera: () -> Unit
 ) {
+    val timers = listOf(0L to "Off", 5L to "5s", 30L to "30s", 60L to "1m", 3600L to "1h", 86400L to "1d")
     Column(Modifier.fillMaxWidth().padding(vertical = 8.dp, horizontal = 8.dp)) {
         SheetAction("Photo", Icons.Default.PhotoCamera, onImage)
         SheetAction("Video", Icons.Default.Movie, onVideo)
         SheetAction("Document", Icons.Default.Description, onDocument)
         SheetAction("Camera", Icons.Default.PhotoCamera, onCamera)
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.VisibilityOff, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("View once", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "Photo/video opens one time, no screenshot",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(checked = viewOnce, onCheckedChange = onViewOnceChange)
+        }
+        Text(
+            "Self-destruct timer",
+            style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+        )
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            timers.forEach { (secs, label) ->
+                FilterChip(
+                    selected = selfDestructSecs == secs,
+                    onClick = { onSelfDestructChange(secs) },
+                    label = { Text(label) }
+                )
+            }
+        }
     }
 }
 
