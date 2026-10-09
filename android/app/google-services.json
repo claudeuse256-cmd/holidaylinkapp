@@ -1,0 +1,49 @@
+{
+  "project_info": {
+    "project_number": "213152244895",
+    "firebase_url": "https://studentroom-9f546-default-rtdb.firebaseio.com",
+    "project_id": "studentroom-9f546",
+    "storage_bucket": "studentroom-9f546.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:213152244895:android:e2fc386b9dcfaa3e7deeaa",
+        "android_client_info": {
+          "package_name": "com.holidaylink.appcom"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyByjpiB0LKuMhggCJ6ZItPJgEqDGlIbm0U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:213152244895:android:6c2d9813181e44477deeaa",
+        "android_client_info": {
+          "package_name": "org.holidaylink.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyByjpiB0LKuMhggCJ6ZItPJgEqDGlIbm0U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
