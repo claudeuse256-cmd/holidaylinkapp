@@ -361,6 +361,37 @@ class Api(context: Context) {
         return body.optBoolean("enabled")
     }
 
+    // ---------------------------------------------------------------- Firebase OTP (Render otp service)
+
+    data class FirebaseOtpRequest(val phone: String, val resendAfterSeconds: Int)
+    data class FirebaseOtpResult(val customToken: String, val uid: String, val isNew: Boolean, val phone: String)
+
+    /** Request an Infobip SMS code. The code hash lives in Firebase for 5 minutes. */
+    suspend fun otpRequest(internationalPhone: String): FirebaseOtpRequest {
+        val body = postJson("otp/request", JSONObject().put("phone", internationalPhone))
+        val normalized = body.optString("phone").takeIf { it.isNotBlank() } ?: internationalPhone
+        return FirebaseOtpRequest(
+            phone = normalized,
+            resendAfterSeconds = body.optInt("resendAfterSeconds", 45).coerceAtLeast(0)
+        )
+    }
+
+    /** Verify the SMS code. Returns a Firebase custom token to sign in with. */
+    suspend fun otpVerify(internationalPhone: String, pin: String): FirebaseOtpResult {
+        val body = postJson(
+            "otp/verify",
+            JSONObject().put("phone", internationalPhone).put("pin", pin)
+        )
+        val token = body.optString("token")
+        if (token.isBlank()) throw ApiException("That code is incorrect or has expired. Check the SMS and try again.")
+        return FirebaseOtpResult(
+            customToken = token,
+            uid = body.optString("uid"),
+            isNew = body.optBoolean("isNew"),
+            phone = body.optString("phone").takeIf { it.isNotBlank() } ?: internationalPhone
+        )
+    }
+
     data class PhoneCheck(val phone:String,val exists:Boolean,val twoFactorEnabled:Boolean)
 
     suspend fun checkPhone(internationalPhone:String): PhoneCheck {

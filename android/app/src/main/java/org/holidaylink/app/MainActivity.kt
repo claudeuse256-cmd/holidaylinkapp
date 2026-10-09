@@ -91,6 +91,7 @@ import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AccountStore
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.CallManager
 import org.holidaylink.app.ui.CallScreen
 import org.holidaylink.app.net.ChatItem
@@ -212,11 +213,12 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
         fontScale = AppSettings.state.fontScale
     ) {
         AppLockGate {
-            var signedIn by remember { mutableStateOf(api.sessionToken() != null) }
+            var signedIn by remember { mutableStateOf(FirebaseBackend.currentUser != null) }
             var bannedMsg by remember { mutableStateOf<String?>(null) }
             val banMsg = bannedMsg
             if (banMsg != null) {
                 BannedScreen(message = banMsg, onSwitchNumber = {
+                    FirebaseBackend.signOut()
                     prefs.edit().remove("token").remove("userId").apply()
                     bannedMsg = null
                     signedIn = false
@@ -225,7 +227,10 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
                 SignedInApp(
                     api = api,
                     prefs = prefs,
-                    onLoggedOut = { signedIn = false },
+                    onLoggedOut = {
+                        FirebaseBackend.signOut()
+                        signedIn = false
+                    },
                     onBanned = { bannedMsg = it }
                 )
             } else {
@@ -477,6 +482,7 @@ private fun SignedInApp(
             conversationId = null,
             onOpenConversation = { push(Destination.AiChat(it)) },
             onOpenProfile = { push(Destination.AiProfile) },
+            onOpenPage = { page, _ -> push(aiPageDestination(page)) },
             onBack = pop
         )
 
@@ -494,9 +500,22 @@ private fun SignedInApp(
                 stack.add(Destination.AiChat(id))
             },
             onOpenProfile = { push(Destination.AiProfile) },
+            onOpenPage = { page, _ -> push(aiPageDestination(page)) },
             onBack = pop
         )
     }
+}
+
+/** Study Buddy open_page targets mapped onto native destinations. */
+private fun aiPageDestination(page: String): Destination = when (page.lowercase()) {
+    "quizzes", "papers", "study" -> Destination.Ai
+    "events", "videos", "daily_feed", "feed", "dashboard" -> Destination.Status(false)
+    "store", "wallet" -> Destination.Store
+    "chat", "room" -> Destination.Tabs
+    "invite" -> Destination.NewChat
+    "profile" -> Destination.MyProfile
+    "buddies", "leaderboard", "skills" -> Destination.Search
+    else -> Destination.FeatureHub
 }
 
 /** Settings hub plus its sub-screens, kept as one stack so Back behaves predictably. */
@@ -927,6 +946,11 @@ private fun BannedScreen(message: String, onSwitchNumber: () -> Unit) {
 private fun friendlyMessage(e: Throwable, fallback: String): String =
     (e as? ApiException)?.message?.takeIf { it.isNotBlank() } ?: fallback
 
+private fun finishFirebaseLogin(prefs: SharedPreferences, uid: String, phone: String, countryIso: String) {
+    // Firebase Auth holds the session; prefs keep the uid/phone the rest of the app reads.
+    prefs.edit().putString("userId", uid).putString("phone", phone).putString("countryIso", countryIso).apply()
+}
+
 private fun saveSession(prefs: SharedPreferences, token: String?, userId: String?) {
     val editor = prefs.edit()
     if (!token.isNullOrBlank()) editor.putString("token", token)
@@ -937,12 +961,13 @@ private fun saveSession(prefs: SharedPreferences, token: String?, userId: String
 private const val OTP_LENGTH = 6
 
 /**
- * Sign-in: phone number, SMS code, then the profile details for a brand new account.
- * The number the server says it will verify against is always the number we send back for
- * verification, so the two requests can never disagree.
+ * Sign-in: phone number, Infobip SMS code, Firebase custom-token login.
+ * Profile lives in Firestore users/{uid} (same doc as the website).
+ * 2FA is the website's device-approval flow (twoFactorRequests + sessions).
  */
 @Composable
 fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
+    val context = LocalContext.current
     var country by remember {
         mutableStateOf(Countries.byIso(prefs.getString("countryIso", Countries.DEFAULT_ISO)))
     }
@@ -950,9 +975,6 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
     var pin by remember { mutableStateOf("") }
     var display by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
-    var email by remember { mutableStateOf("") }
-    var twoFactorPassword by remember { mutableStateOf("") }
-    var useTwoFactor by remember { mutableStateOf(false) }
     var step by remember { mutableStateOf(0) }
     var error by remember { mutableStateOf("") }
     var info by remember { mutableStateOf("") }
@@ -961,6 +983,8 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
     var signingUp by remember { mutableStateOf(false) }
     var verifiedPhone by remember { mutableStateOf("") }
     var cooldown by remember { mutableStateOf(0) }
+    var waitingRequestId by remember { mutableStateOf<String?>(null) }
+    var firebaseUid by remember { mutableStateOf("") }
 
     val scope = rememberCoroutineScope()
     val international = remember(national, country) {
@@ -976,13 +1000,30 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
         }
     }
 
-    fun loginTwoFactor() {
-        if (twoFactorPassword.length < 8) { error = "Enter your 2FA password."; return }
-        scope.launch {
-            runCatching { api.loginWithTwoFactor(verifiedPhone.ifBlank { international }, twoFactorPassword) }
-                .onSuccess { result -> saveSession(prefs, result.token, result.userId); onLoggedIn() }
-                .onFailure { error = if (it is ApiException) friendlyMessage(it, "2FA login failed.") else "2FA login failed." }
+    // 2FA approval listener: another device approves → finish login.
+    val waitingId = waitingRequestId
+    DisposableEffect(waitingId) {
+        val reg = waitingId?.let { id ->
+            FirebaseBackend.watchTwoFactorRequest(id) { approved ->
+                if (approved) {
+                    scope.launch {
+                        runCatching { FirebaseBackend.touchSession(context, firebaseUid) }
+                        finishFirebaseLogin(prefs, firebaseUid, verifiedPhone.ifBlank { international }, country.iso)
+                        waitingRequestId = null
+                        onLoggedIn()
+                    }
+                } else {
+                    scope.launch {
+                        FirebaseBackend.cancelTwoFactorRequest(id)
+                        FirebaseBackend.signOut()
+                        waitingRequestId = null
+                        error = "Sign-in was denied on your other device."
+                        step = 0
+                    }
+                }
+            }
         }
+        onDispose { reg?.remove() }
     }
 
     fun sendCode(resend: Boolean) {
@@ -993,14 +1034,14 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
         info = ""
         scope.launch {
             try {
-                val result = api.requestOtp(international)
+                val result = api.otpRequest(international)
                 verifiedPhone = result.phone
                 prefs.edit()
                     .putString("phone", result.phone)
                     .putString("countryIso", country.iso)
                     .apply()
                 cooldown = result.resendAfterSeconds
-                info = "Verification code sent to ${PhoneNumbers.mask(result.phone)}."
+                info = "Verification code sent to ${PhoneNumbers.mask(result.phone)}. It works for 5 minutes."
                 if (!resend) step = 1
             } catch (e: ApiException) {
                 error = friendlyMessage(e, "We couldn't send the code. Please try again.")
@@ -1015,15 +1056,7 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
 
 
     fun continueFromPhone() {
-        if (sending) return
-        sending=true; error=""; info=""
-        scope.launch {
-            try {
-                val check=api.checkPhone(international); verifiedPhone=check.phone
-                if(check.exists && check.twoFactorEnabled){ step=3 } else { sending=false; sendCode(resend=false); return@launch }
-            } catch(e:ApiException){ error=friendlyMessage(e,"We couldn't check that number.") }
-            finally { sending=false }
-        }
+        sendCode(resend = false)
     }
 
     fun verifyCode() {
@@ -1038,13 +1071,42 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
         info = ""
         scope.launch {
             try {
-                val result = api.verifyOtp(verifiedPhone.ifBlank { international }, code)
-                if (result.needsProfile) {
+                val result = api.otpVerify(verifiedPhone.ifBlank { international }, code)
+                val user = FirebaseBackend.signInWithCustomToken(result.customToken)
+                val uid = user.uid
+                firebaseUid = uid
+                val profile = FirebaseBackend.loadProfile(uid)
+                if (profile == null) {
+                    error = "We couldn't load your profile. Please try again."
+                    FirebaseBackend.signOut()
+                    return@launch
+                }
+                if (profile.banned) {
+                    error = profile.banReason?.takeIf { it.isNotBlank() }?.let { "This account was banned: $it" }
+                        ?: "This account was banned."
+                    FirebaseBackend.signOut()
+                    return@launch
+                }
+                if (profile.disabled) {
+                    error = "This account was disabled. Contact support."
+                    FirebaseBackend.signOut()
+                    return@launch
+                }
+                val gate = FirebaseBackend.checkTwoFactor(context, uid)
+                if (gate is FirebaseBackend.TwoFactorGate.Waiting) {
+                    waitingRequestId = gate.requestId
+                    pin = ""
+                    step = 3
+                    return@launch
+                }
+                if (profile.name.isBlank() || result.isNew) {
                     verifiedPhone = result.phone
+                    display = profile.name
+                    username = profile.username
                     pin = ""
                     step = 2
                 } else {
-                    saveSession(prefs, result.token, result.userId)
+                    finishFirebaseLogin(prefs, uid, result.phone, country.iso)
                     onLoggedIn()
                 }
             } catch (e: ApiException) {
@@ -1063,14 +1125,19 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
         error = ""
         scope.launch {
             try {
-                val result = api.completeProfile(
-                    verifiedPhone.ifBlank { international },
-                    display.trim(),
-                    username.trim(),
-                    email.trim(),
-                    twoFactorPassword.trim().takeIf { it.length >= 8 }
-                )
-                saveSession(prefs, result.token, result.userId)
+                val uid = firebaseUid.ifBlank { FirebaseBackend.uid } ?: throw ApiException("Sign-in expired. Verify again.")
+                val cleanName = display.trim().take(120)
+                val cleanUsername = username.trim().lowercase().filter { it.isLetterOrDigit() || it == '_' }.take(32)
+                if (cleanName.isBlank() || cleanUsername.length < 3) {
+                    error = "Enter a display name and a username of 3+ characters."
+                    return@launch
+                }
+                if (FirebaseBackend.isUsernameTaken(cleanUsername, uid)) {
+                    error = "That @username is already taken."
+                    return@launch
+                }
+                FirebaseBackend.saveProfile(uid, cleanName, cleanUsername, "")
+                finishFirebaseLogin(prefs, uid, verifiedPhone.ifBlank { international }, country.iso)
                 onLoggedIn()
             } catch (e: ApiException) {
                 error = friendlyMessage(e, "We couldn't create your account. Please try again.")
@@ -1103,7 +1170,7 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
                         0 -> "Your chats. Your people. Your holiday life."
                         1 -> "Enter the SMS code"
                         2 -> "Create your HolidayLink profile"
-                        3 -> "Enter your 2FA password"
+                        3 -> "Approve on your other device"
                         else -> "HolidayLink"
                     },
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1112,7 +1179,7 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
                 when (step) {
                     0 -> {
                         Text(
-                            "Enter your number. HolidayLink will check the account first, then use 2FA or SMS as required.",
+                            "Enter your number. A verification code arrives by SMS and works for 5 minutes.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Row(
@@ -1220,11 +1287,26 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
                     }
 
                     3 -> {
-                        Text("2FA password required", style=MaterialTheme.typography.titleLarge)
-                        Text("This number is already registered with 2FA enabled.", color=MaterialTheme.colorScheme.onSurfaceVariant)
-                        OutlinedTextField(twoFactorPassword, { twoFactorPassword = it }, label={Text("2FA password")}, singleLine=true, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Password), modifier=Modifier.fillMaxWidth())
-                        Button(onClick={loginTwoFactor()}, enabled=twoFactorPassword.length>=8, modifier=Modifier.fillMaxWidth()){ Text("Login") }
-                        TextButton(onClick={step=0;twoFactorPassword=""}){ Text("Use a different number") }
+                        Text("Check your other device", style=MaterialTheme.typography.titleLarge)
+                        Text(
+                            "This account uses 2FA approval. Open HolidayLink on a signed-in device and approve this sign-in.",
+                            color=MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Text("Waiting for approval…")
+                        }
+                        TextButton(onClick={
+                            waitingRequestId?.let { id ->
+                                scope.launch {
+                                    FirebaseBackend.cancelTwoFactorRequest(id)
+                                    FirebaseBackend.signOut()
+                                }
+                            }
+                            waitingRequestId = null
+                            step = 0
+                        }){ Text("Cancel and use a different number") }
                     }
 
                     2 -> {
@@ -1243,20 +1325,6 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
                             username, { username = it },
                             label = { Text("@username - must be unique") },
                             singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        OutlinedTextField(
-                            email, { email = it },
-                            label = { Text("Email (optional backup)") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        OutlinedTextField(
-                            twoFactorPassword, { twoFactorPassword = it },
-                            label = { Text("2FA password (optional, 8+ characters)") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                             modifier = Modifier.fillMaxWidth()
                         )
                         Button(
