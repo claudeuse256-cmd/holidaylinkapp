@@ -49,7 +49,9 @@ import androidx.compose.material.icons.filled.KeyboardVoice
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Search
@@ -80,6 +82,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -157,24 +160,40 @@ fun ChatScreen(
     var reportTarget by remember { mutableStateOf<FirestoreChat.ChatMessage?>(null) }
     var aiBots by remember { mutableStateOf<List<FirestoreBots.StudyBot>>(emptyList()) }
     var aiSending by remember { mutableStateOf(false) }
+    // Bodies just sent but not yet echoed back by Firestore: single grey tick.
+    var pendingTexts by remember { mutableStateOf<List<String>>(emptyList()) }
 
     var recorder by remember { mutableStateOf<VoiceRecorder?>(null) }
     var recordingMs by remember { mutableStateOf(0L) }
     var amplitude by remember { mutableIntStateOf(0) }
 
-    val title = peerUser?.displayName ?: chat.peer?.displayName ?: chat.title ?: "Group"
+    val title = peerUser?.displayName?.takeIf { it.isNotBlank() }
+        ?: chat.peer?.displayName?.takeIf { it.isNotBlank() }
+        ?: chat.title?.takeIf { it.isNotBlank() }
+        ?: if (chat.kind == "direct") "Chat" else "Group"
 
     val messages by remember(chat.id) { FirestoreChat.messagesFlow(chat.id) }
         .collectAsState(initial = emptyList())
 
     LaunchedEffect(chat.id) {
         runCatching { FirestoreChat.purgeExpired(chat.id) }
-        peerUser = chat.peer ?: chat.peer?.let { it }
-        val pid = chat.peer?.id?.takeIf { it.isNotBlank() && !it.startsWith("00000000") }
+        peerUser = chat.peer
+        var pid = chat.peer?.id?.takeIf { it.isNotBlank() && !it.startsWith("00000000") }
+        if (pid == null && chat.kind == "direct") {
+            // Header must never read "Group" for a 1-1 chat: recover the peer
+            // from the conversation members instead.
+            pid = runCatching {
+                FirebaseBackend.db.collection("chats").document(chat.id).get().await()
+                    .let { doc -> ((doc.get("users") as? List<String>) ?: emptyList()).firstOrNull { it != uid } }
+            }.getOrNull()
+        }
         if (pid != null) {
             runCatching { FirestoreChat.resolvePeer(pid) }.onSuccess {
                 peerUser = it
-                peerOnline = it.online
+                peerOnline = FirebaseBackend.isTrulyOnline(
+                    it.online,
+                    it.lastSeen?.let { iso -> runCatching { java.time.Instant.parse(iso).toEpochMilli() }.getOrNull() }
+                )
             }
         }
         runCatching { aiBots = FirestoreBots.list() }
@@ -183,6 +202,10 @@ fun ChatScreen(
     LaunchedEffect(messages) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.lastIndex)
+            if (pendingTexts.isNotEmpty()) {
+                val echoed = messages.filter { it.senderId == uid }.map { it.text }.toSet()
+                pendingTexts = pendingTexts.filter { it !in echoed }
+            }
             if (messages.any { it.senderId != uid && !it.read }) {
                 runCatching { FirestoreChat.markRead(chat.id) }
             }
@@ -211,6 +234,8 @@ fun ChatScreen(
                     FirestoreChat.editMessage(chat.id, editId, body)
                     editingId = null
                 } else {
+                    val reply = replyingTo
+                    pendingTexts = pendingTexts + body
                     FirestoreChat.send(
                         chatId = chat.id,
                         text = body,
@@ -344,6 +369,7 @@ fun ChatScreen(
                             Text(
                                 text = when {
                                     peerOnline == true -> "online"
+                                    peerUser?.lastSeen != null -> "last seen ${friendlyWhen(peerUser?.lastSeen)}"
                                     else -> peerUser?.username?.let { "@$it" } ?: chat.peer?.username?.let { "@$it" } ?: "HolidayLink"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
@@ -448,6 +474,7 @@ fun ChatScreen(
                         FsMessageBubble(
                             message = message,
                             mine = message.senderId == uid,
+                            pending = message.senderId == uid && !message.read && message.text in pendingTexts,
                             onLongPress = { sheetFor = message },
                             onOpenViewOnce = { target ->
                                 if (target.senderId == uid) {
@@ -622,6 +649,7 @@ private fun urlToStoragePath(url: String): String? {
 private fun FsMessageBubble(
     message: FirestoreChat.ChatMessage,
     mine: Boolean,
+    pending: Boolean,
     onLongPress: () -> Unit,
     onOpenViewOnce: (FirestoreChat.ChatMessage) -> Unit
 ) {
@@ -707,7 +735,8 @@ private fun FsMessageBubble(
             }
             if (mine) {
                 Spacer(Modifier.width(4.dp))
-                StatusTick(if (message.read) "read" else "delivered")
+                // Sent (single grey) → delivered (double grey) → read (double blue).
+                StatusTick(if (message.read) "read" else if (pending) "sent" else "delivered")
             }
         }
     }
@@ -715,6 +744,10 @@ private fun FsMessageBubble(
 
 @Composable
 private fun FsFileRow(name: String, kind: String, url: String) {
+    if (kind == "voice") {
+        VoicePlayer(url = url, name = name)
+        return
+    }
     val context = LocalContext.current
     Row(
         Modifier.fillMaxWidth()
@@ -734,6 +767,83 @@ private fun FsFileRow(name: String, kind: String, url: String) {
         Icon(Icons.Default.Description, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.width(10.dp))
         Text(name, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun VoicePlayer(url: String, name: String) {
+    val context = LocalContext.current
+    var playing by remember(url) { mutableStateOf(false) }
+    var progress by remember(url) { mutableFloatStateOf(0f) }
+    var duration by remember(url) { mutableIntStateOf(0) }
+    var position by remember(url) { mutableIntStateOf(0) }
+    val player = remember(url) { android.media.MediaPlayer() }
+    DisposableEffect(url) {
+        onDispose {
+            runCatching { player.reset(); player.release() }
+        }
+    }
+    LaunchedEffect(playing) {
+        while (playing) {
+            delay(250)
+            runCatching {
+                if (player.isPlaying) {
+                    position = player.currentPosition
+                    val d = player.duration.coerceAtLeast(1)
+                    duration = d
+                    progress = position.toFloat() / d
+                } else if (position >= duration && duration > 0) {
+                    playing = false
+                    position = 0
+                    progress = 0f
+                }
+            }
+        }
+    }
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IconButton(onClick = {
+            runCatching {
+                if (playing) {
+                    player.pause()
+                    playing = false
+                } else {
+                    if (position <= 0) {
+                        player.reset()
+                        player.setDataSource(url)
+                        player.prepare()
+                        duration = player.duration
+                    }
+                    player.start()
+                    playing = true
+                }
+            }
+        }) {
+            Icon(
+                if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
+                if (playing) "Pause" else "Play",
+                tint = MaterialTheme.colorScheme.primary
+            )
+        }
+        Column(Modifier.weight(1f)) {
+            Text(
+                name,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+            Text(
+                "${formatDuration(position.toLong())} / ${formatDuration(duration.toLong())}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 
@@ -923,7 +1033,18 @@ private fun ChatComposer(
                     .clip(RoundedCornerShape(22.dp))
                     .background(MaterialTheme.colorScheme.surfaceContainerHigh)
                     .padding(horizontal = 14.dp, vertical = 10.dp),
-                textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                textStyle = MaterialTheme.typography.bodyLarge.copy(
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontSize = 16.sp
+                ),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    capitalization = androidx.compose.foundation.text.KeyboardCapitalization.Sentences,
+                    imeAction = androidx.compose.ui.text.input.ImeAction.Send
+                ),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                    onSend = { onSend() }
+                ),
                 maxLines = 4,
                 decorationBox = { inner ->
                     if (draft.isEmpty()) {

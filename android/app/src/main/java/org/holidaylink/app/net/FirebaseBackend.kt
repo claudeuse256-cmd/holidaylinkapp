@@ -84,6 +84,44 @@ object FirebaseBackend {
 
     fun deviceLabel(): String = android.os.Build.MODEL ?: "Android device"
 
+    /** Heartbeat: marks this user online with a fresh timestamp. */
+    suspend fun touchPresence() {
+        val uid = uid ?: return
+        runCatching {
+            db.collection("users").document(uid).update(
+                mapOf("online" to true, "lastSeen" to com.google.firebase.Timestamp.now())
+            ).await()
+        }
+    }
+
+    /** Best-effort offline mark for logout. */
+    suspend fun goOffline() {
+        val uid = uid ?: return
+        runCatching {
+            db.collection("users").document(uid).update(
+                mapOf("online" to false, "lastSeen" to com.google.firebase.Timestamp.now())
+            ).await()
+        }
+    }
+
+    /** True only when the online flag is fresh (5 min). Stale flags lie. */
+    fun isTrulyOnline(online: Boolean, lastSeenMillis: Long?): Boolean {
+        if (!online) return false
+        if (lastSeenMillis == null) return false
+        return System.currentTimeMillis() - lastSeenMillis < 5 * 60 * 1000L
+    }
+
+    /** Reads lastSeen whether stored as Timestamp, millis Long, or ISO string. */
+    fun docLastSeenMillis(data: Map<String, Any?>): Long? {
+        (data["lastSeen"] as? com.google.firebase.Timestamp)?.let { return it.seconds * 1000L }
+        (data["lastSeen"] as? Number)?.let { return it.toLong() }
+        (data["lastSeen"] as? String)?.let {
+            return runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull()
+        }
+        (data["last_seen"] as? com.google.firebase.Timestamp)?.let { return it.seconds * 1000L }
+        return null
+    }
+
     sealed interface TwoFactorGate {
         data object Allowed : TwoFactorGate
         data class Waiting(val requestId: String) : TwoFactorGate

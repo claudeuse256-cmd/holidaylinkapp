@@ -104,12 +104,15 @@ fun UsersScreen(
             val all = dir.documents.filter { it.id != uid }.mapNotNull { d ->
                 val name = d.getString("name").orEmpty()
                 if (name.isBlank()) return@mapNotNull null
+                val online = d.getBoolean("online") == true
+                val seenMs = FirebaseBackend.docLastSeenMillis(d.data.orEmpty())
                 User(
                     id = d.id,
                     displayName = name,
                     username = d.getString("username").orEmpty(),
                     avatarUrl = d.getString("profilePic"),
-                    online = d.getBoolean("online") == true
+                    online = FirebaseBackend.isTrulyOnline(online, seenMs),
+                    lastSeen = seenMs?.let { java.time.Instant.ofEpochMilli(it).toString() }
                 )
             }
             val chatDocs = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().await()
@@ -190,7 +193,7 @@ private fun WhatsAppUserRow(
     onOpen: () -> Unit, onMessage: () -> Unit
 ) {
     Row(Modifier.fillMaxWidth().clickable { onOpen() }.padding(horizontal = 14.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
-        Avatar(name = user.displayName, photo = user.avatarUrl, size = 44.dp)
+        Avatar(name = user.displayName, photo = user.avatarUrl, size = 44.dp, online = user.online)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -205,6 +208,7 @@ private fun WhatsAppUserRow(
                 isFriend -> "Friend"
                 mutual > 0 -> "$mutual groups in common"
                 user.online -> "Online"
+                !user.lastSeen.isNullOrBlank() -> "Last seen ${friendlyWhen(user.lastSeen)}"
                 else -> "@${user.username}"
             }
             Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)

@@ -65,20 +65,19 @@ data class HolidayFeature(
 )
 
 private val features = listOf(
-    HolidayFeature("Home Feed", "Announcements and the latest HolidayLink updates", Icons.Default.Newspaper, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:status"),
-    HolidayFeature("Find Buddies", "Discover students and connect around interests", Icons.Default.Groups, listOf(Color(0xFF7C3AED), Color(0xFFEC4899)), "native:users"),
+    HolidayFeature("Home Feed", "Announcements and the latest HolidayLink updates", Icons.Default.Newspaper, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:feed"),
     HolidayFeature("Homework", "Organise holiday work and study tasks", Icons.Default.MenuBook, listOf(Color(0xFF2563EB), Color(0xFF06B6D4)), "native:ai"),
-    HolidayFeature("Quizzes", "Test yourself and track your progress", Icons.Default.Quiz, listOf(Color(0xFF8B5CF6), Color(0xFF2563EB)), "native:ai"),
-    HolidayFeature("Past Papers", "Find revision papers by subject and year", Icons.Default.Description, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:ai"),
-    HolidayFeature("Events", "Discover and join HolidayLink events", Icons.Default.CalendarMonth, listOf(Color(0xFF10B981), Color(0xFF06B6D4)), "native:status"),
+    HolidayFeature("Quizzes", "Test yourself and track your progress", Icons.Default.Quiz, listOf(Color(0xFF8B5CF6), Color(0xFF2563EB)), "native:quizzes"),
+    HolidayFeature("Past Papers", "Find revision papers by subject and year", Icons.Default.Description, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:papers"),
+    HolidayFeature("Events", "Discover and join HolidayLink events", Icons.Default.CalendarMonth, listOf(Color(0xFF10B981), Color(0xFF06B6D4)), "native:events"),
     HolidayFeature("AI Homework Help", "Ask HolidayLink AI for study help", Icons.Default.SmartToy, listOf(Color(0xFF06B6D4), Color(0xFF7C3AED)), "native:ai"),
-    HolidayFeature("Daily Feed", "Read short updates and entertainment posts", Icons.Default.Newspaper, listOf(Color(0xFFEC4899), Color(0xFF8B5CF6)), "native:status"),
+    HolidayFeature("Daily Feed", "Read short updates and entertainment posts", Icons.Default.Newspaper, listOf(Color(0xFFEC4899), Color(0xFF8B5CF6)), "native:feed"),
     HolidayFeature("Store", "HolidayLink plans, packs and available items", Icons.Default.ShoppingBag, listOf(Color(0xFF22C55E), Color(0xFF06B6D4)), "native:store"),
-    HolidayFeature("Rankings", "See quiz points and student rankings", Icons.Default.Leaderboard, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:users"),
+    HolidayFeature("Rankings", "See quiz points and student rankings", Icons.Default.Leaderboard, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:rankings"),
     HolidayFeature("Invite Friends", "Share HolidayLink with your friends", Icons.Default.PersonAdd, listOf(Color(0xFF2563EB), Color(0xFF7C3AED)), "native:invite"),
     HolidayFeature("Calls", "Open your audio and video call history", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:calls"),
     HolidayFeature("Messages", "Open the full HolidayLink messaging experience", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:chats"),
-    HolidayFeature("Wallet", "Open your HolidayLink wallet area", Icons.Default.AccountBalanceWallet, listOf(Color(0xFF10B981), Color(0xFF22C55E)), "native:store")
+    HolidayFeature("Wallet", "Balance, withdrawals and transactions", Icons.Default.AccountBalanceWallet, listOf(Color(0xFF10B981), Color(0xFF22C55E)), "native:wallet")
 )
 
 @Composable

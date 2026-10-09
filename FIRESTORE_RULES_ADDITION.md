@@ -46,3 +46,22 @@ Render OTP service needs only:
 - FIREBASE_SERVICE_ACCOUNT_JSON (service account, Project settings > Service accounts)
 - INFOBIP_BASE_URL + INFOBIP_API_KEY + INFOBIP_FROM
 - DEFAULT_COUNTRY_CODE=256, OTP_COOLDOWN_SECONDS=45
+
+## Firebase Storage rules (chat voice/video/files + any Storage use)
+
+```storage
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Signed-in users may read any chat media (same openness as the site).
+    match /chat_media/{chatId}/{file} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.resource.size < 20 * 1024 * 1024;
+    }
+    match /chat_voice/{chatId}/{file} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.resource.size < 20 * 1024 * 1024;
+    }
+  }
+}
+```

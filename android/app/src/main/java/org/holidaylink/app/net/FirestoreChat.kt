@@ -65,13 +65,21 @@ object FirestoreChat {
     }
 
     suspend fun resolvePeer(peerId: String): User {
-        val p = FirebaseBackend.loadProfile(peerId)
+        val doc = db.collection("users").document(peerId).get().await()
+        val data = doc.data.orEmpty()
+        val name = (doc.getString("name") ?: doc.getString("displayName")).orEmpty()
+            .takeIf { it.isNotBlank() } ?: "HolidayLink user"
+        val username = doc.getString("username").orEmpty()
+        val avatar = (doc.getString("profilePic") ?: doc.getString("avatarUrl"))?.takeIf { it.isNotBlank() }
+        val online = doc.getBoolean("online") == true
+        val seen = FirebaseBackend.docLastSeenMillis(data)?.let { java.time.Instant.ofEpochMilli(it).toString() }
         return User(
             id = peerId,
-            displayName = p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user",
-            username = p?.username.orEmpty(),
-            avatarUrl = p?.profilePic,
-            online = p?.let { false } == true
+            displayName = name,
+            username = username,
+            avatarUrl = avatar,
+            online = online,
+            lastSeen = seen
         )
     }
 

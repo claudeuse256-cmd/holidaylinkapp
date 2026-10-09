@@ -104,6 +104,12 @@ import org.holidaylink.app.phone.CountryCode
 import org.holidaylink.app.phone.PhoneNumbers
 import org.holidaylink.app.ui.AiChatScreen
 import org.holidaylink.app.ui.AiProfileScreen
+import org.holidaylink.app.ui.EventsScreen
+import org.holidaylink.app.ui.FeedScreen
+import org.holidaylink.app.ui.PapersScreen
+import org.holidaylink.app.ui.QuizzesScreen
+import org.holidaylink.app.ui.RankingsScreen
+import org.holidaylink.app.ui.WalletScreen
 import org.holidaylink.app.ui.AppLockGate
 import org.holidaylink.app.ui.CallsScreen
 import org.holidaylink.app.ui.ChatScreen
@@ -174,6 +180,12 @@ private sealed interface Destination {
     data object FeatureHub : Destination
     data class Status(val startWithComposer: Boolean = false) : Destination
     data object Store : Destination
+    data object Feed : Destination
+    data object Quizzes : Destination
+    data object Papers : Destination
+    data object Events : Destination
+    data object Wallet : Destination
+    data object Rankings : Destination
 }
 
 /**
@@ -183,20 +195,23 @@ private sealed interface Destination {
 private fun nativeDestinationFor(route: String): Destination = when {
     route == "native:calls" -> Destination.Calls
     route == "native:status" || route == "status.html" -> Destination.Status(false)
+    route == "native:feed" || route == "feed.html" -> Destination.Feed
+    route == "native:quizzes" || route == "quizzes.html" -> Destination.Quizzes
+    route == "native:papers" || route == "papers.html" -> Destination.Papers
+    route == "native:events" || route == "events.html" -> Destination.Events
+    route == "native:wallet" -> Destination.Wallet
+    route == "native:rankings" -> Destination.Rankings
     route == "native:ai" || route == "aihelp.html" -> Destination.Ai
     route == "native:users" -> Destination.Search
     route == "native:chats" -> Destination.Tabs
     route == "native:store" -> Destination.Store
     route == "native:invite" -> Destination.NewChat
-    route == "dashboard.html" || route.contains("dashboard") -> Destination.Status(false)
-    route == "feed.html" -> Destination.Status(false)
-    route == "events.html" -> Destination.Status(false)
-    route == "quizzes.html" || route == "papers.html" -> Destination.Ai
+    route == "dashboard.html" || route.contains("dashboard") -> Destination.Feed
     route == "store.html" -> Destination.Store
     route == "room.html" -> Destination.Tabs
     route == "invite.html" -> Destination.NewChat
     route.startsWith("http") -> Destination.WebFeature("HolidayLink", route)
-    route.endsWith(".html") -> Destination.Status(false)
+    route.endsWith(".html") -> Destination.Feed
     else -> Destination.FeatureHub
 }
 
@@ -217,6 +232,7 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
         AppLockGate {
             var signedIn by remember { mutableStateOf(FirebaseBackend.currentUser != null) }
             var bannedMsg by remember { mutableStateOf<String?>(null) }
+            val scope = rememberCoroutineScope()
             val banMsg = bannedMsg
             if (banMsg != null) {
                 BannedScreen(message = banMsg, onSwitchNumber = {
@@ -230,6 +246,7 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
                     api = api,
                     prefs = prefs,
                     onLoggedOut = {
+                        scope.launch { runCatching { FirebaseBackend.goOffline() } }
                         FirebaseBackend.signOut()
                         signedIn = false
                     },
@@ -277,6 +294,7 @@ private fun SignedInApp(
     LaunchedEffect(Unit) {
         runCatching {
             val uid = FirebaseBackend.uid ?: return@runCatching
+            FirebaseBackend.touchPresence()
             val profile = FirebaseBackend.loadProfile(uid) ?: return@runCatching
             me = Me(
                 id = uid,
@@ -290,8 +308,10 @@ private fun SignedInApp(
             )
         }
         // A website-admin ban lands mid-session too: re-check quietly every minute.
+        // Same tick keeps presence truthful (online + fresh lastSeen).
         while (true) {
             delay(60_000)
+            runCatching { FirebaseBackend.touchPresence() }
             val uid = FirebaseBackend.uid
             val banned = uid != null && runCatching {
                 FirebaseBackend.loadProfile(uid)?.banned == true
@@ -467,6 +487,18 @@ private fun SignedInApp(
 
         Destination.Store -> org.holidaylink.app.ui.StoreScreen(api = api, onBack = pop)
 
+        Destination.Feed -> FeedScreen(api = api, onBack = pop)
+
+        Destination.Quizzes -> QuizzesScreen(api = api, onBack = pop)
+
+        Destination.Papers -> PapersScreen(api = api, onBack = pop)
+
+        Destination.Events -> EventsScreen(api = api, onBack = pop)
+
+        Destination.Wallet -> WalletScreen(api = api, onBack = pop)
+
+        Destination.Rankings -> RankingsScreen(api = api, onBack = pop)
+
         is Destination.Status -> StatusScreen(api = api, me = me, startWithComposer = current.startWithComposer)
 
         is Destination.WebFeature -> WebFeatureScreen(
@@ -557,6 +589,8 @@ private fun SettingsFlow(
 ) {
     var route by remember { mutableStateOf<SettingsRoute?>(null) }
     val open = route
+    // System back inside a sub-screen returns to the hub instead of leaving Settings.
+    androidx.activity.compose.BackHandler(enabled = open != null) { route = null }
     if (open == null) {
         SettingsHub(
             api = api,

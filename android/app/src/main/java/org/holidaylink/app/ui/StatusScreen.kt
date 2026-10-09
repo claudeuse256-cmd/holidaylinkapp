@@ -28,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -86,12 +87,40 @@ fun StatusScreen(
     var composerOpen by remember(startWithComposer) { mutableStateOf(startWithComposer) }
     // Which person's reel entry the list is currently filtered to; null shows everyone.
     var selectedUserId by remember { mutableStateOf<String?>(null) }
+    var viewCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    var viewersFor by remember { mutableStateOf<StatusUpdate?>(null) }
+    var confirmDelete by remember { mutableStateOf<StatusUpdate?>(null) }
+    val scope = rememberCoroutineScope()
+
+    suspend fun refreshViews(ids: List<String>) {
+        val counts = mutableMapOf<String, Int>()
+        ids.forEach { id ->
+            counts[id] = runCatching {
+                FirebaseBackend.db.collection("statuses").document(id)
+                    .collection("status_views").get().await().size()
+            }.getOrDefault(0)
+        }
+        viewCounts = counts
+    }
+
+    suspend fun recordViews(list: List<StatusUpdate>) {
+        val uid = FirebaseBackend.uid.orEmpty()
+        list.filter { it.userId != uid }.forEach { s ->
+            runCatching {
+                FirebaseBackend.db.collection("statuses").document(s.id)
+                    .collection("status_views").document(uid)
+                    .set(mapOf("viewedAt" to com.google.firebase.Timestamp.now())).await()
+            }
+        }
+    }
 
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
         try {
             statuses = loadFirestoreStatuses()
             error = ""
+            refreshViews(statuses.map { it.id })
+            recordViews(statuses)
         } catch (e: Exception) {
             error = "We couldn't load status updates. Check your internet."
         } finally {
@@ -103,7 +132,10 @@ fun StatusScreen(
     LaunchedEffect(Unit) {
         while (true) {
             kotlinx.coroutines.delay(30_000)
-            runCatching { statuses = loadFirestoreStatuses() }
+            runCatching {
+                statuses = loadFirestoreStatuses()
+                refreshViews(statuses.map { it.id })
+            }
         }
     }
 
@@ -236,14 +268,30 @@ fun StatusScreen(
 
                             if (mine.isNotEmpty()) {
                                 item(key = "hdr-mine") { SectionHeader("My updates", mine.size) }
-                                items(mine, key = { it.id }) { StatusRow(it) }
+                                items(mine, key = { it.id }) {
+                                    StatusRow(
+                                        status = it,
+                                        mine = true,
+                                        viewCount = viewCounts[it.id] ?: 0,
+                                        onDelete = { confirmDelete = it },
+                                        onViewers = { viewersFor = it }
+                                    )
+                                }
                             }
 
                             if (others.isNotEmpty()) {
                                 item(key = "hdr-friends") {
                                     SectionHeader("Friends", others.size)
                                 }
-                                items(others, key = { it.id }) { StatusRow(it) }
+                                items(others, key = { it.id }) {
+                                    StatusRow(
+                                        status = it,
+                                        mine = false,
+                                        viewCount = 0,
+                                        onDelete = {},
+                                        onViewers = {}
+                                    )
+                                }
                             }
                         }
                     }
@@ -270,10 +318,38 @@ fun StatusScreen(
             }
         )
     }
+
+    val doomed = confirmDelete
+    if (doomed != null) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = null },
+            title = { Text("Delete this update?") },
+            text = { Text("It disappears for everyone immediately, before the 24 hours are up.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = null
+                    scope.launch {
+                        runCatching {
+                            FirebaseBackend.db.collection("statuses").document(doomed.id).delete().await()
+                        }.onSuccess { reload++ }
+                    }
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Keep") } }
+        )
+    }
+
+    viewersFor?.let { StatusViewersSheet(status = it, onDismiss = { viewersFor = null }) }
 }
 
 @Composable
-private fun StatusRow(status: StatusUpdate) {
+private fun StatusRow(
+    status: StatusUpdate,
+    mine: Boolean,
+    viewCount: Int,
+    onDelete: () -> Unit,
+    onViewers: () -> Unit
+) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -283,13 +359,26 @@ private fun StatusRow(status: StatusUpdate) {
         Avatar(name = status.userName, photo = status.avatarUrl, size = 46.dp)
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                status.userName,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    status.userName,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                if (mine) {
+                    IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            Icons.Default.Delete,
+                            "Delete this update",
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
             Text(
                 friendlyWhen(status.createdAt),
                 style = MaterialTheme.typography.labelSmall,
@@ -309,16 +398,48 @@ private fun StatusRow(status: StatusUpdate) {
                         .clip(MaterialTheme.shapes.medium)
                 )
             }
-            if (status.viewerCount > 0) {
+            if (mine) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Seen by ${status.viewerCount}",
+                    if (viewCount > 0) "Seen by $viewCount — tap to see who" else "Not seen yet",
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clickable(enabled = viewCount > 0) { onViewers() }
                 )
             }
         }
     }
+}
+
+@Composable
+private fun StatusViewersSheet(status: StatusUpdate, onDismiss: () -> Unit) {
+    var names by remember { mutableStateOf<List<String>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    LaunchedEffect(status.id) {
+        names = runCatching {
+            val views = FirebaseBackend.db.collection("statuses").document(status.id)
+                .collection("status_views").get().await()
+            views.documents.mapNotNull { v ->
+                val p = runCatching { FirebaseBackend.loadProfile(v.id) }.getOrNull()
+                p?.name?.takeIf { it.isNotBlank() }
+            }
+        }.getOrDefault(emptyList())
+        loading = false
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Seen by ${names.size}") },
+        text = {
+            when {
+                loading -> Text("Loading…")
+                names.isEmpty() -> Text("Nobody has opened this update yet.")
+                else -> Column {
+                    names.take(50).forEach { Text("• $it", style = MaterialTheme.typography.bodyMedium) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+    )
 }
 
 @Composable

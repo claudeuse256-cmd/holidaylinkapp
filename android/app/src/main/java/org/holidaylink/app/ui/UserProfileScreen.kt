@@ -111,7 +111,20 @@ fun UserProfileScreen(
             )
             error = ""
         } catch (e: Exception) {
-            error = "We couldn't load that profile. Check your internet."
+            // Never a dead screen: fall back to the already-known listing data.
+            if (profile == null && user.displayName.isNotBlank()) {
+                profile = Profile(
+                    id = user.id,
+                    displayName = user.displayName,
+                    username = user.username.takeIf { it.isNotBlank() },
+                    avatarUrl = user.avatarUrl,
+                    about = null,
+                    phone = null,
+                    online = null,
+                    lastSeen = null
+                )
+            }
+            if (profile == null) error = "We couldn't load that profile. Check your internet."
         } finally {
             loading = false
         }
@@ -177,10 +190,14 @@ fun UserProfileScreen(
                 }
 
                 Spacer(Modifier.height(10.dp))
+                val trulyOnline = shown.online == true && runCatching {
+                    val ms = shown.lastSeen?.let { java.time.Instant.parse(it).toEpochMilli() }
+                    ms == null || System.currentTimeMillis() - ms < 5 * 60 * 1000L
+                }.getOrDefault(false)
                 Text(
                     when {
                         shown.blockedByThem -> "You can't see their details while you're blocked"
-                        shown.online == true -> "Online now"
+                        trulyOnline -> "Online now"
                         else -> shown.lastSeen?.let { "Last seen ${friendlyWhen(it)}" } ?: "Last seen hidden"
                     },
                     style = MaterialTheme.typography.bodySmall,

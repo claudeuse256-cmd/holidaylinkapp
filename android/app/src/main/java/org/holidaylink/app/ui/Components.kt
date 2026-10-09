@@ -124,7 +124,11 @@ fun Avatar(
 ) {
     val context = LocalContext.current
     val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, photo) {
-        value = photo?.takeIf { it.isNotBlank() }?.let { decodeAvatar(context, it) }
+        // Network + decode must stay off the main thread or every remote
+        // photo silently fails and falls back to initials.
+        value = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            photo?.takeIf { it.isNotBlank() }?.let { avatarMemoryCache[it] ?: decodeAvatar(context, it)?.also { bmp -> avatarMemoryCache[it] = bmp } }
+        }
     }
 
     val initial = name.trim().firstOrNull()?.uppercase() ?: "?"
@@ -177,6 +181,9 @@ private fun avatarTint(seed: String): Color {
     val hash = abs(seed.trim().lowercase().hashCode())
     return palette[hash % palette.size]
 }
+
+/** Small in-memory photo cache so lists don't re-download avatars per row. */
+private val avatarMemoryCache = android.util.LruCache<String, android.graphics.Bitmap>(48)
 
 /** Decodes a downscaled bitmap from a content:// or file:// URI or an http(s) URL. */
 private fun decodeAvatar(context: Context, source: String): android.graphics.Bitmap? = runCatching {

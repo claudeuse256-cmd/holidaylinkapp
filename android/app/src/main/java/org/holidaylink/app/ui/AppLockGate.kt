@@ -5,6 +5,7 @@ import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
 import androidx.biometric.BiometricPrompt
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -138,10 +139,17 @@ fun AppLockGate(content: @Composable () -> Unit) {
         return
     }
 
-    Column(
+    // Biometrics prompt first (see LaunchedEffect above); the PIN form below is
+    // the fallback. Themed surface so light/dark both render correctly.
+    androidx.compose.foundation.layout.Box(
         Modifier
             .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
             .padding(32.dp),
+        contentAlignment = Alignment.Center
+    ) {
+    Column(
+        Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -192,5 +200,6 @@ fun AppLockGate(content: @Composable () -> Unit) {
                 style = MaterialTheme.typography.bodySmall
             )
         }
+    }
     }
 }
