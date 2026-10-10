@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Leaderboard
 import androidx.compose.material.icons.filled.Newspaper
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Quiz
 import androidx.compose.material.icons.filled.ShoppingBag
 import androidx.compose.material3.AlertDialog
@@ -69,9 +70,11 @@ import com.google.firebase.Timestamp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.FirebaseBackend
-
+import org.holidaylink.app.net.Imgbb
 // ==================================================================== feed
 
 /** Daily Feed / Home Feed: website posters collection with likes + comments. */
@@ -147,6 +150,8 @@ fun FeedScreen(api: Api, onBack: () -> Unit) {
                             title = (data["title"] as? String).orEmpty(),
                             body = (data["message"] as? String ?: data["content"] as? String).orEmpty(),
                             image = (data["image"] as? String ?: data["imageUrl"] as? String),
+                            videoUrl = (data["videoUrl"] as? String),
+                            moreDetails = (data["moreDetails"] as? String),
                             category = (data["category"] as? String ?: "announcement"),
                             likes = ((data["likes"] as? List<String>).orEmpty()),
                             comments = ((data["comments"] as? List<Map<String, String>>).orEmpty()),
@@ -181,6 +186,8 @@ private fun FeedCard(
     title: String,
     body: String,
     image: String?,
+    videoUrl: String?,
+    moreDetails: String?,
     category: String,
     likes: List<String>,
     comments: List<Map<String, String>>,
@@ -188,8 +195,10 @@ private fun FeedCard(
     onLike: () -> Unit,
     onComment: (String) -> Unit
 ) {
+    val context = LocalContext.current
     var open by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf("") }
+    var showMore by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
             .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(14.dp)
@@ -206,6 +215,27 @@ private fun FeedCard(
         if (!image.isNullOrBlank()) {
             Spacer(Modifier.height(8.dp))
             RemoteImage(url = image, modifier = Modifier.fillMaxWidth().height(190.dp).clip(RoundedCornerShape(12.dp)))
+        }
+        if (!videoUrl.isNullOrBlank()) {
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    runCatching {
+                        context.startActivity(
+                            android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(videoUrl))
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.PlayArrow, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Watch video")
+            }
+        }
+        if (!moreDetails.isNullOrBlank()) {
+            TextButton(onClick = { showMore = true }) { Text("See more") }
         }
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -224,6 +254,24 @@ private fun FeedCard(
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.clickable { open = !open }
             )
+            Spacer(Modifier.weight(1f))
+            IconButton(
+                onClick = {
+                    runCatching {
+                        context.startActivity(
+                            android.content.Intent.createChooser(
+                                android.content.Intent(android.content.Intent.ACTION_SEND)
+                                    .setType("text/plain")
+                                    .putExtra(android.content.Intent.EXTRA_TEXT, "$title\n$body"),
+                                "Share post"
+                            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                },
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(Icons.Default.Share, "Share", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
         if (open) {
             Spacer(Modifier.height(6.dp))
@@ -249,6 +297,14 @@ private fun FeedCard(
                 }) { Text("Send") }
             }
         }
+    }
+    if (showMore && !moreDetails.isNullOrBlank()) {
+        AlertDialog(
+            onDismissRequest = { showMore = false },
+            title = { Text(title.ifBlank { "Details" }) },
+            text = { Text(moreDetails) },
+            confirmButton = { TextButton(onClick = { showMore = false }) { Text("Close") } }
+        )
     }
 }
 
@@ -300,11 +356,17 @@ fun QuizzesScreen(api: Api, onBack: () -> Unit) {
                         @Suppress("UNCHECKED_CAST")
                         val q = quizzes[i]
                         val questions = (q["questions"] as? List<Map<String, Any?>>).orEmpty()
+                        @Suppress("UNCHECKED_CAST")
+                        val played = ((q["participants"] as? List<String>).orEmpty()).contains(uid)
+                        val paid = (q["isPaid"] as? Boolean) == true
                         QuizCard(
                             title = (q["title"] as? String).orEmpty(),
                             desc = (q["description"] as? String).orEmpty(),
                             prize = (q["prize"] as? Number)?.toLong() ?: 0L,
                             count = questions.size,
+                            played = played,
+                            paid = paid,
+                            fee = (q["entryFee"] as? Number)?.toLong() ?: 0L,
                             onStart = { playing = i }
                         )
                     }
@@ -316,58 +378,146 @@ fun QuizzesScreen(api: Api, onBack: () -> Unit) {
     playing?.let { i ->
         @Suppress("UNCHECKED_CAST")
         val q = quizzes[i]
+        @Suppress("UNCHECKED_CAST")
+        val already = ((q["participants"] as? List<String>).orEmpty()).contains(uid)
+        val prize = (q["prize"] as? Number)?.toLong() ?: 0L
+        val paid = (q["isPaid"] as? Boolean) == true
+        val fee = (q["entryFee"] as? Number)?.toLong() ?: 0L
+        var entryOk by remember(i) { mutableStateOf(!paid) }
+        var entryBusy by remember(i) { mutableStateOf(false) }
+        var txId by remember(i) { mutableStateOf("") }
+        var shotUri by remember(i) { mutableStateOf<android.net.Uri?>(null) }
+        val context = LocalContext.current
+        LaunchedEffect(i, paid) {
+            if (!paid) return@LaunchedEffect
+            entryOk = runCatching {
+                FirebaseBackend.db.collection("quizPayments")
+                    .whereEqualTo("userId", uid).whereEqualTo("quizId", ids[i])
+                    .whereEqualTo("status", "approved").limit(1).get().await().isEmpty.not()
+            }.getOrDefault(false)
+        }
+        if (paid && !entryOk) {
+            val picker = androidx.activity.compose.rememberLauncherForActivityResult(
+                androidx.activity.result.contract.ActivityResultContracts.GetContent()
+            ) { uri -> shotUri = uri }
+            AlertDialog(
+                onDismissRequest = { playing = null },
+                title = { Text("Entry fee UGX $fee") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("This quiz needs an approved payment. Attach the receipt screenshot and your transaction ID.")
+                        OutlinedTextField(value = txId, onValueChange = { txId = it.take(60) }, label = { Text("Transaction ID") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        OutlinedButton(onClick = { picker.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
+                            Text(if (shotUri == null) "Attach receipt screenshot" else "Screenshot attached ✓")
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = txId.isNotBlank() && shotUri != null && !entryBusy,
+                        onClick = {
+                            entryBusy = true
+                            scope.launch {
+                                runCatching {
+                                    val bytes = MediaPicker.imageJpegBytes(context, shotUri!!)
+                                        ?: throw ApiException("That screenshot couldn't be read.")
+                                    val url = Imgbb.uploadJpeg(bytes)
+                                    FirebaseBackend.db.collection("quizPayments").add(
+                                        mapOf(
+                                            "userId" to uid, "quizId" to ids[i],
+                                            "entryFee" to fee, "screenshotUrl" to url,
+                                            "transactionId" to txId.trim(), "mode" to "manual",
+                                            "status" to "pending", "timestamp" to Timestamp.now()
+                                        )
+                                    ).await()
+                                }.onSuccess {
+                                    snackbar.showSnackbar("Payment sent. Play opens once approved.")
+                                    playing = null
+                                }.onFailure {
+                                    snackbar.showSnackbar((it as? ApiException)?.message ?: "Couldn't send payment.")
+                                }
+                                entryBusy = false
+                            }
+                        }
+                    ) { Text("Submit") }
+                },
+                dismissButton = { TextButton(onClick = { playing = null }) { Text("Cancel") } }
+            )
+            return@let
+        }
         QuizPlayDialog(
             title = (q["title"] as? String).orEmpty(),
-            timeLimit = ((q["timeLimit"] as? Number)?.toLong() ?: 60L).coerceIn(10, 600),
+            timeLimit = ((q["timeLimit"] as? Number)?.toLong() ?: 10L).coerceIn(10, 600),
             questions = ((q["questions"] as? List<Map<String, Any?>>).orEmpty()),
             onDismiss = { playing = null },
             onFinish = { correct, total ->
                 playing = null
                 scope.launch {
-                    runCatching { awardQuiz(ids[i], correct, total) }
-                        .onSuccess { snackbar.showSnackbar("You scored $correct/$total.") }
-                        .onFailure { snackbar.showSnackbar("Score saved locally only.") }
+                    runCatching { awardQuiz(ids[i], correct, total, prize, already) }
+                        .onSuccess { rewarded ->
+                            snackbar.showSnackbar(
+                                if (rewarded) "You scored $correct/$total — rewarded!"
+                                else "You scored $correct/$total."
+                            )
+                        }
+                        .onFailure { snackbar.showSnackbar("Couldn't save that score.") }
                 }
             }
         )
     }
 }
 
-private suspend fun awardQuiz(quizId: String, correct: Int, total: Int) {
+/**
+ * Website endQuiz parity: first play only. Score >= 50% with a prize pays
+ * balance += prize, points += 10, quizzesWon += 1 + Quiz Reward transaction
+ * + notification. Replay earns nothing.
+ */
+private suspend fun awardQuiz(quizId: String, correct: Int, total: Int, prize: Long, alreadyPlayed: Boolean): Boolean {
     val uid = FirebaseBackend.uid.orEmpty()
     val db = FirebaseBackend.db
-    val allCorrect = total > 0 && correct == total
+    if (alreadyPlayed) return false
+    val passed = total > 0 && correct * 2 >= total
     db.collection("quizzes").document(quizId)
         .update("participants", com.google.firebase.firestore.FieldValue.arrayUnion(uid)).await()
-    db.collection("quizPayments").add(
-        mapOf("userId" to uid, "quizId" to quizId, "score" to "$correct/$total", "timestamp" to Timestamp.now())
-    ).await()
-    val points = (correct * 10).toLong()
+    if (!passed) return false
     val userRef = db.collection("users").document(uid)
     val snap = userRef.get().await()
     userRef.update(
         mapOf(
-            "points" to ((snap.getLong("points") ?: 0) + points),
-            "quizzesWon" to ((snap.getLong("quizzesWon") ?: 0) + if (allCorrect) 1 else 0)
+            "points" to ((snap.getLong("points") ?: 0) + 10),
+            "quizzesWon" to ((snap.getLong("quizzesWon") ?: 0) + 1),
+            "balance" to ((snap.getLong("balance") ?: 0) + prize)
         )
     ).await()
-    if (allCorrect) {
-        val prize = 0L
+    if (prize > 0) {
         db.collection("transactions").add(
-            mapOf("userId" to uid, "type" to "Quiz Reward", "amount" to prize, "timestamp" to Timestamp.now())
-        ).await()
-        db.collection("notifications").add(
             mapOf(
-                "userId" to uid, "title" to "Quiz Reward",
-                "message" to "Perfect score! +$points points.", "read" to false,
-                "timestamp" to Timestamp.now()
+                "userId" to uid, "type" to "Quiz Reward", "amount" to prize,
+                "quizId" to quizId, "timestamp" to Timestamp.now()
             )
         ).await()
     }
+    db.collection("notifications").add(
+        mapOf(
+            "userId" to uid, "title" to "Quiz Reward",
+            "message" to "You scored $correct/$total: +10 points" + if (prize > 0) " and UGX $prize." else ".",
+            "read" to false, "timestamp" to Timestamp.now()
+        )
+    ).await()
+    return true
 }
 
 @Composable
-private fun QuizCard(title: String, desc: String, prize: Long, count: Int, onStart: () -> Unit) {
+private fun QuizCard(
+    title: String,
+    desc: String,
+    prize: Long,
+    count: Int,
+    played: Boolean,
+    paid: Boolean,
+    fee: Long,
+    onStart: () -> Unit
+) {
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
             .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(14.dp),
@@ -377,10 +527,21 @@ private fun QuizCard(title: String, desc: String, prize: Long, count: Int, onSta
             Text(title.ifBlank { "Quiz" }, fontWeight = FontWeight.Bold)
             if (desc.isNotBlank()) Text(desc.take(120), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(4.dp))
-            Text("$count questions" + if (prize > 0) " • Prize UGX $prize" else "", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+            Text(
+                buildString {
+                    append("$count questions")
+                    if (prize > 0) append(" • Prize UGX $prize")
+                    if (paid && fee > 0) append(" • Entry UGX $fee")
+                    if (played) append(" • Played")
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
         }
         Spacer(Modifier.width(10.dp))
-        Button(onClick = onStart, enabled = count > 0) { Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(4.dp)); Text("Start") }
+        Button(onClick = onStart, enabled = count > 0) {
+            Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(4.dp)); Text(if (played) "Replay" else "Start")
+        }
     }
 }
 
@@ -462,9 +623,11 @@ private fun QuizPlayDialog(
 fun PapersScreen(api: Api, onBack: () -> Unit) {
     val context = LocalContext.current
     var papers by remember { mutableStateOf<List<Map<String, Any?>>>(emptyList()) }
+    var ids by remember { mutableStateOf<List<String>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf("") }
     var tab by remember { mutableStateOf("papers") }
+    var cat by remember { mutableStateOf("all") }
 
     LaunchedEffect(tab) {
         loading = papers.isEmpty()
@@ -472,6 +635,7 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
             val snap = FirebaseBackend.db.collection(if (tab == "papers") "papers" else "guides")
                 .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
                 .limit(100).get().await()
+            ids = snap.documents.map { it.id }
             @Suppress("UNCHECKED_CAST")
             papers = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
             error = ""
@@ -479,6 +643,29 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
             error = "Couldn't load. Check your internet."
         } finally {
             loading = false
+        }
+    }
+
+    fun openUrl(url: String) {
+        if (url.isBlank()) return
+        runCatching {
+            context.startActivity(
+                android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+    }
+
+    fun shareDoc(id: String, title: String) {
+        runCatching {
+            val link = "https://holidaylink.org/${if (tab == "papers") "papers" else "papers"}.html?${if (tab == "papers") "paper" else "guide"}=$id"
+            context.startActivity(
+                android.content.Intent.createChooser(
+                    android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain")
+                        .putExtra(android.content.Intent.EXTRA_TEXT, "$title\n$link"),
+                    "Share"
+                ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
         }
     }
 
@@ -494,32 +681,36 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
                 FilterChip(selected = tab == "papers", onClick = { tab = "papers"; papers = emptyList() }, label = { Text("Papers") })
                 FilterChip(selected = tab == "guides", onClick = { tab = "guides"; papers = emptyList() }, label = { Text("Guides") })
             }
+            if (tab == "papers") {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("all" to "All", "uce" to "UCE", "uace" to "UACE", "mock" to "Mock").forEach { (v, l) ->
+                        FilterChip(selected = cat == v, onClick = { cat = v }, label = { Text(l) })
+                    }
+                }
+            }
             when {
                 loading -> LoadingState(label = "Loading…")
                 error.isNotBlank() && papers.isEmpty() -> ErrorState(error)
                 papers.isEmpty() -> EmptyState(icon = Icons.Default.Description, title = "Nothing here yet", subtitle = "New uploads appear here.")
                 else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(papers.indices.toList()) { i ->
+                    val shown = papers.indices.filter { i ->
+                        tab != "papers" || cat == "all" ||
+                            ((papers[i]["category"] as? String)?.lowercase() == cat)
+                    }
+                    if (shown.isEmpty()) item { Text("Nothing in this category yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    items(shown, key = { ids[it] }) { i ->
                         val p = papers[i]
                         val title = (p["title"] as? String).orEmpty().ifBlank { "Untitled" }
                         val meta = listOfNotNull(
                             p["subject"] as? String, p["class"] as? String,
-                            (p["year"] as? Number)?.toString(), p["board"] as? String
+                            (p["year"] as? Number)?.toString(), p["board"] as? String,
+                            (p["category"] as? String)?.uppercase()
                         ).joinToString(" • ")
+                        val url = (p["fileUrl"] as? String ?: p["url"] as? String ?: p["driveUrl"] as? String).orEmpty()
+                        val fileType = (p["fileType"] as? String).orEmpty()
                         Row(
                             Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
                                 .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                                .clickable {
-                                    val url = (p["url"] as? String ?: p["driveUrl"] as? String).orEmpty()
-                                    if (url.isNotBlank()) {
-                                        runCatching {
-                                            context.startActivity(
-                                                android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
-                                                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                            )
-                                        }
-                                    }
-                                }
                                 .padding(14.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -528,6 +719,12 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
                             Column(Modifier.weight(1f)) {
                                 Text(title, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 if (meta.isNotBlank()) Text(meta, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                if (fileType.isNotBlank()) Text(fileType.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.height(6.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(onClick = { openUrl(url) }, enabled = url.isNotBlank()) { Text("View") }
+                                    OutlinedButton(onClick = { shareDoc(ids[i], title) }) { Text("Share") }
+                                }
                             }
                         }
                     }
@@ -553,9 +750,61 @@ fun EventsScreen(api: Api, onBack: () -> Unit) {
     var desc by remember { mutableStateOf("") }
     var date by remember { mutableStateOf("") }
     var location by remember { mutableStateOf("") }
+    var bookingFor by remember { mutableStateOf<Int?>(null) }
+    var bookQty by remember { mutableStateOf("1") }
+    var bookPhone by remember { mutableStateOf("") }
+    var bookShot by remember { mutableStateOf<android.net.Uri?>(null) }
+    var booking by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val uid = FirebaseBackend.uid.orEmpty()
+
+    val bookPicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.GetContent()
+    ) { uri -> bookShot = uri }
+
+    suspend fun submitBooking(i: Int) {
+        booking = true
+        try {
+            val e = events[i]
+            val price = ((e["price"] as? Number)?.toLong() ?: 0L)
+            val qty = bookQty.toIntOrNull()?.coerceIn(1, 20) ?: 1
+            val bytes = bookShot?.let { MediaPicker.imageJpegBytes(context, it) }
+                ?: throw ApiException("Attach the payment screenshot.")
+            val url = Imgbb.uploadJpeg(bytes)
+            val me = FirebaseBackend.loadProfile(uid)
+            val reference = java.util.UUID.randomUUID().toString()
+            val ticketId = "TKT-" + reference.take(8).uppercase()
+            FirebaseBackend.db.collection("bookings").document(reference).set(
+                mapOf(
+                    "type" to "event",
+                    "eventId" to ids[i],
+                    "eventTitle" to ((e["title"] as? String).orEmpty()),
+                    "userId" to uid,
+                    "userName" to (me?.name ?: ""),
+                    "phone" to bookPhone.ifBlank { me?.phone ?: "" },
+                    "quantity" to qty,
+                    "totalAmount" to (price * qty),
+                    "screenshotUrl" to url,
+                    "ticketId" to ticketId,
+                    "paymentMode" to "manual",
+                    "status" to "pending",
+                    "timestamp" to Timestamp.now()
+                )
+            ).await()
+            FirebaseBackend.db.collection("events").document(ids[i])
+                .update("participants", com.google.firebase.firestore.FieldValue.arrayUnion(uid)).await()
+            bookingFor = null
+            bookQty = "1"; bookShot = null
+            reload++
+            snackbar.showSnackbar("Booked! Ticket $ticketId is pending approval.")
+        } catch (ex: Exception) {
+            snackbar.showSnackbar((ex as? ApiException)?.message ?: "Couldn't book that event.")
+        } finally {
+            booking = false
+        }
+    }
 
     suspend fun load() {
         loading = events.isEmpty()
@@ -634,17 +883,30 @@ fun EventsScreen(api: Api, onBack: () -> Unit) {
                         @Suppress("UNCHECKED_CAST")
                         val parts = (e["participants"] as? List<String>).orEmpty()
                         val joined = parts.contains(uid)
+                        val paid = (e["type"] as? String) == "paid"
+                        val price = ((e["price"] as? Number)?.toLong() ?: 0L
+                        val img = (e["image"] as? String)
                         Column(
                             Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
                                 .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(14.dp)
                         ) {
+                            if (!img.isNullOrBlank()) {
+                                RemoteImage(url = img, modifier = Modifier.fillMaxWidth().height(150.dp).clip(RoundedCornerShape(12.dp)))
+                                Spacer(Modifier.height(8.dp))
+                            }
                             Text((e["title"] as? String).orEmpty().ifBlank { "Event" }, fontWeight = FontWeight.Bold)
                             Spacer(Modifier.height(4.dp))
                             Text((e["description"] as? String).orEmpty().take(200), style = MaterialTheme.typography.bodyMedium)
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                listOfNotNull(e["date"] as? String, e["location"] as? String).joinToString(" • ") +
-                                    " • ${parts.size} going",
+                                listOfNotNull(
+                                    e["date"] as? String,
+                                    e["time"] as? String,
+                                    e["location"] as? String,
+                                    e["category"] as? String
+                                ).joinToString(" • ") +
+                                    " • ${parts.size} going" +
+                                    if (paid && price > 0) " • UGX $price" else " • Free",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -652,18 +914,115 @@ fun EventsScreen(api: Api, onBack: () -> Unit) {
                             Button(
                                 enabled = !joined,
                                 onClick = {
-                                    scope.launch {
-                                        runCatching {
-                                            FirebaseBackend.db.collection("events").document(ids[i])
-                                                .update("participants", com.google.firebase.firestore.FieldValue.arrayUnion(uid)).await()
-                                            reload++
-                                        }.onFailure { snackbar.showSnackbar("Couldn't join.") }
+                                    if (paid && price > 0) bookingFor = i
+                                    else {
+                                        scope.launch {
+                                            runCatching {
+                                                FirebaseBackend.db.collection("events").document(ids[i])
+                                                    .update("participants", com.google.firebase.firestore.FieldValue.arrayUnion(uid)).await()
+                                                // Notify the creator, like the dashboard does.
+                                                val creator = e["creatorId"] as? String
+                                                if (!creator.isNullOrBlank() && creator != uid) {
+                                                    val me = FirebaseBackend.loadProfile(uid)
+                                                    FirebaseBackend.db.collection("notifications").add(
+                                                        mapOf(
+                                                            "userId" to creator, "title" to "New event join",
+                                                            "message" to "${me?.name ?: "Someone"} joined ${e["title"]}.",
+                                                            "read" to false, "timestamp" to Timestamp.now()
+                                                        )
+                                                    ).await()
+                                                }
+                                                reload++
+                                            }.onFailure { snackbar.showSnackbar("Couldn't join.") }
+                                        }
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth()
-                            ) { Text(if (joined) "Joined" else "Join") }
+                            ) { Text(if (joined) "Joined" else if (paid && price > 0) "Book • UGX $price" else "Join free") }
                         }
                     }
+                    item(key = "tickets-hdr") {
+                        Text("My tickets", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+                    }
+                    item(key = "tickets") { MyTickets(uid = uid) }
+                }
+            }
+        }
+    }
+
+    bookingFor?.let { i ->
+        val e = events.getOrNull(i) ?: run { bookingFor = null; return@let }
+        val price = ((e["price"] as? Number)?.toLong() ?: 0L)
+        AlertDialog(
+            onDismissRequest = { if (!booking) bookingFor = null },
+            title = { Text("Book ${(e["title"] as? String).orEmpty().ifBlank { "event" }}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("UGX $price per ticket", color = MaterialTheme.colorScheme.primary)
+                    OutlinedTextField(value = bookQty, onValueChange = { bookQty = it.filter { c -> c.isDigit() }.take(2) }, label = { Text("Quantity") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = bookPhone, onValueChange = { bookPhone = it.filter { c -> c.isDigit() }.take(12) }, label = { Text("Payment phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedButton(onClick = { bookPicker.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (bookShot == null) "Attach payment screenshot" else "Screenshot attached ✓")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = !booking && bookShot != null, onClick = { scope.launch { submitBooking(i) } }) {
+                    Text(if (booking) "Booking…" else "Book")
+                }
+            },
+            dismissButton = { TextButton(enabled = !booking, onClick = { bookingFor = null }) { Text("Cancel") } }
+        )
+    }
+}
+
+@Composable
+private fun MyTickets(uid: String) {
+    var tickets by remember { mutableStateOf<List<Map<String, Any?>>>(emptyList()) }
+    var ids by remember { mutableStateOf<List<String>>(emptyList()) }
+    val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(uid) {
+        runCatching {
+            val snap = FirebaseBackend.db.collection("bookings")
+                .whereEqualTo("userId", uid).whereEqualTo("type", "event")
+                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
+                .limit(50).get().await()
+            ids = snap.documents.map { it.id }
+            @Suppress("UNCHECKED_CAST")
+            tickets = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
+        }
+    }
+    if (tickets.isEmpty()) {
+        Text("No tickets yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        tickets.forEachIndexed { index, t ->
+            val status = (t["status"] as? String) ?: "pending"
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text((t["ticketId"] as? String ?: "Ticket"), fontWeight = FontWeight.Bold)
+                    Text(
+                        "${(t["eventTitle"] as? String).orEmpty()} • ${status.replaceFirstChar { c -> c.uppercase() }}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (status == "pending") {
+                    TextButton(onClick = {
+                        scope.launch {
+                            runCatching {
+                                FirebaseBackend.db.collection("bookings").document(ids[index]).delete().await()
+                                tickets = tickets.filterIndexed { j, _ -> j != index }
+                                ids = ids.filterIndexed { j, _ -> j != index }
+                            }.onFailure { snackbar.showSnackbar("Couldn't delete that ticket.") }
+                        }
+                    }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
                 }
             }
         }
@@ -723,9 +1082,9 @@ fun WalletScreen(api: Api, onBack: () -> Unit) {
             Spacer(Modifier.height(16.dp))
             Text("Withdraw", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(value = amount, onValueChange = { amount = it.filter { c -> c.isDigit() }.take(9) }, label = { Text("Amount (UGX)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = amount, onValueChange = { amount = it.filter { c -> c.isDigit() }.take(9) }, label = { Text("Amount (UGX, min 5,000)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(value = phone, onValueChange = { phone = it.filter { c -> c.isDigit() }.take(12) }, label = { Text("Mobile money number") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = phone, onValueChange = { phone = it.filter { c -> c.isDigit() }.take(10) }, label = { Text("Mobile money number (07…)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("MTN", "Airtel").forEach { p ->
@@ -734,24 +1093,35 @@ fun WalletScreen(api: Api, onBack: () -> Unit) {
             }
             Spacer(Modifier.height(8.dp))
             Button(
-                enabled = (amount.toLongOrNull() ?: 0) > 0 && phone.length >= 9,
+                enabled = (amount.toLongOrNull() ?: 0) >= 5000 && phone.length == 10 && phone.startsWith("07"),
                 onClick = {
                     scope.launch {
                         runCatching {
+                            val amt = amount.toLongOrNull() ?: 0
+                            if (amt > balance) throw ApiException("Insufficient balance.")
                             val me = FirebaseBackend.loadProfile(uid)
                             FirebaseBackend.db.collection("withdrawals").add(
                                 mapOf(
                                     "userId" to uid, "userName" to (me?.name ?: ""),
-                                    "amount" to (amount.toLongOrNull() ?: 0),
+                                    "amount" to amt,
                                     "phone" to phone, "provider" to provider,
                                     "status" to "pending", "timestamp" to Timestamp.now()
+                                )
+                            ).await()
+                            FirebaseBackend.db.collection("transactions").add(
+                                mapOf(
+                                    "userId" to uid, "type" to "Withdrawal Request",
+                                    "amount" to -amt, "description" to "$provider $phone",
+                                    "timestamp" to Timestamp.now()
                                 )
                             ).await()
                         }.onSuccess {
                             amount = ""; phone = ""
                             snackbar.showSnackbar("Withdrawal requested. Admin approves it.")
                             load()
-                        }.onFailure { snackbar.showSnackbar("Couldn't send that request.") }
+                        }.onFailure {
+                            snackbar.showSnackbar((it as? ApiException)?.message ?: "Couldn't send that request.")
+                        }
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
@@ -773,6 +1143,129 @@ fun WalletScreen(api: Api, onBack: () -> Unit) {
                             )
                         }
                         Text("UGX ${t["amount"] ?: 0}", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================================================================== invite
+
+/** Invite friends: referral link, share, invite list with UGX 1,000 per activation. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun InviteScreen(api: Api, onBack: () -> Unit) {
+    val context = LocalContext.current
+    var invites by remember { mutableStateOf<List<Map<String, Any?>>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf("") }
+    val uid = FirebaseBackend.uid.orEmpty()
+    val link = "https://holidaylink.org/signup.html?ref=$uid"
+
+    LaunchedEffect(uid) {
+        try {
+            val snap = FirebaseBackend.db.collection("invites")
+                .whereEqualTo("inviterId", uid).limit(200).get().await()
+            @Suppress("UNCHECKED_CAST")
+            invites = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
+                .sortedByDescending { (it["timestamp"] as? Timestamp)?.seconds ?: 0 }
+            error = ""
+        } catch (e: Exception) {
+            error = "Couldn't load invites. Check your internet."
+        } finally {
+            loading = false
+        }
+    }
+
+    fun share(text: String, pkg: String? = null) {
+        runCatching {
+            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain")
+                .putExtra(android.content.Intent.EXTRA_TEXT, text)
+            if (pkg != null) intent.setPackage(pkg)
+            context.startActivity(
+                android.content.Intent.createChooser(intent, "Invite friends")
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+    }
+
+    val activated = invites.count { (it["status"] as? String) == "activated" }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(title = { Text("Invite Friends") }, navigationIcon = {
+                IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+            })
+        }
+    ) { padding ->
+        Column(Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
+            Text("Share HolidayLink", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Friends join with your link. You earn UGX 1,000 for each friend that activates.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(14.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(link, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), maxLines = 2)
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = { share("Join me on HolidayLink: $link") }) { Text("Share") }
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { share("Join me on HolidayLink: $link", "com.whatsapp") },
+                    modifier = Modifier.weight(1f)
+                ) { Text("WhatsApp") }
+                OutlinedButton(
+                    onClick = { share("Join me on HolidayLink: $link", "com.facebook.katana") },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Facebook") }
+            }
+            Spacer(Modifier.height(20.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("${invites.size}", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                    Text("Invited", style = MaterialTheme.typography.labelSmall)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("$activated", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                    Text("Activated", style = MaterialTheme.typography.labelSmall)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("UGX ${activated * 1000}", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    Text("Earned", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            when {
+                loading -> LoadingState(label = "Loading invites…")
+                error.isNotBlank() && invites.isEmpty() -> ErrorState(error)
+                invites.isEmpty() -> Text("No invites yet. Share your link above.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                else -> invites.forEach { inv ->
+                    val active = (inv["status"] as? String) == "activated"
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                ((inv["invitedName"] as? String)?.takeIf { it.isNotBlank() }
+                                    ?: (inv["invitedEmail"] as? String).orEmpty()).ifBlank { "Invitee" },
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                (inv["status"] as? String ?: "pending").replaceFirstChar { c -> c.uppercase() },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        if (active) Text("+UGX 1,000", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                     }
                 }
             }

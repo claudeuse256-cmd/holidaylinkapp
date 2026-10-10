@@ -136,33 +136,199 @@ private fun FeatureCard(feature: HolidayFeature, onClick: () -> Unit) {
 
 @Composable
 fun StoreScreen(api: Api?, onBack: () -> Unit) {
-    var items by remember { mutableStateOf(emptyList<org.holidaylink.app.net.StoreItem>()) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
+    var products by remember { mutableStateOf<List<Map<String, Any?>>>(emptyList()) }
+    var ids by remember { mutableStateOf<List<String>>(emptyList()) }
+    var orders by remember { mutableStateOf<List<Map<String, Any?>>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf("") }
-    LaunchedEffect(api) {
-        try { items = api?.storeItems() ?: emptyList(); error = "" }
-        catch (e: Exception) { error = "Couldn't load store. Check server + Postgres." }
-        loading = false
+    var buying by remember { mutableStateOf<Int?>(null) }
+    var qty by remember { mutableStateOf("1") }
+    var buyerName by remember { mutableStateOf("") }
+    var buyerPhone by remember { mutableStateOf("") }
+    var fulfilment by remember { mutableStateOf("pickup") }
+    var shotUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    var placing by remember { mutableStateOf(false) }
+    val uid = FirebaseBackend.uid.orEmpty()
+
+    DisposableEffect(Unit) {
+        val regProducts = FirebaseBackend.db.collection("products")
+            .orderBy("createdAt", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .limit(100).addSnapshotListener { snap, e ->
+                if (e != null) {
+                    error = "Couldn't load store. Check your internet."
+                } else {
+                    @Suppress("UNCHECKED_CAST")
+                    products = snap?.documents?.map { it.data.orEmpty() as Map<String, Any?> }.orEmpty()
+                    ids = snap?.documents?.map { it.id }.orEmpty()
+                    error = ""
+                }
+                loading = false
+            }
+        val regOrders = FirebaseBackend.db.collection("storeOrders")
+            .whereEqualTo("userId", uid)
+            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .limit(50).addSnapshotListener { snap, _ ->
+                @Suppress("UNCHECKED_CAST")
+                orders = snap?.documents?.map { it.data.orEmpty() as Map<String, Any?> }.orEmpty()
+            }
+        onDispose { regProducts.remove(); regOrders.remove() }
     }
+
+    val shotPicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.GetContent()
+    ) { uri -> shotUri = uri }
+
+    suspend fun placeOrder(i: Int) {
+        placing = true
+        try {
+            val p = products[i]
+            val unit = ((p["price"] as? Number)?.toLong()
+                ?: (p["priceMinor"] as? Number)?.toLong()?.div(100) ?: 0L)
+            val count = qty.toIntOrNull()?.coerceIn(1, 99) ?: 1
+            var screenshotURL: String? = null
+            shotUri?.let { uri ->
+                val bytes = MediaPicker.imageJpegBytes(context, uri)
+                    ?: throw ApiException("That screenshot couldn't be read.")
+                screenshotURL = Imgbb.uploadJpeg(bytes)
+            }
+            val me = FirebaseBackend.loadProfile(uid)
+            val reference = "HL-${System.currentTimeMillis()}"
+            FirebaseBackend.db.collection("storeOrders").document(reference).set(
+                mapOf(
+                    "userId" to uid,
+                    "userName" to buyerName.ifBlank { me?.name ?: "" },
+                    "phone" to buyerPhone.ifBlank { me?.phone ?: "" },
+                    "items" to listOf(
+                        mapOf(
+                            "productId" to ids[i],
+                            "name" to ((p["title"] as? String ?: p["name"] as? String).orEmpty()),
+                            "price" to unit,
+                            "qty" to count
+                        )
+                    ),
+                    "totalAmount" to (unit * count),
+                    "fulfilment" to fulfilment,
+                    "payment" to mapOf(
+                        "amount" to (unit * count),
+                        "currency" to ((p["currency"] as? String) ?: "UGX"),
+                        "screenshotURL" to screenshotURL,
+                        "status" to if (screenshotURL != null) "submitted" else "pending",
+                        "timestamp" to Timestamp.now()
+                    ),
+                    "status" to "pending",
+                    "timestamp" to Timestamp.now()
+                )
+            ).await()
+            buying = null
+            qty = "1"; shotUri = null
+            snackbar.showSnackbar("Order $reference placed.")
+        } catch (e: Exception) {
+            snackbar.showSnackbar((e as? ApiException)?.message ?: "Couldn't place that order.")
+        } finally {
+            placing = false
+        }
+    }
+
     Column(Modifier.fillMaxSize()) {
-        GlassTopBar(title = "Store", subtitle = "Plans • Packs • Same Postgres", onBack = onBack)
+        GlassTopBar(title = "Store", subtitle = "Plans • Packs • Updates live", onBack = onBack)
         when {
             loading -> LoadingState(label = "Loading store…")
-            error.isNotBlank() && items.isEmpty() -> ErrorState(error)
-            items.isEmpty() -> EmptyState(icon = Icons.Default.ShoppingBag, title = "Store is empty", subtitle = "Admin adds plans later. You said to ignore admin for now.")
+            error.isNotBlank() && products.isEmpty() -> ErrorState(error)
+            products.isEmpty() -> EmptyState(icon = Icons.Default.ShoppingBag, title = "Store is empty", subtitle = "New items from admin appear here automatically.")
             else -> LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(items, key = { it.id }) { item ->
-                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(14.dp)) {
-                        Column(Modifier.weight(1f)) {
-                            Text(item.title, fontWeight = FontWeight.Bold)
-                            Text(item.description.take(140), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Spacer(Modifier.height(6.dp))
-                            Text("${item.priceMinor} ${item.currency}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                items(products.indices.toList(), key = { ids[it] }) { i ->
+                    val p = products[i]
+                    val title = ((p["title"] as? String ?: p["name"] as? String).orEmpty()).ifBlank { "Item" }
+                    val price = ((p["price"] as? Number)?.toLong()
+                        ?: (p["priceMinor"] as? Number)?.toLong()?.div(100) ?: 0L)
+                    val img = (p["image"] as? String ?: p["imageUrl"] as? String)
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
+                            .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(14.dp)
+                    ) {
+                        if (!img.isNullOrBlank()) {
+                            RemoteImage(
+                                url = img,
+                                modifier = Modifier.fillMaxWidth().height(150.dp).clip(RoundedCornerShape(12.dp))
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        Text(title, fontWeight = FontWeight.Bold)
+                        Text(
+                            ((p["description"] as? String).orEmpty()).take(140),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "UGX $price",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(onClick = { buying = i }) { Text("Buy") }
+                        }
+                    }
+                }
+                if (orders.isNotEmpty()) {
+                    item(key = "orders-hdr") {
+                        Text(
+                            "My orders (${orders.size})",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                    }
+                    items(orders.indices.toList(), key = { "order-$it" }) { i ->
+                        val o = orders[i]
+                        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                            Column(Modifier.weight(1f)) {
+                                Text("UGX ${o["totalAmount"] ?: 0} • ${(o["status"] as? String) ?: "pending"}")
+                                Text(
+                                    (o["timestamp"] as? Timestamp)?.toDate()?.toString().orEmpty().take(16),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    buying?.let { i ->
+        AlertDialog(
+            onDismissRequest = { if (!placing) buying = null },
+            title = { Text("Buy ${((products[i]["title"] as? String ?: products[i]["name"] as? String).orEmpty()).ifBlank { "item" }}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(value = qty, onValueChange = { qty = it.filter { c -> c.isDigit() }.take(2) }, label = { Text("Quantity") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = buyerName, onValueChange = { buyerName = it.take(80) }, label = { Text("Your name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = buyerPhone, onValueChange = { buyerPhone = it.filter { c -> c.isDigit() }.take(12) }, label = { Text("Payment phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("pickup", "delivery").forEach { f ->
+                            FilterChip(selected = fulfilment == f, onClick = { fulfilment = f }, label = { Text(f.replaceFirstChar { c -> c.uppercase() }) })
+                        }
+                    }
+                    OutlinedButton(onClick = { shotPicker.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Default.CloudUpload, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (shotUri == null) "Payment screenshot (optional)" else "Screenshot attached ✓")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = !placing, onClick = { scope.launch { placeOrder(i) } }) {
+                    Text(if (placing) "Placing…" else "Place order")
+                }
+            },
+            dismissButton = { TextButton(enabled = !placing, onClick = { buying = null }) { Text("Cancel") } }
+        )
     }
 }
 

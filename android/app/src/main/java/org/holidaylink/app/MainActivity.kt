@@ -106,6 +106,7 @@ import org.holidaylink.app.ui.AiChatScreen
 import org.holidaylink.app.ui.AiProfileScreen
 import org.holidaylink.app.ui.EventsScreen
 import org.holidaylink.app.ui.FeedScreen
+import org.holidaylink.app.ui.InviteScreen
 import org.holidaylink.app.ui.PapersScreen
 import org.holidaylink.app.ui.QuizzesScreen
 import org.holidaylink.app.ui.RankingsScreen
@@ -186,6 +187,7 @@ private sealed interface Destination {
     data object Events : Destination
     data object Wallet : Destination
     data object Rankings : Destination
+    data object Invite : Destination
 }
 
 /**
@@ -205,11 +207,11 @@ private fun nativeDestinationFor(route: String): Destination = when {
     route == "native:users" -> Destination.Search
     route == "native:chats" -> Destination.Tabs
     route == "native:store" -> Destination.Store
-    route == "native:invite" -> Destination.NewChat
+    route == "native:invite" -> Destination.Invite
     route == "dashboard.html" || route.contains("dashboard") -> Destination.Feed
     route == "store.html" -> Destination.Store
     route == "room.html" -> Destination.Tabs
-    route == "invite.html" -> Destination.NewChat
+    route == "invite.html" -> Destination.Invite
     route.startsWith("http") -> Destination.WebFeature("HolidayLink", route)
     route.endsWith(".html") -> Destination.Feed
     else -> Destination.FeatureHub
@@ -498,6 +500,8 @@ private fun SignedInApp(
         Destination.Wallet -> WalletScreen(api = api, onBack = pop)
 
         Destination.Rankings -> RankingsScreen(api = api, onBack = pop)
+
+        Destination.Invite -> InviteScreen(api = api, onBack = pop)
 
         is Destination.Status -> StatusScreen(api = api, me = me, startWithComposer = current.startWithComposer)
 
