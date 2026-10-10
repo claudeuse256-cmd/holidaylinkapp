@@ -12,7 +12,6 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.tryAwaitRelease
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -34,6 +33,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardCapitalization
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -314,7 +317,15 @@ fun ChatScreen(
     }
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
-            beginRecording(locked = true)
+            val instance = VoiceRecorder(context)
+            if (instance.start()) {
+                recorder = instance
+                recordingMs = 0L
+                recLocked = true
+                recPaused = false
+            } else {
+                scope.launch { snackbar.showSnackbar("The microphone is unavailable right now.") }
+            }
         }
     }
 
@@ -1100,7 +1111,6 @@ private fun AttachSheet(
 
 // ------------------------------------------------------------------ composer
 
-@Composable
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ChatComposer(
@@ -1260,11 +1270,11 @@ private fun ChatComposer(
                     fontSize = 16.sp
                 ),
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
-                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                    capitalization = androidx.compose.foundation.text.KeyboardCapitalization.Sentences,
-                    imeAction = androidx.compose.ui.text.input.ImeAction.Send
+                keyboardOptions = KeyboardOptions(
+                    capitalization = KeyboardCapitalization.Sentences,
+                    imeAction = ImeAction.Send
                 ),
-                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                keyboardActions = KeyboardActions(
                     onSend = { onSend() }
                 ),
                 maxLines = 4,

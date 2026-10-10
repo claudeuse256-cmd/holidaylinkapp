@@ -127,7 +127,9 @@ fun Avatar(
         // Network + decode must stay off the main thread or every remote
         // photo silently fails and falls back to initials.
         value = withContext(kotlinx.coroutines.Dispatchers.IO) {
-            photo?.takeIf { it.isNotBlank() }?.let { avatarMemoryCache[it] ?: decodeAvatar(context, it)?.also { bmp -> avatarMemoryCache[it] = bmp } }
+            photo?.takeIf { it.isNotBlank() }?.let {
+                avatarMemoryCache.get(it) ?: decodeAvatar(context, it)?.also { bmp -> avatarMemoryCache.put(it, bmp) }
+            }
         }
     }
 
