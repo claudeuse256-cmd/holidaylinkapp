@@ -321,6 +321,7 @@ fun QuizzesScreen(api: Api, onBack: () -> Unit) {
     var playing by remember { mutableStateOf<Int?>(null) }
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    val uid = FirebaseBackend.uid.orEmpty()
 
     LaunchedEffect(Unit) {
         try {
@@ -884,7 +885,7 @@ fun EventsScreen(api: Api, onBack: () -> Unit) {
                         val parts = (e["participants"] as? List<String>).orEmpty()
                         val joined = parts.contains(uid)
                         val paid = (e["type"] as? String) == "paid"
-                        val price = ((e["price"] as? Number)?.toLong() ?: 0L
+                        val price = ((e["price"] as? Number)?.toLong() ?: 0L)
                         val img = (e["image"] as? String)
                         Column(
                             Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
