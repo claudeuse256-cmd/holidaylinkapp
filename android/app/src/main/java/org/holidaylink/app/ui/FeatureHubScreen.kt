@@ -74,7 +74,7 @@ import androidx.compose.ui.unit.dp
 /**
  * HolidayLink's non-messaging feature center. Admin tools intentionally do not appear here.
  * Public website functionality is opened inside the app through WebFeatureScreen while the
- * native Render/Neon migration is completed feature-by-feature.
+ * native Firebase migration is completed feature-by-feature.
  */
 data class HolidayFeature(
     val title: String,

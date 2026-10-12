@@ -22,7 +22,7 @@ data class PickedFile(
  *
  * Images are re-encoded as JPEG and capped at [imageMaxDimension] so uploads stay fast on
  * mobile data. The server writes the decoded bytes to disk under /uploads and stores only the
- * URL in PostgreSQL, so image blobs never end up in the database.
+ * URL in Firestore, so image blobs never end up in the database.
  */
 object MediaPicker {
 

@@ -191,7 +191,7 @@ private sealed interface Destination {
 }
 
 /**
- * All feature-center entries open native screens backed by the same Render+Neon
+ * All feature-center entries open native screens backed by the same Firebase
  * database — never a website. Only unknown external URLs fall back to WebView.
  */
 private fun nativeDestinationFor(route: String): Destination = when {

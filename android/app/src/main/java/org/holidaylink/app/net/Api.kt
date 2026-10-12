@@ -526,7 +526,7 @@ class Api(context: Context) {
     /**
      * Updates the signed-in user's profile.
      * [avatarDataUrl] is an already-downscaled JPEG data URL; the server stores it as a file
-     * and returns the public URL, so no image bytes are written into PostgreSQL.
+     * and returns the public URL, so no image bytes are written into Firestore.
      * Passing [removeAvatar] clears the picture.
      */
     suspend fun updateProfile(
