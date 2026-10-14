@@ -222,7 +222,7 @@ fun UpdateScreen(onBack: () -> Unit) {
 
 /** Small elevated card used only by this screen. */
 @Composable
-private fun Cardish(content: androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
+private fun Cardish(content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
     androidx.compose.material3.Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
