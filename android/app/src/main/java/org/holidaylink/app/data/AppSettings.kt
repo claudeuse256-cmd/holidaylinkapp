@@ -55,6 +55,11 @@ data class SettingsSnapshot(
     val notifyVibration: Boolean = true,
     val notifyPreview: Boolean = true,
     val mutedChats: Map<String, Boolean> = emptyMap(),
+    val pinnedChats: Map<String, Boolean> = emptyMap(),
+    val archivedChats: Map<String, Boolean> = emptyMap(),
+    val starredMessages: Map<String, Boolean> = emptyMap(),
+    val hiddenMessages: Map<String, Boolean> = emptyMap(),
+    val blockedUsers: Map<String, Boolean> = emptyMap(),
     val aiEnabled: Boolean = true,
     val saveAiChats: Boolean = true,
     val aiResponseStyle: String = "balanced"
@@ -123,6 +128,11 @@ object AppSettings {
         const val N_VIBRATE = "set.notify.vibration"
         const val N_PREVIEW = "set.notify.preview"
         const val MUTED = "set.mutedChats"
+        const val PINNED = "set.pinnedChats"
+        const val ARCHIVED = "set.archivedChats"
+        const val STARRED = "set.starredMessages"
+        const val HIDDEN = "set.hiddenMessages"
+        const val BLOCKED = "set.blockedUsers"
         const val AI_ENABLED = "set.ai.enabled"
         const val AI_SAVE = "set.ai.save"
         const val AI_STYLE = "set.ai.style"
@@ -158,6 +168,11 @@ object AppSettings {
             notifyVibration = p.getBoolean(K.N_VIBRATE, true),
             notifyPreview = p.getBoolean(K.N_PREVIEW, true),
             mutedChats = decodeMuted(p.getString(K.MUTED, "").orEmpty()),
+            pinnedChats = decodeMuted(p.getString(K.PINNED, "").orEmpty()),
+            archivedChats = decodeMuted(p.getString(K.ARCHIVED, "").orEmpty()),
+            starredMessages = decodeMuted(p.getString(K.STARRED, "").orEmpty()),
+            hiddenMessages = decodeMuted(p.getString(K.HIDDEN, "").orEmpty()),
+            blockedUsers = decodeMuted(p.getString(K.BLOCKED, "").orEmpty()),
             aiEnabled = p.getBoolean(K.AI_ENABLED, true),
             saveAiChats = p.getBoolean(K.AI_SAVE, true),
             aiResponseStyle = p.getString(K.AI_STYLE, "balanced") ?: "balanced"
@@ -290,6 +305,59 @@ object AppSettings {
         val next = LinkedHashMap(state.mutedChats)
         if (muted) next[conversationId] = true else next.remove(conversationId)
         prefs.edit().putString(K.MUTED, encodeMuted(next)).apply()
+        commit()
+    }
+
+    fun isChatPinned(conversationId: String): Boolean =
+        state.pinnedChats[conversationId] == true
+
+    fun setChatPinned(conversationId: String, pinned: Boolean) {
+        val next = LinkedHashMap(state.pinnedChats)
+        if (pinned) next[conversationId] = true else next.remove(conversationId)
+        prefs.edit().putString(K.PINNED, encodeMuted(next)).apply()
+        commit()
+    }
+
+    fun isChatArchived(conversationId: String): Boolean =
+        state.archivedChats[conversationId] == true
+
+    fun setChatArchived(conversationId: String, archived: Boolean) {
+        val next = LinkedHashMap(state.archivedChats)
+        if (archived) next[conversationId] = true else next.remove(conversationId)
+        prefs.edit().putString(K.ARCHIVED, encodeMuted(next)).apply()
+        commit()
+    }
+
+    fun isMessageStarred(chatId: String, messageId: String): Boolean =
+        state.starredMessages["$chatId/$messageId"] == true
+
+    fun setMessageStarred(chatId: String, messageId: String, starred: Boolean) {
+        val key = "$chatId/$messageId"
+        val next = LinkedHashMap(state.starredMessages)
+        if (starred) next[key] = true else next.remove(key)
+        prefs.edit().putString(K.STARRED, encodeMuted(next)).apply()
+        commit()
+    }
+
+    /** Local "delete for me": the message stays on the server for everyone else. */
+    fun isMessageHidden(chatId: String, messageId: String): Boolean =
+        state.hiddenMessages["$chatId/$messageId"] == true
+
+    fun setMessageHidden(chatId: String, messageId: String, hidden: Boolean) {
+        val key = "$chatId/$messageId"
+        val next = LinkedHashMap(state.hiddenMessages)
+        if (hidden) next[key] = true else next.remove(key)
+        prefs.edit().putString(K.HIDDEN, encodeMuted(next)).apply()
+        commit()
+    }
+
+    /** Local contact block: the composer locks on this device. */
+    fun isUserBlocked(userId: String): Boolean = state.blockedUsers[userId] == true
+
+    fun setUserBlocked(userId: String, blocked: Boolean) {
+        val next = LinkedHashMap(state.blockedUsers)
+        if (blocked) next[userId] = true else next.remove(userId)
+        prefs.edit().putString(K.BLOCKED, encodeMuted(next)).apply()
         commit()
     }
 

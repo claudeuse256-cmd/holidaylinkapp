@@ -7,12 +7,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -42,6 +44,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,16 +54,22 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Imgbb
 import org.holidaylink.app.net.ApiException
@@ -79,8 +88,8 @@ fun StatusScreen(
     me: Me?,
     startWithComposer: Boolean = false
 ) {
-    var statuses by remember { mutableStateOf<List<StatusUpdate>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    var statuses by remember { mutableStateOf(DeviceCache.memory<List<StatusUpdate>>("statuses") ?: emptyList()) }
+    var loading by remember { mutableStateOf(statuses.isEmpty()) }
     var refreshing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
@@ -90,6 +99,11 @@ fun StatusScreen(
     var viewCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     var viewersFor by remember { mutableStateOf<StatusUpdate?>(null) }
     var confirmDelete by remember { mutableStateOf<StatusUpdate?>(null) }
+    // Full-screen WhatsApp-style viewer.
+    var viewerList by remember { mutableStateOf<List<StatusUpdate>>(emptyList()) }
+    var viewerStart by remember { mutableIntStateOf(0) }
+    var viewerMine by remember { mutableStateOf(false) }
+    var viewerOpen by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     suspend fun refreshViews(ids: List<String>) {
@@ -116,25 +130,28 @@ fun StatusScreen(
 
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
-        try {
-            statuses = loadFirestoreStatuses()
+        val fresh = DeviceCache.load("statuses", { source -> loadFirestoreStatuses(source) }) { data ->
+            statuses = data
             error = ""
-            refreshViews(statuses.map { it.id })
-            recordViews(statuses)
-        } catch (e: Exception) {
-            error = "We couldn't load status updates. Check your internet."
-        } finally {
             loading = false
-            refreshing = false
         }
+        if (fresh == null && statuses.isEmpty()) {
+            error = "We couldn't load status updates. Check your internet."
+        }
+        runCatching { refreshViews(statuses.map { it.id }) }
+        runCatching { recordViews(statuses) }
+        loading = false
+        refreshing = false
     }
 
     LaunchedEffect(Unit) {
         while (true) {
             kotlinx.coroutines.delay(30_000)
             runCatching {
-                statuses = loadFirestoreStatuses()
-                refreshViews(statuses.map { it.id })
+                val fresh = loadFirestoreStatuses()
+                statuses = fresh
+                DeviceCache.put("statuses", fresh)
+                refreshViews(fresh.map { it.id })
             }
         }
     }
@@ -142,6 +159,15 @@ fun StatusScreen(
     val selected = selectedUserId
     val mine = statuses.filter { it.userId == me?.id && (selected == null || selected == it.userId) }
     val others = statuses.filter { it.userId != me?.id && (selected == null || selected == it.userId) }
+
+    // Opens the full-screen reel for one person, starting on the tapped update.
+    val openViewer: (StatusUpdate) -> Unit = { tapped ->
+        val person = statuses.filter { it.userId == tapped.userId }.sortedBy { it.createdAt }
+        viewerList = person
+        viewerStart = person.indexOfFirst { it.id == tapped.id }.coerceAtLeast(0)
+        viewerMine = tapped.userId == me?.id
+        viewerOpen = true
+    }
 
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -177,8 +203,8 @@ fun StatusScreen(
                     currentUserId = me?.id,
                     selectedId = selected,
                     onPick = { picked ->
-                        // Tapping the active entry again clears the filter.
-                        selectedUserId = if (selected == picked.userId) null else picked.userId
+                        // WhatsApp behaviour: tapping a person opens their reel full-screen.
+                        openViewer(picked)
                     }
                 )
 
@@ -273,6 +299,7 @@ fun StatusScreen(
                                         status = it,
                                         mine = true,
                                         viewCount = viewCounts[it.id] ?: 0,
+                                        onOpen = { openViewer(it) },
                                         onDelete = { confirmDelete = it },
                                         onViewers = { viewersFor = it }
                                     )
@@ -288,6 +315,7 @@ fun StatusScreen(
                                         status = it,
                                         mine = false,
                                         viewCount = 0,
+                                        onOpen = { openViewer(it) },
                                         onDelete = {},
                                         onViewers = {}
                                     )
@@ -340,6 +368,18 @@ fun StatusScreen(
     }
 
     viewersFor?.let { StatusViewersSheet(status = it, onDismiss = { viewersFor = null }) }
+
+    if (viewerOpen && viewerList.isNotEmpty()) {
+        StatusViewer(
+            updates = viewerList,
+            startIndex = viewerStart,
+            mine = viewerMine,
+            viewCounts = viewCounts,
+            onDelete = { confirmDelete = it },
+            onViewers = { viewersFor = it },
+            onDismiss = { viewerOpen = false }
+        )
+    }
 }
 
 @Composable
@@ -347,12 +387,14 @@ private fun StatusRow(
     status: StatusUpdate,
     mine: Boolean,
     viewCount: Int,
+    onOpen: () -> Unit,
     onDelete: () -> Unit,
     onViewers: () -> Unit
 ) {
     Row(
         Modifier
             .fillMaxWidth()
+            .clickable { onOpen() }
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Top
     ) {
@@ -545,12 +587,14 @@ private fun StatusComposer(
 }
 
 /** Firestore statuses: same docs as the website (24h expiry, imgbb photos). */
-private suspend fun loadFirestoreStatuses(): List<StatusUpdate> {
+private suspend fun loadFirestoreStatuses(
+    source: com.google.firebase.firestore.Source = com.google.firebase.firestore.Source.DEFAULT
+): List<StatusUpdate> {
     val now = com.google.firebase.Timestamp.now()
     val snap = FirebaseBackend.db.collection("statuses")
         .whereGreaterThan("expiresAt", now)
         .orderBy("expiresAt")
-        .limit(200).get().await()
+        .limit(200).get(source).await()
     val docs = snap.documents.sortedByDescending { it.getTimestamp("createdAt")?.seconds ?: 0 }
     val authors = mutableMapOf<String, Pair<String, String?>>()
     return docs.mapNotNull { d ->
@@ -662,4 +706,196 @@ private fun StatusReel(
             }
         }
     }
+}
+
+// ------------------------------------------------------------------ full-screen reel
+
+/**
+ * WhatsApp-style status viewer: full-screen portrait, segmented progress bars, auto-advance
+ * (tap right / tap left to step, hold to pause), header with avatar + time, delete for your
+ * own updates and a "Seen by" footer.
+ */
+@Composable
+private fun StatusViewer(
+    updates: List<StatusUpdate>,
+    startIndex: Int,
+    mine: Boolean,
+    viewCounts: Map<String, Int>,
+    onDelete: (StatusUpdate) -> Unit,
+    onViewers: (StatusUpdate) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var index by remember(updates) { mutableIntStateOf(startIndex.coerceIn(0, updates.lastIndex)) }
+    var progress by remember { mutableFloatStateOf(0f) }
+    var paused by remember { mutableStateOf(false) }
+    val current = updates[index.coerceIn(0, updates.lastIndex)]
+
+    fun stepForward() {
+        if (index < updates.lastIndex) {
+            index++
+            progress = 0f
+        } else {
+            onDismiss()
+        }
+    }
+
+    LaunchedEffect(index, paused) {
+        if (paused) return@LaunchedEffect
+        while (progress < 1f) {
+            kotlinx.coroutines.delay(80)
+            progress = (progress + 0.016f).coerceAtMost(1f)
+        }
+        stepForward()
+    }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            if (!current.mediaUrl.isNullOrBlank()) {
+                RemoteImage(url = current.mediaUrl, modifier = Modifier.fillMaxSize())
+            } else {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(statusGradientColor(index), statusGradientColor(index + 2))
+                            )
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        current.body.orEmpty(),
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(36.dp)
+                    )
+                }
+            }
+
+            // Tap right two-thirds = next, left third = back; press and hold = pause.
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(index) {
+                        detectTapGestures(
+                            onPress = {
+                                paused = true
+                                tryAwaitRelease()
+                                paused = false
+                            },
+                            onTap = { offset ->
+                                if (offset.x < size.width * 0.3f) {
+                                    if (index > 0) index--
+                                    progress = 0f
+                                } else {
+                                    stepForward()
+                                }
+                            }
+                        )
+                    }
+            )
+
+            Column(Modifier.fillMaxSize()) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    updates.forEachIndexed { i, _ ->
+                        val frac = when {
+                            i < index -> 1f
+                            i == index -> progress
+                            else -> 0f
+                        }
+                        Box(
+                            Modifier
+                                .weight(1f)
+                                .height(3.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(Color.White.copy(alpha = 0.35f))
+                        ) {
+                            if (frac > 0f) {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth(frac)
+                                        .fillMaxHeight()
+                                        .background(Color.White)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Avatar(name = current.userName, photo = current.avatarUrl, size = 36.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            current.userName,
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            friendlyWhen(current.createdAt),
+                            color = Color.White.copy(alpha = 0.8f),
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                    if (mine) {
+                        IconButton(onClick = { onDelete(current) }) {
+                            Icon(Icons.Default.Delete, "Delete", tint = Color.White)
+                        }
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, "Close", tint = Color.White)
+                    }
+                }
+
+                Spacer(Modifier.weight(1f))
+
+                if (!current.mediaUrl.isNullOrBlank() && !current.body.isNullOrBlank()) {
+                    Text(
+                        current.body,
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
+                    )
+                }
+
+                if (mine) {
+                    val count = viewCounts[current.id] ?: 0
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = count > 0) { onViewers(current) }
+                            .padding(horizontal = 20.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            if (count > 0) "Seen by $count · tap to see who" else "Not seen yet",
+                            color = Color.White.copy(alpha = 0.85f),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                } else {
+                    Spacer(Modifier.height(22.dp))
+                }
+            }
+        }
+    }
+}
+
+private fun statusGradientColor(i: Int): Color {
+    val palette = listOf(
+        Color(0xFF075E54), Color(0xFF128C7E), Color(0xFF1E88E5),
+        Color(0xFF6A1B9A), Color(0xFF00897B), Color(0xFF3949AB)
+    )
+    return palette[i.mod(palette.size)]
 }

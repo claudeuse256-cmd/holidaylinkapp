@@ -85,6 +85,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalContext
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.data.AppSettings
@@ -98,7 +99,9 @@ import org.holidaylink.app.net.CallManager
 import org.holidaylink.app.ui.CallScreen
 import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.Me
+import org.holidaylink.app.net.Notifier
 import org.holidaylink.app.net.User
+import org.holidaylink.app.push.PushTokens
 import org.holidaylink.app.phone.Countries
 import org.holidaylink.app.phone.CountryCode
 import org.holidaylink.app.phone.PhoneNumbers
@@ -126,6 +129,7 @@ import org.holidaylink.app.ui.SettingsHub
 import org.holidaylink.app.ui.SettingsHost
 import org.holidaylink.app.ui.SettingsRoute
 import org.holidaylink.app.ui.StatusScreen
+import org.holidaylink.app.ui.StarredMessagesScreen
 import org.holidaylink.app.ui.UserProfileScreen
 import org.holidaylink.app.ui.rememberNotificationPermissionState
 import org.holidaylink.app.ui.theme.HolidayLinkTheme
@@ -146,7 +150,32 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppSettings.init(this)
+        NotificationRouter.consume(intent)
         setContent { HolidayLinkApp(this) }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        NotificationRouter.consume(intent)
+    }
+}
+
+/**
+ * Carries a tapped-notification target into the Compose tree. The system tray intent carries
+ * only a conversation id, so [HolidayLinkApp] turns it back into a real chat screen.
+ */
+private object NotificationRouter {
+    var pendingChatId by mutableStateOf<String?>(null)
+        private set
+
+    fun consume(intent: android.content.Intent?) {
+        val id = intent?.getStringExtra(org.holidaylink.app.net.Notifier.EXTRA_TARGET)
+        if (!id.isNullOrBlank()) pendingChatId = id
+    }
+
+    fun clear() {
+        pendingChatId = null
     }
 }
 
@@ -188,6 +217,7 @@ private sealed interface Destination {
     data object Wallet : Destination
     data object Rankings : Destination
     data object Invite : Destination
+    data object Starred : Destination
 }
 
 /**
@@ -208,6 +238,7 @@ private fun nativeDestinationFor(route: String): Destination = when {
     route == "native:chats" -> Destination.Tabs
     route == "native:store" -> Destination.Store
     route == "native:invite" -> Destination.Invite
+    route == "native:starred" -> Destination.Starred
     route == "dashboard.html" || route.contains("dashboard") -> Destination.Feed
     route == "store.html" -> Destination.Store
     route == "room.html" -> Destination.Tabs
@@ -231,6 +262,12 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
         themeMode = AppSettings.state.themeMode,
         fontScale = AppSettings.state.fontScale
     ) {
+        // Every screen paints on the theme background, so the Menu hub and any page that does
+        // not draw its own Scaffold still follows light/dark mode instead of the raw window.
+        androidx.compose.material3.Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = androidx.compose.material3.MaterialTheme.colorScheme.background
+        ) {
         AppLockGate {
             var signedIn by remember { mutableStateOf(FirebaseBackend.currentUser != null) }
             var bannedMsg by remember { mutableStateOf<String?>(null) }
@@ -257,6 +294,7 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
             } else {
                 AuthFlow(api, prefs) { signedIn = true }
             }
+        }
         }
     }
 }
@@ -329,6 +367,83 @@ private fun SignedInApp(
 
     val userId = me?.id ?: FirebaseBackend.uid.orEmpty()
 
+    // Real system notifications: create the channels and register this device's FCM token…
+    LaunchedEffect(userId) {
+        if (userId.isBlank()) return@LaunchedEffect
+        Notifier.ensureChannels(context)
+        PushTokens.register()
+    }
+    // …then watch this user's notification documents so a new alert actually lands in the
+    // phone's notification shade while the app is alive (FCM covers the app-killed case).
+    DisposableEffect(userId) {
+        if (userId.isBlank()) return@DisposableEffect onDispose {}
+        val seen = mutableSetOf<String>()
+        var primed = false
+        val reg = FirebaseBackend.db.collection("notifications")
+            .whereEqualTo("userId", userId)
+            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .limit(20)
+            .addSnapshotListener { snap, _ ->
+                if (snap == null) return@addSnapshotListener
+                if (!primed) {
+                    // First snapshot is the existing backlog: learn it, don't buzz for it.
+                    snap.documents.forEach { seen.add(it.id) }
+                    primed = true
+                    return@addSnapshotListener
+                }
+                snap.documentChanges.forEach { change ->
+                    if (change.type.name != "ADDED") return@forEach
+                    val d = change.document
+                    if (!seen.add(d.id)) return@forEach
+                    if (d.getBoolean("read") == true) return@forEach
+                    val type = d.getString("type") ?: "message"
+                    // Plain messages are already covered by the unread-counter listener below;
+                    // skipping them here stops the same message buzzing twice.
+                    if (type == "message") return@forEach
+                    val title = d.getString("title") ?: "HolidayLink"
+                    val body = d.getString("body") ?: ""
+                    val target = d.getString("chatId") ?: d.getString("conversationId")
+                        ?: d.getString("callId")
+                    if (type == "call") {
+                        Notifier.call(context, d.id.hashCode(), title, body, target)
+                    } else {
+                        Notifier.message(context, d.id.hashCode(), title, body, target)
+                    }
+                }
+            }
+        onDispose { reg.remove() }
+    }
+
+    // Live message notifications: a chat doc's `unread_<uid>` counter only rises when a
+    // message actually arrives for us, so we watch it and raise a system notification.
+    LaunchedEffect(userId) {
+        if (userId.isBlank()) return@LaunchedEffect
+        val lastUnread = HashMap<String, Int>()
+        var primed = false
+        FirestoreChat.chatsFlow(userId).collect { rows ->
+            if (!primed) {
+                rows.forEach { lastUnread[it.id] = it.unread }
+                primed = true
+                return@collect
+            }
+            rows.forEach { row ->
+                val prev = lastUnread[row.id] ?: 0
+                if (row.unread > prev) {
+                    val openHere = (stack.lastOrNull() as? Destination.Chat)?.chat?.id == row.id
+                    if (!openHere) {
+                        val who = row.title.takeIf { it.isNotBlank() }
+                            ?: runCatching {
+                                FirestoreChat.resolvePeer(row.peerId.orEmpty()).displayName
+                            }.getOrNull()
+                            ?: "New message"
+                        Notifier.message(context, row.id.hashCode(), who, row.lastBody ?: "New message", row.id)
+                    }
+                }
+                lastUnread[row.id] = row.unread
+            }
+        }
+    }
+
     val openDirectChat: (User) -> Unit = { user ->
         scope.launch {
             runCatching { FirestoreChat.startDirect(user.id) }
@@ -365,6 +480,15 @@ private fun SignedInApp(
                 ChatItem(conversationId, "direct", null, null, null, null)
             }
             stack.add(Destination.Chat(chat))
+        }
+    }
+
+    // Tapping a system notification opens the conversation it refers to.
+    val notifiedChatId = NotificationRouter.pendingChatId
+    LaunchedEffect(notifiedChatId) {
+        if (notifiedChatId != null) {
+            openConversationById(notifiedChatId)
+            NotificationRouter.clear()
         }
     }
 
@@ -478,6 +602,11 @@ private fun SignedInApp(
         Destination.Calls -> CallsScreen(
             api = api,
             onOpenChat = openDirectChat
+        )
+
+        Destination.Starred -> StarredMessagesScreen(
+            onBack = pop,
+            onOpenChat = { chatId -> openConversationById(chatId) }
         )
 
         Destination.FeatureHub -> FeatureHubScreen(
@@ -600,7 +729,8 @@ private fun SettingsFlow(
             api = api,
             me = me,
             onOpen = { route = it },
-            onLoggedOut = onLoggedOut
+            onLoggedOut = onLoggedOut,
+            onBack = onBack
         )
     } else {
         SettingsHost(
@@ -671,14 +801,14 @@ private fun TabShell(
                 }
                 Box(
                     Modifier
-                        .size(72.dp)
+                        .size(56.dp)
                         .clip(CircleShape)
                         .background(Brush.radialGradient(listOf(glassCyan.copy(alpha=.95f), glassBlue, glassPurple)))
                         .border(1.5.dp, glassCyan.copy(alpha=.8f), CircleShape)
                         .clickable { fabOpen = !fabOpen },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(if (fabOpen) Icons.Default.Close else Icons.Default.Add, "Create", tint = Color.White, modifier = Modifier.size(38.dp))
+                    Icon(if (fabOpen) Icons.Default.Close else Icons.Default.Add, "Create", tint = Color.White, modifier = Modifier.size(26.dp))
                 }
             }
         }
@@ -771,8 +901,8 @@ private fun GlassHeader(
         Spacer(Modifier.width(6.dp))
         GlassCircleButton(Icons.Default.Notifications, "Notifications", onNotifications)
         Spacer(Modifier.width(6.dp))
-        Box(Modifier.size(48.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF1565FF), Color(0xFF7A2CFF)))).border(1.dp, Color(0xFF3DE7FF), CircleShape).clickable { onProfile() }, contentAlignment = Alignment.Center) {
-            if (me != null) Avatar(me.displayName, size = 39.dp, photo = me.avatarUrl)
+        Box(Modifier.size(40.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF1565FF), Color(0xFF7A2CFF)))).border(1.dp, Color(0xFF3DE7FF), CircleShape).clickable { onProfile() }, contentAlignment = Alignment.Center) {
+            if (me != null) Avatar(me.displayName, size = 32.dp, photo = me.avatarUrl)
             else Icon(Icons.Default.Person, "Profile", tint = Color.White)
         }
     }
@@ -782,12 +912,12 @@ private fun GlassHeader(
 private fun GlassCircleButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     Box(
-        Modifier.size(48.dp).clip(CircleShape)
+        Modifier.size(40.dp).clip(CircleShape)
             .background(scheme.primaryContainer)
             .border(1.dp, scheme.outlineVariant, CircleShape)
             .clickable { onClick() },
         contentAlignment = Alignment.Center
-    ) { Icon(icon, label, tint = scheme.onPrimaryContainer, modifier = Modifier.size(25.dp)) }
+    ) { Icon(icon, label, tint = scheme.onPrimaryContainer, modifier = Modifier.size(20.dp)) }
 }
 
 @Composable
@@ -833,16 +963,16 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
     ) {
         item {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onPostStatus() }) {
-                Box(Modifier.size(64.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF7A2CFF)))).padding(3.dp), contentAlignment = Alignment.Center) {
-                    Box(Modifier.fillMaxSize().clip(CircleShape).background(scheme.surfaceContainerHigh), contentAlignment = Alignment.Center) { Icon(Icons.Default.Add, "Your status", tint = scheme.primary, modifier = Modifier.size(30.dp)) }
+                Box(Modifier.size(52.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF7A2CFF)))).padding(3.dp), contentAlignment = Alignment.Center) {
+                    Box(Modifier.fillMaxSize().clip(CircleShape).background(scheme.surfaceContainerHigh), contentAlignment = Alignment.Center) { Icon(Icons.Default.Add, "Your status", tint = scheme.primary, modifier = Modifier.size(22.dp)) }
                 }
                 Spacer(Modifier.height(4.dp)); Text("Your status", color = scheme.onBackground, fontSize = 11.sp)
             }
         }
         items(people) { person ->
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onOpenStatus() }) {
-                Box(Modifier.size(64.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF8B2DFF)))).padding(3.dp), contentAlignment = Alignment.Center) {
-                    Avatar(person.second, photo = person.third, size = 58.dp)
+                Box(Modifier.size(52.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF8B2DFF)))).padding(3.dp), contentAlignment = Alignment.Center) {
+                    Avatar(person.second, photo = person.third, size = 46.dp)
                 }
                 Spacer(Modifier.height(4.dp)); Text(person.second.take(10), color = scheme.onBackground, fontSize = 11.sp, maxLines = 1)
             }
@@ -855,15 +985,15 @@ private fun GlassSearchBar(onClick: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp)
-            .clip(RoundedCornerShape(28.dp))
+            .clip(RoundedCornerShape(22.dp))
             .background(scheme.surfaceContainerHigh.copy(alpha = 0.85f))
-            .border(1.dp, scheme.outlineVariant, RoundedCornerShape(28.dp))
+            .border(1.dp, scheme.outlineVariant, RoundedCornerShape(22.dp))
             .clickable { onClick() }
-            .padding(horizontal = 18.dp, vertical = 14.dp),
+            .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(Icons.Default.Search, null, tint = scheme.onSurfaceVariant, modifier = Modifier.size(27.dp))
-        Spacer(Modifier.width(14.dp)); Text("Search chats, users, channels...", color = scheme.onSurfaceVariant, fontSize = 16.sp)
+        Icon(Icons.Default.Search, null, tint = scheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(10.dp)); Text("Search chats, users, channels...", color = scheme.onSurfaceVariant, fontSize = 14.sp)
     }
 }
 

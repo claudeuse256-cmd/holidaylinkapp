@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -47,6 +48,9 @@ import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.EmojiEmotions
 import androidx.compose.material.icons.filled.Flag
+import androidx.compose.material.icons.filled.Forward
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardVoice
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
@@ -58,6 +62,8 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -69,6 +75,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -82,6 +89,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableFloatStateOf
@@ -106,8 +114,10 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.fragment.app.FragmentActivity
 import com.google.firebase.Timestamp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
@@ -143,6 +153,8 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val listState = rememberLazyListState()
+    // True when the newest message is already on screen; drives the "jump to latest" button.
+    val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
     val uid = currentUserId.ifBlank { FirestoreChat.myUid() }
 
     var draft by remember { mutableStateOf("") }
@@ -160,11 +172,21 @@ fun ChatScreen(
     var viewOnceSend by remember { mutableStateOf(false) }
     var selfDestructSecs by remember { mutableLongStateOf(0L) }
     var viewOnceTarget by remember { mutableStateOf<FirestoreChat.ChatMessage?>(null) }
+    var photoUrl by remember { mutableStateOf<String?>(null) }
     var reportTarget by remember { mutableStateOf<FirestoreChat.ChatMessage?>(null) }
+    var infoFor by remember { mutableStateOf<FirestoreChat.ChatMessage?>(null) }
+    var searching by remember(chat.id) { mutableStateOf(false) }
+    var query by remember(chat.id) { mutableStateOf("") }
+    var forwardMsg by remember { mutableStateOf<FirestoreChat.ChatMessage?>(null) }
+    var forwardChats by remember { mutableStateOf<List<FirestoreChat.ChatRow>>(emptyList()) }
+    var forwardNames by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var aiBots by remember { mutableStateOf<List<FirestoreBots.StudyBot>>(emptyList()) }
     var aiSending by remember { mutableStateOf(false) }
     // Bodies just sent but not yet echoed back by Firestore: single grey tick.
     var pendingTexts by remember { mutableStateOf<List<String>>(emptyList()) }
+    // Index of the first unread incoming message, captured once so we can draw the
+    // WhatsApp-style "Unread messages" line even after markRead flips the flags.
+    var unreadAnchor by remember(chat.id) { mutableStateOf(-1) }
 
     var recorder by remember { mutableStateOf<VoiceRecorder?>(null) }
     var recordingMs by remember { mutableStateOf(0L) }
@@ -179,8 +201,15 @@ fun ChatScreen(
         ?: chat.title?.takeIf { it.isNotBlank() }
         ?: if (chat.kind == "direct") "Chat" else "Group"
 
-    val messages by remember(chat.id) { FirestoreChat.messagesFlow(chat.id) }
+    val rawMessages by remember(chat.id) { FirestoreChat.messagesFlow(chat.id) }
         .collectAsState(initial = emptyList())
+    // "Delete for me" hides the message on this device only; it stays on the server
+    // for everyone else, exactly like WhatsApp.
+    val hiddenMessages = AppSettings.state.hiddenMessages
+    val messages = remember(rawMessages, hiddenMessages) {
+        if (hiddenMessages.isEmpty()) rawMessages
+        else rawMessages.filter { hiddenMessages["${chat.id}/${it.id}"] != true }
+    }
 
     LaunchedEffect(chat.id) {
         runCatching { FirestoreChat.purgeExpired(chat.id) }
@@ -213,8 +242,39 @@ fun ChatScreen(
                 val echoed = messages.filter { it.senderId == uid }.map { it.text }.toSet()
                 pendingTexts = pendingTexts.filter { it !in echoed }
             }
+            // Remember where the unread block starts before markRead clears the flags.
+            if (unreadAnchor < 0) {
+                unreadAnchor = messages.indexOfFirst { it.senderId != uid && !it.read }
+            }
             if (messages.any { it.senderId != uid && !it.read }) {
                 runCatching { FirestoreChat.markRead(chat.id) }
+            }
+            // Receiving these on this device flips the sender's single tick to a double tick.
+            if (messages.any { it.senderId != uid && !it.delivered }) {
+                runCatching { FirestoreChat.markDelivered(chat.id) }
+            }
+        }
+    }
+
+    // The "Unread messages" line is transient, exactly like WhatsApp.
+    LaunchedEffect(unreadAnchor) {
+        if (unreadAnchor >= 0) {
+            delay(6000)
+            unreadAnchor = -1
+        }
+    }
+
+    // Load the chat list when the user starts forwarding a message.
+    LaunchedEffect(forwardMsg) {
+        if (forwardMsg != null && forwardChats.isEmpty()) {
+            runCatching {
+                val rows = FirestoreChat.chatsFlow(uid).first()
+                forwardChats = rows
+                forwardNames = rows.mapNotNull { r ->
+                    r.peerId?.let { pid ->
+                        pid to runCatching { FirestoreChat.resolvePeer(pid).displayName }.getOrDefault("Chat")
+                    }
+                }.toMap()
             }
         }
     }
@@ -395,8 +455,36 @@ fun ChatScreen(
         }
     }
 
+    val blockedPeerId = peerUser?.id?.takeIf { it.isNotBlank() }
+    val isBlocked = blockedPeerId != null && AppSettings.isUserBlocked(blockedPeerId)
+
     Scaffold(
         topBar = {
+            if (searching) {
+                TopAppBar(
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
+                    navigationIcon = {
+                        IconButton(onClick = { searching = false; query = "" }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Close search")
+                        }
+                    },
+                    title = {
+                        BasicTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                            modifier = Modifier.fillMaxWidth(),
+                            decorationBox = { inner ->
+                                if (query.isEmpty()) {
+                                    Text("Search in chat", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                inner()
+                            }
+                        )
+                    }
+                )
+            } else {
             TopAppBar(
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
@@ -422,16 +510,34 @@ fun ChatScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = { searching = true }) { Icon(Icons.Default.Search, "Search") }
                     peerUser?.let { peer ->
                         IconButton(onClick = { onOpenCalls(peer) }) { Icon(Icons.Default.Call, "Call") }
                     }
                 }
             )
+            }
         },
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             val mention = remember(draft, aiBots) { parseMention(draft) }
             Column {
+                if (isBlocked && blockedPeerId != null) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "You blocked this contact. Unblock to keep chatting.",
+                            Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        TextButton(onClick = { AppSettings.setUserBlocked(blockedPeerId, false) }) {
+                            Text("Unblock")
+                        }
+                    }
+                } else {
                 if (mention != null && !sending && !aiSending) {
                     val (handle, botId, instruction) = mention
                     Row(
@@ -505,10 +611,32 @@ fun ChatScreen(
                         }
                     }
                 )
+                }
             }
         }
     ) { padding ->
-        Column(Modifier.padding(padding).fillMaxSize()) {
+        Box(Modifier.padding(padding).fillMaxSize()) {
+            ChatWallpaper(
+                uri = AppSettings.state.chatWallpaper,
+                solid = AppSettings.state.chatWallpaperSolid,
+                modifier = Modifier.matchParentSize()
+            )
+            Column(Modifier.fillMaxSize()) {
+            if (searching && query.isNotBlank()) {
+                ChatSearchResults(
+                    messages = messages,
+                    query = query,
+                    myUid = uid,
+                    peerLabel = title,
+                    onPick = { id ->
+                        searching = false
+                        query = ""
+                        val i = messages.indexOfFirst { it.id == id }
+                        if (i >= 0) scope.launch { listState.animateScrollToItem(i) }
+                    }
+                )
+                return@Column
+            }
             if (error.isNotBlank() && messages.isEmpty()) {
                 ErrorState(error) { error = "" }
                 return@Column
@@ -522,12 +650,35 @@ fun ChatScreen(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    items(messages, key = { it.id }) { message ->
+                    itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
+                        val day = dayOf(message)
+                        val prevDay = if (index > 0) dayOf(messages[index - 1]) else null
+                        Column(Modifier.fillMaxWidth()) {
+                        if (day != null && day != prevDay) {
+                            DateSeparator(dayLabel(day))
+                        }
+                        if (index == unreadAnchor) {
+                            UnreadDivider()
+                        }
                         FsMessageBubble(
                             message = message,
                             mine = message.senderId == uid,
+                            myUid = uid,
+                            starred = AppSettings.isMessageStarred(chat.id, message.id),
                             pending = message.senderId == uid && !message.read && message.text in pendingTexts,
                             onLongPress = { sheetFor = message },
+                            onOpenImage = { photoUrl = it },
+                            onJumpTo = { targetId ->
+                                val i = messages.indexOfFirst { it.id == targetId }
+                                if (i >= 0) scope.launch { listState.animateScrollToItem(i) }
+                            },
+                            onReact = { emoji ->
+                                val reacted = message.reactions[emoji]?.contains(uid) == true
+                                scope.launch {
+                                    runCatching { FirestoreChat.react(chat.id, message.id, emoji, !reacted) }
+                                        .onFailure { snackbar.showSnackbar("Couldn't react") }
+                                }
+                            },
                             onOpenViewOnce = { target ->
                                 if (target.senderId == uid) {
                                     scope.launch { snackbar.showSnackbar("View-once: the recipient opens it one time.") }
@@ -536,11 +687,24 @@ fun ChatScreen(
                                 }
                             }
                         )
+                        }
                     }
                 }
             }
         }
+            // WhatsApp/Telegram-style: only shows when you have scrolled away from the newest.
+            if (!atBottom && messages.isNotEmpty()) {
+                SmallFloatingActionButton(
+                    onClick = { scope.launch { listState.animateScrollToItem(messages.lastIndex) } },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 14.dp),
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor = MaterialTheme.colorScheme.primary
+                ) { Icon(Icons.Default.KeyboardArrowDown, "Scroll to latest") }
+            }
+        }
     }
+
+    photoUrl?.let { url -> PhotoViewer(url = url, onDismiss = { photoUrl = null }) }
 
     // ---------------------------------------------------------------- sheets
 
@@ -557,6 +721,34 @@ fun ChatScreen(
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ) {
             Column(Modifier.fillMaxWidth().padding(vertical = 8.dp, horizontal = 8.dp)) {
+                // Quick reactions (WhatsApp/Telegram). Tapping again removes your reaction.
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    listOf("👍", "❤️", "😂", "😮", "😢", "🙏").forEach { emoji ->
+                        val reacted = sheetMsg.reactions[emoji]?.contains(uid) == true
+                        Text(
+                            emoji,
+                            modifier = Modifier
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(
+                                    if (reacted) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                    else Color.Transparent
+                                )
+                                .clickable {
+                                    scope.launch {
+                                        runCatching { FirestoreChat.react(chat.id, sheetMsg.id, emoji, !reacted) }
+                                            .onFailure { snackbar.showSnackbar("Couldn't react") }
+                                    }
+                                    sheetFor = null
+                                }
+                                .padding(8.dp),
+                            style = MaterialTheme.typography.titleLarge
+                        )
+                    }
+                }
                 if (!mine) {
                     SheetAction("Reply", Icons.Default.Reply, {
                         replyingTo = sheetMsg
@@ -582,8 +774,26 @@ fun ChatScreen(
                         sheetFor = null
                     })
                 }
+                SheetAction("Forward", Icons.Default.Forward, {
+                    forwardMsg = sheetMsg
+                    sheetFor = null
+                })
+                val starredMsg = AppSettings.isMessageStarred(chat.id, sheetMsg.id)
+                SheetAction(if (starredMsg) "Unstar message" else "Star message", if (starredMsg) Icons.Default.Star else Icons.Default.StarBorder) {
+                    AppSettings.setMessageStarred(chat.id, sheetMsg.id, !starredMsg)
+                    sheetFor = null
+                }
                 SheetAction("Copy text", Icons.Default.ContentCopy, {
                     copyToClipboard(context, sheetMsg.text)
+                    sheetFor = null
+                })
+                SheetAction("Delete for me", Icons.Default.VisibilityOff, {
+                    AppSettings.setMessageHidden(chat.id, sheetMsg.id, true)
+                    sheetFor = null
+                    scope.launch { snackbar.showSnackbar("Deleted for you") }
+                })
+                SheetAction("Message info", Icons.Default.Info, {
+                    infoFor = sheetMsg
                     sheetFor = null
                 })
                 if (!mine) {
@@ -591,6 +801,78 @@ fun ChatScreen(
                         reportTarget = sheetMsg
                         sheetFor = null
                     })
+                }
+            }
+        }
+    }
+
+    val fwd = forwardMsg
+    if (fwd != null) {
+        ModalBottomSheet(
+            onDismissRequest = { forwardMsg = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ) {
+            Column(Modifier.fillMaxWidth().padding(bottom = 20.dp)) {
+                Text(
+                    "Forward to…",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(start = 20.dp, top = 4.dp, bottom = 4.dp)
+                )
+                if (forwardChats.isEmpty()) {
+                    Text(
+                        "Loading your chats…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 20.dp, top = 8.dp, bottom = 8.dp)
+                    )
+                } else {
+                    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 360.dp)) {
+                        items(forwardChats, key = { it.id }) { row ->
+                            val label = forwardNames[row.peerId]
+                                ?: row.title.ifBlank {
+                                    if (row.isGroup || row.isBroadcast || row.isCommunity) "Group" else "Chat"
+                                }
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        scope.launch {
+                                            runCatching {
+                                                FirestoreChat.send(
+                                                    chatId = row.id,
+                                                    text = fwd.text,
+                                                    imageUrl = fwd.imageUrl,
+                                                    fileUrl = fwd.fileUrl,
+                                                    fileName = fwd.fileName,
+                                                    kind = fwd.type,
+                                                    durationMs = fwd.durationMs,
+                                                    audioBlob = fwd.audioBlob
+                                                )
+                                            }.onSuccess { snackbar.showSnackbar("Forwarded") }
+                                                .onFailure { snackbar.showSnackbar("Couldn't forward") }
+                                        }
+                                        forwardMsg = null
+                                    }
+                                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Avatar(
+                                    name = label,
+                                    photo = null,
+                                    online = false,
+                                    size = 40.dp
+                                )
+                                Spacer(Modifier.width(14.dp))
+                                Text(
+                                    label,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -679,6 +961,11 @@ fun ChatScreen(
             }
         )
     }
+
+    val info = infoFor
+    if (info != null) {
+        MessageInfoDialog(chatId = chat.id, message = info, myUid = uid) { infoFor = null }
+    }
 }
 
 /** Resolve an @ai/@bot instruction into sendable text (Study Buddy brain). */
@@ -703,6 +990,95 @@ private fun urlToStoragePath(url: String): String? {
     }.getOrNull()
 }
 
+/** In-chat search results (tap a hit to jump to it in the conversation). */
+@Composable
+private fun ChatSearchResults(
+    messages: List<FirestoreChat.ChatMessage>,
+    query: String,
+    myUid: String,
+    peerLabel: String,
+    onPick: (String) -> Unit
+) {
+    val found = remember(messages, query) {
+        val q = query.trim()
+        if (q.isEmpty()) emptyList()
+        else messages.filter { it.text.contains(q, ignoreCase = true) }
+    }
+    if (found.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("No messages found", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        return
+    }
+    LazyColumn(Modifier.fillMaxSize()) {
+        items(found, key = { it.id }) { msg ->
+            Column(
+                Modifier.fillMaxWidth()
+                    .clickable { onPick(msg.id) }
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                Text(
+                    if (msg.senderId == myUid) "You" else peerLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    msg.text.ifBlank { "[attachment]" },
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+/** WhatsApp-style message info: status, time, edit marker and reactions. */
+@Composable
+private fun MessageInfoDialog(
+    chatId: String,
+    message: FirestoreChat.ChatMessage,
+    myUid: String,
+    onDismiss: () -> Unit
+) {
+    val mine = message.senderId == myUid
+    val sentText = message.createdAt?.let { ts ->
+        runCatching {
+            android.text.format.DateFormat.format("MMM d, yyyy • h:mm a", ts.toDate()).toString()
+        }.getOrNull()
+    } ?: "—"
+    val status = when {
+        !mine -> "Received"
+        message.read -> "Read"
+        message.delivered -> "Delivered"
+        else -> "Sent"
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        title = { Text("Message info") },
+        text = {
+            Column {
+                Text("Status: $status", style = MaterialTheme.typography.bodyMedium)
+                Text("Sent: $sentText", style = MaterialTheme.typography.bodyMedium)
+                if (message.edited) Text("Edited", style = MaterialTheme.typography.bodyMedium)
+                if (message.reactions.isNotEmpty()) {
+                    Text(
+                        "Reactions: " + message.reactions.keys.joinToString(" "),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+                Text(
+                    "ID: $chatId/${message.id}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    )
+}
+
 // ------------------------------------------------------------------ bubbles
 
 @Composable
@@ -710,8 +1086,13 @@ private fun urlToStoragePath(url: String): String? {
 private fun FsMessageBubble(
     message: FirestoreChat.ChatMessage,
     mine: Boolean,
+    myUid: String,
+    starred: Boolean,
     pending: Boolean,
     onLongPress: () -> Unit,
+    onOpenImage: (String) -> Unit,
+    onReact: (String) -> Unit,
+    onJumpTo: (String) -> Unit,
     onOpenViewOnce: (FirestoreChat.ChatMessage) -> Unit
 ) {
     val bubbleColor = if (mine) MaterialTheme.colorScheme.primaryContainer
@@ -743,6 +1124,7 @@ private fun FsMessageBubble(
                         Modifier.fillMaxWidth().padding(bottom = 6.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
+                            .clickable { message.replyToId?.let(onJumpTo) }
                             .padding(horizontal = 8.dp, vertical = 5.dp)
                     ) {
                         Column {
@@ -777,6 +1159,7 @@ private fun FsMessageBubble(
                             url = url,
                             modifier = Modifier.widthIn(max = 260.dp).heightIn(max = 320.dp)
                                 .clip(RoundedCornerShape(12.dp))
+                                .clickable { onOpenImage(url) }
                         )
                         Spacer(Modifier.height(6.dp))
                     }
@@ -794,7 +1177,48 @@ private fun FsMessageBubble(
                 }
             }
         }
+        if (message.reactions.isNotEmpty()) {
+            Row(
+                Modifier.padding(top = 2.dp, start = 2.dp, end = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                message.reactions.forEach { (emoji, uids) ->
+                    val mineReacted = uids.contains(myUid)
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(
+                                if (mineReacted) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                else MaterialTheme.colorScheme.surfaceContainerHigh
+                            )
+                            .clickable { onReact(emoji) }
+                            .padding(horizontal = 7.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(emoji, style = MaterialTheme.typography.labelMedium)
+                        if (uids.size > 1) {
+                            Spacer(Modifier.width(3.dp))
+                            Text(
+                                "${uids.size}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
         Row(Modifier.padding(horizontal = 6.dp, vertical = 1.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (starred) {
+                Icon(
+                    Icons.Default.Star,
+                    "Starred",
+                    Modifier.size(12.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(4.dp))
+            }
             Text(
                 clockOf(message.createdAt?.toDate()?.toInstant()?.toString()),
                 style = MaterialTheme.typography.labelSmall,
@@ -815,7 +1239,15 @@ private fun FsMessageBubble(
             if (mine) {
                 Spacer(Modifier.width(4.dp))
                 // Sent (single grey) → delivered (double grey) → read (double blue).
-                StatusTick(if (message.read) "read" else if (pending) "sent" else "delivered")
+                // `delivered` is set by the recipient's device, so a freshly sent message
+                // stays on a single tick until it actually arrives — not immediately.
+                StatusTick(
+                    when {
+                        message.read -> "read"
+                        message.delivered -> "delivered"
+                        else -> "sent"
+                    }
+                )
             }
         }
     }
@@ -1432,4 +1864,48 @@ private fun hasMicPermission(context: Context): Boolean =
 private fun copyToClipboard(context: Context, text: String) {
     val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
     manager.setPrimaryClip(ClipData.newPlainText("HolidayLink", text))
+}
+
+private fun dayOf(message: org.holidaylink.app.net.FirestoreChat.ChatMessage): java.time.LocalDate? =
+    message.createdAt?.toDate()?.toInstant()
+        ?.atZone(java.time.ZoneId.systemDefault())
+        ?.toLocalDate()
+
+private fun dayLabel(date: java.time.LocalDate): String {
+    val today = java.time.LocalDate.now()
+    return when (date) {
+        today -> "Today"
+        today.minusDays(1) -> "Yesterday"
+        else -> date.format(java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy"))
+    }
+}
+
+@Composable
+private fun DateSeparator(label: String) {
+    Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f))
+                .padding(horizontal = 10.dp, vertical = 4.dp)
+        )
+    }
+}
+
+@Composable
+private fun UnreadDivider() {
+    Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+        Text(
+            "Unread messages",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                .padding(horizontal = 10.dp, vertical = 4.dp)
+        )
+    }
 }

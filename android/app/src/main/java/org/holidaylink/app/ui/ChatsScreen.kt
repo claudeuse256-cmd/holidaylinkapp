@@ -1,7 +1,9 @@
 package org.holidaylink.app.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -16,17 +18,27 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.MarkChatUnread
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -50,6 +62,7 @@ import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.User
 
 /** Recent conversations from Firestore (same docs as the website), realtime. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatsScreen(
     api: Api,
@@ -60,6 +73,8 @@ fun ChatsScreen(
     val uid = currentUserId.ifBlank { FirestoreChat.myUid() }
     var query by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }
+    var menuFor by remember { mutableStateOf<ChatItem?>(null) }
+    var archivedOpen by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val peerCache = remember { mutableStateMapOf<String, User>() }
 
@@ -93,17 +108,21 @@ fun ChatsScreen(
         return ChatItem(
             row.id, kind, title, peer,
             row.lastBody, row.lastAt?.toDate()?.toInstant()?.toString(),
-            row.unread, false, false, false
+            row.unread, AppSettings.isChatPinned(row.id), AppSettings.isChatArchived(row.id), false
         )
     }
 
-    val visible = remember(rows, query, peerCache) {
-        val needle = query.trim().lowercase()
-        val mapped = rows.map { toItem(it) }
-        if (needle.isBlank()) mapped else mapped.filter {
-            val title = it.peer?.displayName ?: it.title.orEmpty()
-            title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
-        }
+    // Recomputed on every recomposition: `peerCache` is a snapshot state map, so as soon as a
+    // peer resolves the row updates its title. (Wrapping this in remember(rows, query, peerCache)
+    // froze the names because the map instance never changes.)
+    val needle = query.trim().lowercase()
+    // Pinned chats float to the top, WhatsApp-style. Archived chats live behind a toggle.
+    val all = rows.map { toItem(it) }.sortedByDescending { it.pinned }
+    val archivedCount = all.count { it.archived }
+    val mapped = all.filter { it.archived == archivedOpen }
+    val visible = if (needle.isBlank()) mapped else mapped.filter {
+        val title = it.peer?.displayName ?: it.title.orEmpty()
+        title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -146,7 +165,7 @@ fun ChatsScreen(
 
         when {
             error.isNotBlank() && visible.isEmpty() -> ErrorState(error) { error = "" }
-            visible.isEmpty() -> EmptyState(
+            visible.isEmpty() && archivedCount == 0 -> EmptyState(
                 icon = Icons.Default.ChatBubbleOutline,
                 title = "No chats yet",
                 subtitle = "Tap Contacts or the new-chat button to start a conversation."
@@ -156,6 +175,35 @@ fun ChatsScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 24.dp)
             ) {
+                if (query.isBlank() && archivedCount > 0) {
+                    item(key = "archived-toggle") {
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable { archivedOpen = !archivedOpen }
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.Archive,
+                                contentDescription = null,
+                                modifier = Modifier.size(22.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.width(14.dp))
+                            Text(
+                                if (archivedOpen) "Back to all chats" else "Archived ($archivedCount)",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Icon(
+                                if (archivedOpen) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
                 if (query.isNotBlank() && visible.isEmpty()) {
                     item { NoChatsFound(query) }
                 }
@@ -164,8 +212,52 @@ fun ChatsScreen(
                         chat = chat,
                         currentUserId = uid,
                         muted = AppSettings.isChatMuted(chat.id),
-                        onClick = { onOpenChat(chat) }
+                        onClick = { onOpenChat(chat) },
+                        onLongPress = { menuFor = chat }
                     )
+                }
+            }
+        }
+    }
+
+    // WhatsApp-style long-press actions: pin, mute, mark as read.
+    val open = menuFor
+    if (open != null) {
+        ModalBottomSheet(
+            onDismissRequest = { menuFor = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ) {
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp, horizontal = 8.dp)) {
+                val pinned = AppSettings.isChatPinned(open.id)
+                val muted = AppSettings.isChatMuted(open.id)
+                ChatMenuAction(if (pinned) "Unpin chat" else "Pin chat", Icons.Default.PushPin) {
+                    AppSettings.setChatPinned(open.id, !pinned)
+                    menuFor = null
+                }
+                ChatMenuAction(if (muted) "Unmute notifications" else "Mute notifications", if (muted) Icons.Default.VolumeUp else Icons.Default.VolumeOff) {
+                    AppSettings.setChatMuted(open.id, !muted)
+                    menuFor = null
+                }
+                ChatMenuAction("Mark as read", Icons.Default.DoneAll) {
+                    scope.launch { runCatching { FirestoreChat.markRead(open.id) } }
+                    menuFor = null
+                }
+                ChatMenuAction("Mark as unread", Icons.Default.MarkChatUnread) {
+                    scope.launch { runCatching { FirestoreChat.markUnread(open.id) } }
+                    menuFor = null
+                }
+                val archived = AppSettings.isChatArchived(open.id)
+                ChatMenuAction(if (archived) "Unarchive chat" else "Archive chat", Icons.Default.Archive) {
+                    AppSettings.setChatArchived(open.id, !archived)
+                    menuFor = null
+                }
+                val blockableId = open.peer?.id?.takeIf { it.isNotBlank() }
+                if (blockableId != null) {
+                    val blocked = AppSettings.isUserBlocked(blockableId)
+                    ChatMenuAction(if (blocked) "Unblock contact" else "Block contact", Icons.Default.Block) {
+                        AppSettings.setUserBlocked(blockableId, !blocked)
+                        menuFor = null
+                    }
                 }
             }
         }
@@ -173,13 +265,31 @@ fun ChatsScreen(
 }
 
 @Composable
+private fun ChatMenuAction(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(horizontal = 18.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        androidx.compose.material3.Icon(icon, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.width(16.dp))
+        Text(label, style = MaterialTheme.typography.bodyLarge)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
 private fun ChatRow(
     chat: ChatItem,
     currentUserId: String,
     muted: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onLongPress: () -> Unit
 ) {
-    val title = chat.peer?.displayName ?: chat.title ?: "Group"
+    // A 1-1 chat must never borrow the word "Group" while its peer name is still resolving.
+    val title = chat.peer?.displayName ?: chat.title ?: if (chat.kind == "direct") "Chat" else "Group"
     val unread = chat.unreadCount > 0
     val preview = when {
         chat.peerTyping -> "typing…"
@@ -190,7 +300,7 @@ private fun ChatRow(
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable { onClick() }
+            .combinedClickable(onClick = onClick, onLongClick = onLongPress)
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

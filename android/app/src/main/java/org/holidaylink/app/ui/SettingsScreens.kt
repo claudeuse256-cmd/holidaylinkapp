@@ -116,6 +116,7 @@ fun SettingsScaffold(
     title: String,
     onBack: () -> Unit,
     snackbar: SnackbarHostState,
+    showBack: Boolean = true,
     content: @Composable () -> Unit
 ) {
     Scaffold(
@@ -123,8 +124,10 @@ fun SettingsScaffold(
             TopAppBar(
                 title = { Text(title) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                    if (showBack) {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                        }
                     }
                 }
             )
@@ -191,7 +194,8 @@ fun SettingsHub(
     api: Api,
     me: Me?,
     onOpen: (SettingsRoute) -> Unit,
-    onLoggedOut: () -> Unit
+    onLoggedOut: () -> Unit,
+    onBack: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -201,7 +205,7 @@ fun SettingsHub(
     var confirmDelete by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
 
-    SettingsScaffold("Settings", onBack = {}, snackbar = snackbar) {
+    SettingsScaffold("Settings", onBack = onBack ?: {}, snackbar = snackbar, showBack = onBack != null) {
         // -------- profile header
         Row(
             Modifier

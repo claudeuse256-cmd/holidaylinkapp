@@ -38,6 +38,7 @@ class CallManager(private val context: Context, private val api: Api) {
     private var currentKind = "audio"
     private var isCaller = false
     private var answerApplied = false
+    private var accepted = false
     private val seenCandidates = mutableSetOf<String>()
 
     fun connect() {
@@ -98,6 +99,17 @@ class CallManager(private val context: Context, private val api: Api) {
         currentCallId = ref.id
         createPeer(offer = true)
         watchCall(ref.id, caller = true)
+        // WhatsApp-like: no answer after ~45s is a missed call, not an endless ring.
+        scope.launch {
+            kotlinx.coroutines.delay(45_000)
+            if (currentCallId == ref.id && !accepted) {
+                runCatching {
+                    db.collection("calls").document(ref.id)
+                        .update(mapOf("status" to "missed", "endedAt" to Timestamp.now())).await()
+                }
+                onState?.invoke("missed")
+            }
+        }
         val peer = runCatching { FirestoreChat.resolvePeer(calleeId) }.getOrNull()
         return CallRecord(ref.id, peer, kind, "ringing", incoming = false, createdAt = "", durationSeconds = 0)
     }
@@ -106,6 +118,7 @@ class CallManager(private val context: Context, private val api: Api) {
         currentCallId = callId
         currentKind = kind
         isCaller = false
+        accepted = true
         scope.launch {
             val snap = db.collection("calls").document(callId).get().await()
             val offer = snap.get("offer") as? Map<String, String>
@@ -146,15 +159,22 @@ class CallManager(private val context: Context, private val api: Api) {
 
     fun end() {
         val id = currentCallId
+        val missed = !accepted && isCaller
         if (id != null) {
             scope.launch {
                 runCatching {
                     db.collection("calls").document(id)
-                        .update(mapOf("status" to "ended", "endedAt" to Timestamp.now())).await()
+                        .update(
+                            mapOf(
+                                "status" to if (missed) "missed" else "ended",
+                                "endedAt" to Timestamp.now()
+                            )
+                        ).await()
                 }
             }
         }
         pc?.close(); pc = null
+        setSpeaker(false)
         onState?.invoke("ended")
         cleanupCall()
     }
@@ -165,6 +185,14 @@ class CallManager(private val context: Context, private val api: Api) {
 
     fun toggleCamera(enabled: Boolean) {
         localVideo?.setEnabled(enabled)
+    }
+
+    /** Route audio to the loudspeaker (video calls / speakerphone) or the earpiece. */
+    fun setSpeaker(on: Boolean) {
+        runCatching {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            am?.isSpeakerphoneOn = on
+        }
     }
 
     private fun cleanupCall() {
@@ -180,6 +208,7 @@ class CallManager(private val context: Context, private val api: Api) {
         callReg = db.collection("calls").document(callId)
             .addSnapshotListener { snap, _ ->
                 val status = snap?.getString("status") ?: return@addSnapshotListener
+                if (status == "accepted" || status == "connected") accepted = true
                 onState?.invoke(status)
                 // Caller picks up the callee's answer from the call doc.
                 if (caller && !answerApplied) {

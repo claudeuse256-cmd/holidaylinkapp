@@ -57,6 +57,8 @@ import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Quiz
 import androidx.compose.material.icons.filled.ShoppingBag
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -84,20 +86,44 @@ data class HolidayFeature(
     val route: String
 )
 
-private val features = listOf(
-    HolidayFeature("Home Feed", "Announcements and the latest HolidayLink updates", Icons.Default.Newspaper, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:feed"),
-    HolidayFeature("Homework", "Organise holiday work and study tasks", Icons.Default.MenuBook, listOf(Color(0xFF2563EB), Color(0xFF06B6D4)), "native:ai"),
-    HolidayFeature("Quizzes", "Test yourself and track your progress", Icons.Default.Quiz, listOf(Color(0xFF8B5CF6), Color(0xFF2563EB)), "native:quizzes"),
-    HolidayFeature("Past Papers", "Find revision papers by subject and year", Icons.Default.Description, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:papers"),
-    HolidayFeature("Events", "Discover and join HolidayLink events", Icons.Default.CalendarMonth, listOf(Color(0xFF10B981), Color(0xFF06B6D4)), "native:events"),
-    HolidayFeature("AI Homework Help", "Ask HolidayLink AI for study help", Icons.Default.SmartToy, listOf(Color(0xFF06B6D4), Color(0xFF7C3AED)), "native:ai"),
-    HolidayFeature("Daily Feed", "Read short updates and entertainment posts", Icons.Default.Newspaper, listOf(Color(0xFFEC4899), Color(0xFF8B5CF6)), "native:feed"),
-    HolidayFeature("Store", "HolidayLink plans, packs and available items", Icons.Default.ShoppingBag, listOf(Color(0xFF22C55E), Color(0xFF06B6D4)), "native:store"),
-    HolidayFeature("Rankings", "See quiz points and student rankings", Icons.Default.Leaderboard, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:rankings"),
-    HolidayFeature("Invite Friends", "Share HolidayLink with your friends", Icons.Default.PersonAdd, listOf(Color(0xFF2563EB), Color(0xFF7C3AED)), "native:invite"),
-    HolidayFeature("Calls", "Open your audio and video call history", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:calls"),
-    HolidayFeature("Messages", "Open the full HolidayLink messaging experience", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:chats"),
-    HolidayFeature("Wallet", "Balance, withdrawals and transactions", Icons.Default.AccountBalanceWallet, listOf(Color(0xFF10B981), Color(0xFF22C55E)), "native:wallet")
+private data class HolidaySection(val title: String, val features: List<HolidayFeature>)
+
+// One entry per destination. (Older builds listed "Daily Feed" and "Homework" that both
+// silently opened Feed/AI again, so the hub had two buttons for one page.)
+private val sections = listOf(
+    HolidaySection(
+        "Stay updated",
+        listOf(
+            HolidayFeature("Home Feed", "Announcements and the latest HolidayLink updates", Icons.Default.Newspaper, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:feed"),
+            HolidayFeature("Events", "Discover and join HolidayLink events", Icons.Default.CalendarMonth, listOf(Color(0xFF10B981), Color(0xFF06B6D4)), "native:events")
+        )
+    ),
+    HolidaySection(
+        "Study",
+        listOf(
+            HolidayFeature("Quizzes", "Test yourself and track your progress", Icons.Default.Quiz, listOf(Color(0xFF8B5CF6), Color(0xFF2563EB)), "native:quizzes"),
+            HolidayFeature("Past Papers", "Find revision papers by subject and year", Icons.Default.Description, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:papers"),
+            HolidayFeature("AI Homework Help", "Ask HolidayLink AI for study help", Icons.Default.SmartToy, listOf(Color(0xFF06B6D4), Color(0xFF7C3AED)), "native:ai"),
+            HolidayFeature("Rankings", "See quiz points and student rankings", Icons.Default.Leaderboard, listOf(Color(0xFFF59E0B), Color(0xFFEF4444)), "native:rankings")
+        )
+    ),
+    HolidaySection(
+        "Messaging",
+        listOf(
+            HolidayFeature("Messages", "Open the full HolidayLink messaging experience", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:chats"),
+            HolidayFeature("Calls", "Open your audio and video call history", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:calls"),
+            HolidayFeature("Starred messages", "Keep and revisit messages you starred", Icons.Default.Star, listOf(Color(0xFFF59E0B), Color(0xFFFACC15)), "native:starred"),
+            HolidayFeature("Status", "Updates that vanish after 24 hours", Icons.Default.Schedule, listOf(Color(0xFF10B981), Color(0xFF06B6D4)), "native:status")
+        )
+    ),
+    HolidaySection(
+        "Store & more",
+        listOf(
+            HolidayFeature("Store", "HolidayLink plans, packs and available items", Icons.Default.ShoppingBag, listOf(Color(0xFF22C55E), Color(0xFF06B6D4)), "native:store"),
+            HolidayFeature("Wallet", "Balance, withdrawals and transactions", Icons.Default.AccountBalanceWallet, listOf(Color(0xFF10B981), Color(0xFF22C55E)), "native:wallet"),
+            HolidayFeature("Invite Friends", "Share HolidayLink with your friends", Icons.Default.PersonAdd, listOf(Color(0xFF2563EB), Color(0xFF7C3AED)), "native:invite")
+        )
+    )
 )
 
 @Composable
@@ -106,23 +132,26 @@ fun FeatureHubScreen(
     onOpen: (HolidayFeature) -> Unit
 ) {
     Column(Modifier.fillMaxSize()) {
-        GlassTopBar(title = "HolidayLink", subtitle = "Learn • Connect • Grow", onBack = onBack)
+        GlassTopBar(title = "Menu", subtitle = "Everything HolidayLink can do", onBack = onBack)
 
         LazyColumn(
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 28.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            item {
-                GlassHeroCard()
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "Everything from HolidayLink in one place",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-            items(features, key = { it.title }) { feature ->
-                FeatureCard(feature) { onOpen(feature) }
+            item(key = "hero") { GlassHeroCard() }
+            sections.forEach { section ->
+                item(key = "hdr-${section.title}") {
+                    Text(
+                        section.title.uppercase(),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(start = 6.dp, top = 10.dp, bottom = 1.dp)
+                    )
+                }
+                items(section.features, key = { it.route + it.title }) { feature ->
+                    FeatureCard(feature) { onOpen(feature) }
+                }
             }
         }
     }
@@ -133,24 +162,24 @@ private fun FeatureCard(feature: HolidayFeature, onClick: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(24.dp))
+            .clip(RoundedCornerShape(20.dp))
             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.74f))
             .clickable(onClick = onClick)
-            .padding(15.dp),
+            .padding(13.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
-            Modifier.size(50.dp).clip(RoundedCornerShape(17.dp)).background(Brush.linearGradient(feature.accent)),
+            Modifier.size(46.dp).clip(RoundedCornerShape(15.dp)).background(Brush.linearGradient(feature.accent)),
             contentAlignment = Alignment.Center
         ) {
-            Icon(feature.icon, null, tint = Color.White, modifier = Modifier.size(26.dp))
+            Icon(feature.icon, null, tint = Color.White, modifier = Modifier.size(24.dp))
         }
-        Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
+        Column(Modifier.weight(1f).padding(horizontal = 13.dp)) {
             Text(feature.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(3.dp))
-            Text(feature.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(2.dp))
+            Text(feature.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2)
         }
-        Text("›", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
+        Text("›", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
     }
 }
 

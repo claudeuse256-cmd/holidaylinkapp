@@ -85,6 +85,7 @@ fun UserProfileScreen(
     var confirmBlock by remember { mutableStateOf(false) }
     var confirmReport by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+    var viewerUrl by remember { mutableStateOf<String?>(null) }
 
     suspend fun reload() {
         try {
@@ -169,7 +170,12 @@ fun UserProfileScreen(
                     .padding(horizontal = 20.dp)
             ) {
                 Spacer(Modifier.height(20.dp))
-                Avatar(name = shown.displayName, photo = shown.avatarUrl, size = 108.dp)
+                Avatar(
+                    name = shown.displayName,
+                    photo = shown.avatarUrl,
+                    size = 108.dp,
+                    onClick = { shown.avatarUrl?.takeIf { it.isNotBlank() }?.let { viewerUrl = it } }
+                )
                 Spacer(Modifier.height(14.dp))
                 Text(
                     shown.displayName,
@@ -366,6 +372,10 @@ fun UserProfileScreen(
             },
             dismissButton = { TextButton(onClick = { confirmReport = false }) { Text("Cancel") } }
         )
+    }
+
+    viewerUrl?.let { url ->
+        PhotoViewer(url = url, title = shown?.displayName.orEmpty(), onDismiss = { viewerUrl = null })
     }
 }
 

@@ -46,6 +46,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.CallRecord
+import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.User
@@ -60,22 +61,24 @@ fun CallsScreen(
     api: Api,
     onOpenChat: (User) -> Unit
 ) {
-    var calls by remember { mutableStateOf<List<CallRecord>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    var calls by remember { mutableStateOf(DeviceCache.memory<List<CallRecord>>("calls") ?: emptyList()) }
+    var loading by remember { mutableStateOf(calls.isEmpty()) }
     var refreshing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
     var filter by remember { mutableStateOf("all") }
     val peerCache = remember { mutableStateMapOf<String, User>() }
 
-    suspend fun loadHistory(): List<CallRecord> {
+    suspend fun loadHistory(
+        source: com.google.firebase.firestore.Source = com.google.firebase.firestore.Source.DEFAULT
+    ): List<CallRecord> {
         val uid = FirebaseBackend.uid.orEmpty()
         val out = mutableListOf<CallRecord>()
         for (field in listOf("callerId", "calleeId")) {
             val snap = FirebaseBackend.db.collection("calls")
                 .whereEqualTo(field, uid)
                 .orderBy("createdAt", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(100).get().await()
+                .limit(100).get(source).await()
             snap.documents.forEach { d ->
                 val callerId = d.getString("callerId").orEmpty()
                 val calleeId = d.getString("calleeId").orEmpty()
@@ -113,21 +116,22 @@ fun CallsScreen(
 
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
-        try {
-            calls = loadHistory()
+        val fresh = DeviceCache.load("calls", { source -> loadHistory(source) }) { data ->
+            calls = data
             error = ""
-        } catch (e: Exception) {
-            error = "We couldn't load your call history. Check your internet."
-        } finally {
             loading = false
-            refreshing = false
         }
+        if (fresh == null && calls.isEmpty()) {
+            error = "We couldn't load your call history. Check your internet."
+        }
+        loading = false
+        refreshing = false
     }
 
     LaunchedEffect(Unit) {
         while (true) {
             delay(30_000)
-            runCatching { calls = loadHistory() }
+            runCatching { loadHistory() }.onSuccess { DeviceCache.put("calls", it); calls = it }
         }
     }
 

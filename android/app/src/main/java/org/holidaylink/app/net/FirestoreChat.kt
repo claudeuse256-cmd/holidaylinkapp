@@ -1,6 +1,7 @@
 package org.holidaylink.app.net
 
 import com.google.firebase.Timestamp
+import com.google.firebase.firestore.FieldValue
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -131,7 +132,11 @@ object FirestoreChat {
         val replyToBody: String? = null,
         val replyToName: String? = null,
         val audioBlob: String? = null,
-        val edited: Boolean = false
+        val edited: Boolean = false,
+        /** Set by the recipient's device when the message reaches it (double grey tick). */
+        val delivered: Boolean = false,
+        /** emoji -> uids who reacted. Empty map means no reactions. */
+        val reactions: Map<String, List<String>> = emptyMap()
     )
 
     fun messagesFlow(chatId: String): Flow<List<ChatMessage>> = callbackFlow {
@@ -156,7 +161,9 @@ object FirestoreChat {
                         replyToBody = d.getString("replyToBody"),
                         replyToName = d.getString("replyToName"),
                         audioBlob = d.getString("audioBlob"),
-                        edited = d.getBoolean("edited") == true
+                        edited = d.getBoolean("edited") == true,
+                        delivered = d.getBoolean("delivered") == true,
+                        reactions = parseReactions(d.get("reactions"))
                     )
                 } ?: emptyList()
                 trySend(rows)
@@ -186,7 +193,8 @@ object FirestoreChat {
             "text" to text,
             "type" to kind,
             "timestamp" to now,
-            "read" to false
+            "read" to false,
+            "delivered" to false
         )
         imageUrl?.let { data["imageUrl"] = it }
         fileUrl?.let { data["fileUrl"] = it }
@@ -235,6 +243,30 @@ object FirestoreChat {
         batch.commit().await()
     }
 
+    /** Flips the chat back to "unread" so it shows a badge, WhatsApp-style. */
+    suspend fun markUnread(chatId: String) {
+        val uid = myUid()
+        if (uid.isBlank()) return
+        db.collection("chats").document(chatId).update("unread_$uid", 1).await()
+    }
+
+    /**
+     * The recipient's device received these messages: flip them from single to double grey tick.
+     * Only flicks messages the current user did not send.
+     */
+    suspend fun markDelivered(chatId: String) {
+        val uid = myUid()
+        val undelivered = db.collection("chats").document(chatId).collection("messages")
+            .whereEqualTo("delivered", false).get().await()
+        val batch = db.batch()
+        var dirty = false
+        undelivered.documents.filter { it.getString("senderId") != uid }.forEach {
+            batch.update(it.reference, "delivered", true)
+            dirty = true
+        }
+        if (dirty) batch.commit().await()
+    }
+
     /** Delete expired (self-destruct) docs; returns surviving messages. */
     suspend fun purgeExpired(chatId: String) {
         val now = Timestamp.now()
@@ -271,5 +303,29 @@ object FirestoreChat {
     suspend fun editMessage(chatId: String, messageId: String, text: String) {
         db.collection("chats").document(chatId).collection("messages").document(messageId)
             .update(mapOf("text" to text, "edited" to true)).await()
+    }
+
+    /**
+     * Adds or removes the current user's emoji reaction. Stored as
+     * `reactions.<emoji> = [uid, ...]` so the website can read the same shape.
+     */
+    suspend fun react(chatId: String, messageId: String, emoji: String, add: Boolean) {
+        val uid = myUid()
+        if (uid.isBlank() || emoji.isBlank()) return
+        val ref = db.collection("chats").document(chatId).collection("messages").document(messageId)
+        val value = if (add) FieldValue.arrayUnion(uid) else FieldValue.arrayRemove(uid)
+        ref.update("reactions.$emoji", value).await()
+    }
+
+    /** Safely reads the nested `reactions` field into a clean Map<emoji, List<uid>>. */
+    private fun parseReactions(raw: Any?): Map<String, List<String>> {
+        val map = raw as? Map<*, *> ?: return emptyMap()
+        val out = LinkedHashMap<String, List<String>>()
+        map.forEach { (k, v) ->
+            val emoji = k as? String ?: return@forEach
+            val uids = (v as? List<*>)?.mapNotNull { it as? String }.orEmpty()
+            if (uids.isNotEmpty()) out[emoji] = uids
+        }
+        return out
     }
 }

@@ -229,8 +229,10 @@ fun NewChatScreen(
                 )
 
                 else -> LazyColumn(
-                    Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 96.dp)
+                    // weight(1f) keeps the list inside the remaining space; fillMaxSize here
+                    // swallowed the whole column and pushed the Create button off screen.
+                    Modifier.weight(1f),
+                    contentPadding = PaddingValues(bottom = 24.dp)
                 ) {
                     items(users, key = { it.id }) { user ->
                         val checked = selected.contains(user.id)

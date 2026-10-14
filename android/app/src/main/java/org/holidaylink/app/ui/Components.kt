@@ -12,6 +12,9 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -31,6 +34,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Refresh
@@ -56,6 +60,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -73,6 +79,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.launch
@@ -209,6 +217,113 @@ private fun decodeAvatar(context: Context, source: String): android.graphics.Bit
         }
     }
 }.getOrNull()
+
+// ---------------------------------------------------------------- photo viewer
+
+/** Larger cache for full-screen previews, separate from the tiny avatar cache. */
+private val photoViewerCache = android.util.LruCache<String, android.graphics.Bitmap>(16)
+
+/** Loads an image at (near) full resolution from a URL or a content/file URI. */
+private fun loadFullBitmap(context: Context, source: String): android.graphics.Bitmap? = runCatching {
+    if (source.startsWith("http")) {
+        java.net.URL(source).openStream().use { BitmapFactory.decodeStream(it) }
+    } else {
+        context.contentResolver.openInputStream(Uri.parse(source))?.use { BitmapFactory.decodeStream(it) }
+    }
+}.getOrNull()
+
+/**
+ * WhatsApp-style media viewer: black full-screen canvas, tap to close, double-tap and
+ * pinch to zoom, drag to pan. Used for avatars, status and in-chat photos.
+ */
+@Composable
+fun PhotoViewer(url: String?, title: String = "", onDismiss: () -> Unit) {
+    val source = url?.takeIf { it.isNotBlank() } ?: return
+    val context = LocalContext.current
+    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, source) {
+        value = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            photoViewerCache.get(source)
+                ?: loadFullBitmap(context, source)?.also { photoViewerCache.put(source, it) }
+        }
+    }
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        scale = (scale * zoomChange).coerceIn(1f, 8f)
+        offset = if (scale > 1f) offset + panChange else Offset.Zero
+    }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = { onDismiss() },
+                        onDoubleTap = {
+                            scale = if (scale > 1f) 1f else 2.5f
+                            offset = Offset.Zero
+                        }
+                    )
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            val image = bitmap
+            if (image != null) {
+                Image(
+                    bitmap = image.asImageBitmap(),
+                    contentDescription = title,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = scale,
+                            scaleY = scale,
+                            translationX = offset.x,
+                            translationY = offset.y
+                        )
+                        .transformable(transformState)
+                )
+            } else {
+                CircularProgressIndicator(color = Color.White)
+            }
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
+            ) { Icon(Icons.Default.Close, "Close", tint = Color.White) }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- chat wallpaper
+
+/** Draws the user's chat wallpaper (or a themed base) behind the message list. */
+@Composable
+fun ChatWallpaper(uri: String?, solid: Boolean, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val scheme = MaterialTheme.colorScheme
+    val source = uri?.takeIf { it.isNotBlank() }
+    if (source == null || solid) {
+        Box(modifier.background(scheme.surfaceContainerLowest))
+        return
+    }
+    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, source) {
+        value = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            photoViewerCache.get(source) ?: loadFullBitmap(context, source)?.also { photoViewerCache.put(source, it) }
+        }
+    }
+    val image = bitmap
+    if (image != null) {
+        Image(
+            bitmap = image.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = modifier
+        )
+    } else {
+        Box(modifier.background(scheme.surfaceContainerLowest))
+    }
+}
 
 // ---------------------------------------------------------------- states
 

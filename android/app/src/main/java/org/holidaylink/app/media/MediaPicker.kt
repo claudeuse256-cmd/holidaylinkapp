@@ -110,17 +110,51 @@ object MediaPicker {
             BitmapFactory.decodeStream(it, null, options)
         } ?: return null
 
-        val longest = maxOf(bitmap.width, bitmap.height)
-        if (longest <= maxDimension) return bitmap
+        // Phone cameras and WhatsApp images store rotation in EXIF; without applying it the
+        // re-encoded JPEG (which drops EXIF) comes out sideways/flipped. Rotate it into pixels.
+        val upright = applyExifOrientation(resolver.openInputStream(uri), bitmap)
+
+        val longest = maxOf(upright.width, upright.height)
+        if (longest <= maxDimension) return upright
 
         val ratio = maxDimension.toFloat() / longest
         val scaled = Bitmap.createScaledBitmap(
-            bitmap,
-            (bitmap.width * ratio).toInt().coerceAtLeast(1),
-            (bitmap.height * ratio).toInt().coerceAtLeast(1),
+            upright,
+            (upright.width * ratio).toInt().coerceAtLeast(1),
+            (upright.height * ratio).toInt().coerceAtLeast(1),
             true
         )
-        if (scaled != bitmap) bitmap.recycle()
+        if (scaled != upright) upright.recycle()
         return scaled
+    }
+
+    /** Bakes the EXIF orientation tag into the bitmap so re-encoded JPEGs display upright. */
+    private fun applyExifOrientation(stream: java.io.InputStream?, bitmap: Bitmap): Bitmap {
+        if (stream == null) return bitmap
+        val orientation = runCatching {
+            stream.use {
+                android.media.ExifInterface(it).getAttributeInt(
+                    android.media.ExifInterface.TAG_ORIENTATION,
+                    android.media.ExifInterface.ORIENTATION_NORMAL
+                )
+            }
+        }.getOrDefault(android.media.ExifInterface.ORIENTATION_NORMAL)
+
+        val matrix = android.graphics.Matrix()
+        when (orientation) {
+            android.media.ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            android.media.ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            android.media.ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            android.media.ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            android.media.ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            android.media.ExifInterface.ORIENTATION_TRANSPOSE -> { matrix.postRotate(90f); matrix.postScale(-1f, 1f) }
+            android.media.ExifInterface.ORIENTATION_TRANSVERSE -> { matrix.postRotate(270f); matrix.postScale(-1f, 1f) }
+            else -> return bitmap
+        }
+        return runCatching {
+            val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotated != bitmap) bitmap.recycle()
+            rotated
+        }.getOrDefault(bitmap)
     }
 }

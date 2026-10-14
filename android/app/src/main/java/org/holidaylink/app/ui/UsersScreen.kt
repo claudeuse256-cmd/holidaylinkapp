@@ -70,11 +70,11 @@ fun UsersScreen(
 
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
-    var users by remember { mutableStateOf<List<User>>(emptyList()) }
+    var users by remember { mutableStateOf(runCatching { api.readUsersCache() }.getOrDefault(emptyList())) }
     var contactIds by remember { mutableStateOf(emptySet<String>()) }
     var friendIds by remember { mutableStateOf(emptySet<String>()) }
     var mutualCount by remember { mutableStateOf(emptyMap<String, Int>()) }
-    var loading by remember { mutableStateOf(true) }
+    var loading by remember { mutableStateOf(users.isEmpty()) }
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableStateOf(0) }
     var filter by remember { mutableStateOf("All") }

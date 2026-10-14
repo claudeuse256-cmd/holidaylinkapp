@@ -49,6 +49,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.AppNotification
+import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
 
 /**
@@ -64,8 +65,8 @@ fun NotificationListScreen(
     onOpenChat: ((String) -> Unit)? = null,
     onOpenAi: (() -> Unit)? = null
 ) {
-    var items by remember { mutableStateOf<List<AppNotification>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    var items by remember { mutableStateOf(DeviceCache.memory<List<AppNotification>>("notifications") ?: emptyList()) }
+    var loading by remember { mutableStateOf(items.isEmpty()) }
     var refreshing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
@@ -90,12 +91,12 @@ fun NotificationListScreen(
         if (!conversationId.isNullOrBlank() && onOpenChat != null) onOpenChat(conversationId)
     }
 
-    suspend fun loadNotifications(): List<AppNotification> {
+    suspend fun loadNotifications(source: com.google.firebase.firestore.Source): List<AppNotification> {
         val uid = FirebaseBackend.uid.orEmpty()
         val snap = FirebaseBackend.db.collection("notifications")
             .whereEqualTo("userId", uid)
             .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-            .limit(100).get().await()
+            .limit(100).get(source).await()
         return snap.documents.map { d ->
             val data = d.get("data")
             AppNotification(
@@ -119,15 +120,16 @@ fun NotificationListScreen(
 
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
-        try {
-            items = loadNotifications()
+        val fresh = DeviceCache.load("notifications", { source -> loadNotifications(source) }) { data ->
+            items = data
             error = ""
-        } catch (e: Exception) {
-            error = "We couldn't load notifications. Check your internet."
-        } finally {
             loading = false
-            refreshing = false
         }
+        if (fresh == null && items.isEmpty()) {
+            error = "We couldn't load notifications. Check your internet."
+        }
+        loading = false
+        refreshing = false
     }
 
     Scaffold(
