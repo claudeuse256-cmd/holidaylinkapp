@@ -10,11 +10,11 @@ website stay in sync in real time. Admin pages stay on the website.
 Android app ──► Firestore (chats, users, statuses, posters, quizzes,
                  papers, events, products, storeOrders, …)
             ──► imgbb (all images, same key as the website)
-            ──► Render service (Infobip SMS codes + notification pushes)
+            ──► Render service (Yoola SMS codes + notification pushes)
 ```
 
 * `android/` — Kotlin + Jetpack Compose app (`org.holidaylink.app`).
-* `server/` — tiny OTP service only: sends Infobip SMS codes, stores hashes
+* `server/` — tiny OTP service only: sends Yoola SMS codes, stores hashes
   in Firestore `otpCodes/{phone}` (5-minute expiry), returns Firebase custom
   tokens, and relays FCM pushes (`POST /push/send`) so a closed app still rings.
   No chat, message, or user content lives here. No Postgres.
@@ -27,7 +27,7 @@ There is no SQL anywhere: `database/` was deleted with the Postgres removal.
 
 ## Auth
 
-Phone number → Infobip SMS code (Render `/otp/request` + `/otp/verify`) →
+Phone number → Yoola SMS code (Render `/otp/request` + `/otp/verify`) →
 Firebase custom-token sign-in → Firestore `users/{uid}` profile (same doc
 as website signup). 2FA is the website's device-approval flow
 (`twoFactorRequests` + `sessions`).
@@ -51,5 +51,5 @@ the website config).
 
 ## Backend env (Render, OTP service)
 
-`FIREBASE_SERVICE_ACCOUNT_JSON`, `INFOBIP_BASE_URL`, `INFOBIP_API_KEY`,
-`INFOBIP_FROM`, `DEFAULT_COUNTRY_CODE=256`, `OTP_COOLDOWN_SECONDS=45`.
+`FIREBASE_SERVICE_ACCOUNT_JSON`, `YOOLA_API_KEY`, `YOOLA_SENDER`,
+`DEFAULT_COUNTRY_CODE=256`, `OTP_COOLDOWN_SECONDS=45`.

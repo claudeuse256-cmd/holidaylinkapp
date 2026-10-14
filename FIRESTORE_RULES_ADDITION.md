@@ -49,7 +49,7 @@ match /aiCommands/{doc}   { allow read: if request.auth != null; allow write: if
 
 Render OTP service needs only:
 - FIREBASE_SERVICE_ACCOUNT_JSON (service account, Project settings > Service accounts)
-- INFOBIP_BASE_URL + INFOBIP_API_KEY + INFOBIP_FROM
+- YOOLA_API_KEY + YOOLA_SENDER (sender ID is optional, defaults to YoolaSMS)
 - DEFAULT_COUNTRY_CODE=256, OTP_COOLDOWN_SECONDS=45
 
 The same service also serves `POST /push/send` (FCM relay for notifications while a

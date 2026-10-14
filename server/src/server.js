@@ -9,7 +9,7 @@ import admin from 'firebase-admin';
  *
  * The app database is Firebase/Firestore (same as holidaylink.org). This tiny
  * service exists only because the website has no SMS sender: it generates a
- * 6-digit code, sends it through Infobip, stores only its SHA-256 hash in
+ * 6-digit code, sends it through Yoola SMS, stores only its SHA-256 hash in
  * Firestore (`otpCodes/{phone}`, 5-minute expiry), and on verify returns a
  * Firebase custom token so the app signs in with Firebase Auth.
  *
@@ -78,25 +78,36 @@ setInterval(() => {
   }
 }, 60_000).unref();
 
-async function infobip(path, options = {}) {
-  const base = String(process.env.INFOBIP_BASE_URL || '').replace(/\/+$/, '');
-  const key = process.env.INFOBIP_API_KEY;
-  if (!base || !key) throw new Error('Infobip is not configured on the server');
-  const response = await fetch(`${base}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `App ${key}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
-    }
+// ---------------------------------------------------------------- SMS (Yoola)
+
+// Yoola SMS (yoolasms.com) REST API v1. The key lives only on this server,
+// never in the app. Sender IDs are alphanumeric (letters and numbers only).
+const YOOLA_BASE_URL = String(process.env.YOOLA_BASE_URL || 'https://yoolasms.com/api/v1').replace(/\/+$/, '');
+const YOOLA_API_KEY = String(
+  process.env.YOOLA_API_KEY || process.env.YOOLA_SMS_API_KEY || process.env.YOOLASMS_API_KEY || ''
+).trim();
+const YOOLA_SENDER = String(
+  process.env.YOOLA_SENDER || process.env.YOOLA_SENDER_ID || process.env.YOOLA_FROM || 'YoolaSMS'
+).trim();
+
+function smsConfigured() {
+  return Boolean(YOOLA_API_KEY);
+}
+
+async function yoolaSms(path, payload) {
+  if (!YOOLA_API_KEY) throw new Error('Yoola SMS is not configured on the server');
+  const response = await fetch(`${YOOLA_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ ...payload, api_key: YOOLA_API_KEY })
   });
   const text = await response.text();
   let body = {};
   try { body = JSON.parse(text); } catch { body = { raw: text }; }
-  if (!response.ok) {
-    const e = new Error(body?.requestError?.serviceException?.text || body?.message || 'Infobip request failed');
-    e.status = response.status;
+  const status = String(body?.status || '').toLowerCase();
+  if (!response.ok || body?.success === false || status === 'error' || status === 'failed') {
+    const e = new Error(body?.message || body?.error || `Yoola request failed (${response.status})`);
+    e.status = response.ok ? 502 : response.status;
     e.body = body;
     throw e;
   }
@@ -109,7 +120,8 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'holidaylink-otp',
-    smsProviderConfigured: Boolean(process.env.INFOBIP_BASE_URL && process.env.INFOBIP_API_KEY),
+    smsProvider: 'yoola',
+    smsProviderConfigured: smsConfigured(),
     firebaseConfigured: Boolean(serviceAccount),
     pushConfigured: Boolean(serviceAccount),
     defaultCountryCode: DEFAULT_COUNTRY_CODE,
@@ -118,7 +130,7 @@ app.get('/health', (_req, res) => {
 });
 
 /**
- * Generate a code, SMS it through Infobip, store only its hash in Firebase.
+ * Generate a code, SMS it through Yoola SMS, store only its hash in Firebase.
  * The number may then log in for the next 5 minutes after verifying.
  */
 app.post('/otp/request', async (req, res) => {
@@ -141,15 +153,10 @@ app.post('/otp/request', async (req, res) => {
   const code = String(crypto.randomInt(100000, 1000000));
   let sent = null;
   try {
-    sent = await infobip('/sms/3/messages', {
-      method: 'POST',
-      body: JSON.stringify({
-        messages: [{
-          sender: (process.env.INFOBIP_FROM || 'HolidayLink').trim(),
-          destinations: [{ to: phone.replace('+', '') }],
-          content: { text: `Your HolidayLink verification code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes.` }
-        }]
-      })
+    sent = await yoolaSms('/send', {
+      phone: phone.replace('+', ''),
+      sender: YOOLA_SENDER,
+      message: `Your HolidayLink verification code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes.`
     });
   } catch (err) {
     console.error('[otp/request] sms provider error:', err.status || '', err.message);
@@ -170,7 +177,7 @@ app.post('/otp/request', async (req, res) => {
     phone,
     expiresInSeconds: OTP_TTL_MINUTES * 60,
     resendAfterSeconds: OTP_COOLDOWN_SECONDS,
-    messageId: sent?.messages?.[0]?.messageId || null
+    messageId: sent?.message_id || sent?.messageId || sent?.id || null
   });
 });
 

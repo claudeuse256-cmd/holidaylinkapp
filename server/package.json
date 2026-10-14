@@ -2,7 +2,7 @@
   "name": "holidaylink-otp",
   "version": "3.0.0",
   "type": "module",
-  "description": "HolidayLink OTP service: Infobip SMS codes verified against Firebase, returns Firebase custom tokens.",
+  "description": "HolidayLink OTP service: Yoola SMS codes verified against Firebase, returns Firebase custom tokens.",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

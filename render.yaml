@@ -15,9 +15,7 @@ services:
         value: "256"
       - key: OTP_COOLDOWN_SECONDS
         value: "45"
-      - key: INFOBIP_BASE_URL
+      - key: YOOLA_API_KEY
         sync: false
-      - key: INFOBIP_API_KEY
+      - key: YOOLA_SENDER
         sync: false
-      - key: INFOBIP_FROM
-        value: "HolidayLink"
