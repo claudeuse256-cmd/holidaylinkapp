@@ -3,7 +3,8 @@ services:
     name: holidaylink-otp
     runtime: node
     plan: free
-    buildCommand: cd server && npm install
+    autoDeploy: true
+    buildCommand: cd server && npm install --omit=dev --no-audit --no-fund
     startCommand: cd server && npm start
     healthCheckPath: /health
     envVars:
