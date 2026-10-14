@@ -37,15 +37,65 @@ match /aiCommands/{doc}   { allow read: if request.auth != null; allow write: if
    rules check `participants[]` — confirm deployed rules match the website's
    actual field or update them; otherwise both site and app writes fail.
 3. `notifications` create-if-signed-in must stay (AI send_message + admin
-   broadcast depend on it).
+   broadcast depend on it). The app also needs to **read/update its own rows**
+   (`resource.data.userId == request.auth.uid`) so the Notifications screen and
+   mark-as-read work.
 4. `sessions` / `twoFactorRequests` owner-`userId` rules must stay (app 2FA
    device approval depends on them).
+5. The owner must be able to `update` their own `users/{uid}` row, including
+   `fcmTokens`, or device push tokens are never stored and background
+   notifications cannot be delivered.
 ```
 
 Render OTP service needs only:
 - FIREBASE_SERVICE_ACCOUNT_JSON (service account, Project settings > Service accounts)
 - INFOBIP_BASE_URL + INFOBIP_API_KEY + INFOBIP_FROM
 - DEFAULT_COUNTRY_CODE=256, OTP_COOLDOWN_SECONDS=45
+
+The same service also serves `POST /push/send` (FCM relay for notifications while a
+phone's app is closed). It needs **no extra env vars** — just a redeploy so the new
+route exists. See `PUSH_NOTIFICATIONS.md` for the full end-to-end setup, the request
+contract and how to test it.
+
+## Group management fields (new in the Android app)
+
+The in-app group profile writes extra fields on `chats/{id}`:
+
+```
+members: [uid, ...]      // full membership (falls back to `users` when absent)
+admins:  [uid, ...]      // creator is always treated as an admin
+createdBy: uid
+privacy: "public" | "private"
+groupPic / groupPhoto: url
+settings: { sendMessagesAdminsOnly, editInfoAdminsOnly, approveNewMembers }
+```
+
+Rules must let a group participant update these, otherwise:
+- "Only admins can send messages" / "edit info" / "approve new members" toggles
+  and public/private visibility will silently fail.
+- `privacy == "public"` is queried by single equality filter (no index needed),
+  so anyone signed in must be able to read a public group row.
+
+## No composite indexes required
+
+Every list query in the app now uses at most ONE equality filter followed by a
+client-side sort. A `whereEqualTo(...) + orderBy(...)` pair requires a composite
+index and fails silently when the index is missing (that was the cause of the
+call-history error, the empty notifications list and incoming calls not ringing).
+Do not add `orderBy` back next to a filter.
+
+## In-app self-update feed
+
+Settings ▸ App updates checks, in order:
+
+1. `https://api.github.com/repos/claudeuse256-cmd/holidaylinkapp/releases/latest`
+   — publish a GitHub **Release** with an `.apk` asset. Use the `versionCode`
+   as the tag (e.g. `5`) or add `target_code` to the release body JSON.
+2. `https://holidaylink.org/app/latest.json` — plain JSON fallback:
+   `{ "versionName": "2.3.0", "code": 5, "url": "https://.../app.apk", "notes": "..." }`
+
+If neither reports a `code` greater than the installed build's `versionCode`,
+the app reports "You're on the latest version".
 
 ## Firebase Storage rules (chat voice/video/files + any Storage use)
 

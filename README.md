@@ -10,16 +10,18 @@ website stay in sync in real time. Admin pages stay on the website.
 Android app ──► Firestore (chats, users, statuses, posters, quizzes,
                  papers, events, products, storeOrders, …)
             ──► imgbb (all images, same key as the website)
-            ──► Render OTP service (Infobip SMS codes only)
+            ──► Render service (Infobip SMS codes + notification pushes)
 ```
 
 * `android/` — Kotlin + Jetpack Compose app (`org.holidaylink.app`).
 * `server/` — tiny OTP service only: sends Infobip SMS codes, stores hashes
   in Firestore `otpCodes/{phone}` (5-minute expiry), returns Firebase custom
-  tokens. No chat, message, or user content lives here. No Postgres.
+  tokens, and relays FCM pushes (`POST /push/send`) so a closed app still rings.
+  No chat, message, or user content lives here. No Postgres.
 * `render.yaml` — deploys the OTP service (`npm install`, `npm start`).
 * `FIRESTORE_RULES_ADDITION.md` — Firestore + Storage rules to merge into
   the website's deployed rules.
+* `PUSH_NOTIFICATIONS.md` — how notifications work end-to-end and what to set up.
 
 There is no SQL anywhere: `database/` was deleted with the Postgres removal.
 

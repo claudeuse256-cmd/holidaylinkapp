@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Newspaper
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Quiz
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.ShoppingBag
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -629,6 +630,8 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
     var error by remember { mutableStateOf("") }
     var tab by remember { mutableStateOf("papers") }
     var cat by remember { mutableStateOf("all") }
+    var search by remember { mutableStateOf("") }
+    var viewing by remember { mutableStateOf<Triple<String, String, String>?>(null) }
 
     LaunchedEffect(tab) {
         loading = papers.isEmpty()
@@ -647,16 +650,6 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
         }
     }
 
-    fun openUrl(url: String) {
-        if (url.isBlank()) return
-        runCatching {
-            context.startActivity(
-                android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        }
-    }
-
     fun shareDoc(id: String, title: String) {
         runCatching {
             val link = "https://holidaylink.org/${if (tab == "papers") "papers" else "papers"}.html?${if (tab == "papers") "paper" else "guide"}=$id"
@@ -668,6 +661,17 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
                 ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }
+    }
+
+    val openViewer = viewing
+    if (openViewer != null) {
+        PaperViewerScreen(
+            url = openViewer.first,
+            title = openViewer.second,
+            fileType = openViewer.third,
+            onBack = { viewing = null }
+        )
+        return
     }
 
     Scaffold(
@@ -682,6 +686,14 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
                 FilterChip(selected = tab == "papers", onClick = { tab = "papers"; papers = emptyList() }, label = { Text("Papers") })
                 FilterChip(selected = tab == "guides", onClick = { tab = "guides"; papers = emptyList() }, label = { Text("Guides") })
             }
+            OutlinedTextField(
+                value = search,
+                onValueChange = { search = it },
+                singleLine = true,
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search") },
+                placeholder = { Text(if (tab == "papers") "Search past papers" else "Search guides") },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+            )
             if (tab == "papers") {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf("all" to "All", "uce" to "UCE", "uace" to "UACE", "mock" to "Mock").forEach { (v, l) ->
@@ -694,9 +706,17 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
                 error.isNotBlank() && papers.isEmpty() -> ErrorState(error)
                 papers.isEmpty() -> EmptyState(icon = Icons.Default.Description, title = "Nothing here yet", subtitle = "New uploads appear here.")
                 else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    val q = search.trim().lowercase()
                     val shown = papers.indices.filter { i ->
-                        tab != "papers" || cat == "all" ||
-                            ((papers[i]["category"] as? String)?.lowercase() == cat)
+                        val p = papers[i]
+                        val catOk = tab != "papers" || cat == "all" ||
+                            ((p["category"] as? String)?.lowercase() == cat)
+                        val searchOk = q.isBlank() || listOfNotNull(
+                            p["title"] as? String, p["subject"] as? String,
+                            p["class"] as? String, p["board"] as? String,
+                            p["category"] as? String, (p["year"] as? Number)?.toString()
+                        ).any { it.lowercase().contains(q) }
+                        catOk && searchOk
                     }
                     if (shown.isEmpty()) item { Text("Nothing in this category yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     items(shown, key = { ids[it] }) { i ->
@@ -723,8 +743,25 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
                                 if (fileType.isNotBlank()) Text(fileType.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                                 Spacer(Modifier.height(6.dp))
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    OutlinedButton(onClick = { openUrl(url) }, enabled = url.isNotBlank()) { Text("View") }
-                                    OutlinedButton(onClick = { shareDoc(ids[i], title) }) { Text("Share") }
+                                    OutlinedButton(
+                                        onClick = { viewing = Triple(url, title, fileType) },
+                                        enabled = url.isNotBlank(),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                                    ) { Text("View") }
+                                    OutlinedButton(
+                                        onClick = {
+                                            if (url.isNotBlank()) {
+                                                val ok = org.holidaylink.app.media.MediaDownload.save(context, url, title)
+                                                if (!ok) android.widget.Toast.makeText(context, "Couldn't start the download.", android.widget.Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        enabled = url.isNotBlank(),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                                    ) { Text("Download") }
+                                    OutlinedButton(
+                                        onClick = { shareDoc(ids[i], title) },
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                                    ) { Text("Share") }
                                 }
                             }
                         }
@@ -987,11 +1024,12 @@ private fun MyTickets(uid: String) {
         runCatching {
             val snap = FirebaseBackend.db.collection("bookings")
                 .whereEqualTo("userId", uid).whereEqualTo("type", "event")
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
                 .limit(50).get().await()
-            ids = snap.documents.map { it.id }
+            val docs = snap.documents
+                .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+            ids = docs.map { it.id }
             @Suppress("UNCHECKED_CAST")
-            tickets = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
+            tickets = docs.map { it.data.orEmpty() as Map<String, Any?> }
         }
     }
     if (tickets.isEmpty()) {
@@ -1054,12 +1092,14 @@ fun WalletScreen(api: Api, onBack: () -> Unit) {
             balance = user.getLong("balance") ?: 0L
             @Suppress("UNCHECKED_CAST")
             withdrawals = FirebaseBackend.db.collection("withdrawals").whereEqualTo("userId", uid)
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(50).get().await().documents.map { it.data.orEmpty() as Map<String, Any?> }
+                .limit(50).get().await().documents
+                .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+                .map { it.data.orEmpty() as Map<String, Any?> }
             @Suppress("UNCHECKED_CAST")
             transactions = FirebaseBackend.db.collection("transactions").whereEqualTo("userId", uid)
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(50).get().await().documents.map { it.data.orEmpty() as Map<String, Any?> }
+                .limit(50).get().await().documents
+                .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+                .map { it.data.orEmpty() as Map<String, Any?> }
         } catch (e: Exception) {
             snackbar.showSnackbar("Couldn't load wallet. Check your internet.")
         } finally {

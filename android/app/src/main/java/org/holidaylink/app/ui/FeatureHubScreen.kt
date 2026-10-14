@@ -218,10 +218,12 @@ fun StoreScreen(api: Api?, onBack: () -> Unit) {
             }
         val regOrders = FirebaseBackend.db.collection("storeOrders")
             .whereEqualTo("userId", uid)
-            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
             .limit(50).addSnapshotListener { snap, _ ->
                 @Suppress("UNCHECKED_CAST")
-                orders = snap?.documents?.map { it.data.orEmpty() as Map<String, Any?> }.orEmpty()
+                orders = snap?.documents
+                    ?.sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+                    ?.map { it.data.orEmpty() as Map<String, Any?> }
+                    .orEmpty()
             }
         onDispose { regProducts.remove(); regOrders.remove() }
     }

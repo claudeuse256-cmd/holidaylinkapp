@@ -27,12 +27,15 @@ class HolidayMessagingService : FirebaseMessagingService() {
         val type = data["type"] ?: "message"
         val title = data["title"] ?: message.notification?.title ?: "HolidayLink"
         val body = data["body"] ?: message.notification?.body ?: ""
-        val target = data["chatId"] ?: data["callId"]
-        val id = (data["id"] ?: target ?: body.take(24)).hashCode()
+        // Only a conversation can be reopened from the tray. A call has no chat of its
+        // own, so tapping its alert just brings the app forward — if the call is still
+        // ringing, the incoming-call screen is already waiting there.
+        val chatTarget = data["chatId"]?.takeIf { it.isNotBlank() }
+        val id = (data["id"] ?: chatTarget ?: data["callId"] ?: body.take(24)).hashCode()
         if (type == "call") {
-            Notifier.call(applicationContext, id, title, body, target)
+            Notifier.call(applicationContext, id, title, body, chatTarget)
         } else {
-            Notifier.message(applicationContext, id, title, body, target)
+            Notifier.message(applicationContext, id, title, body, chatTarget)
         }
     }
 }

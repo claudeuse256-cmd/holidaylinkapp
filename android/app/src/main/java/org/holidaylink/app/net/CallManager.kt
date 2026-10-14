@@ -40,6 +40,11 @@ class CallManager(private val context: Context, private val api: Api) {
     private var answerApplied = false
     private var accepted = false
     private val seenCandidates = mutableSetOf<String>()
+    /** Call ids already rung, so a re-snapshot never rings the same call twice. */
+    private val ringingCalls = mutableSetOf<String>()
+    /** ICE that arrived before the remote description was set; applied once it is. */
+    private val pendingCandidates = mutableListOf<IceCandidate>()
+    private var remoteSet = false
 
     fun connect() {
         if (factory != null) return
@@ -48,14 +53,21 @@ class CallManager(private val context: Context, private val api: Api) {
         )
         factory = PeerConnectionFactory.builder().createPeerConnectionFactory()
         val uid = FirebaseBackend.uid ?: return
-        // Ringing calls addressed to this device.
+        // Calls addressed to this device. Only one equality filter: pairing it with
+        // `status` needs a composite index that may not be deployed, which is exactly
+        // why incoming calls never rang. Status/age are filtered in code instead.
         incomingReg?.remove()
         incomingReg = db.collection("calls")
             .whereEqualTo("calleeId", uid)
-            .whereEqualTo("status", "ringing")
             .addSnapshotListener { snap, _ ->
-                snap?.documentChanges?.filter { it.type.name == "ADDED" }?.forEach { change ->
+                if (snap == null) return@addSnapshotListener
+                snap.documentChanges.filter { it.type.name == "ADDED" }.forEach { change ->
                     val d = change.document
+                    if (d.getString("status") != "ringing") return@forEach
+                    if (!ringingCalls.add(d.id)) return@forEach
+                    // Ignore stale rings (e.g. replayed from the on-disk cache on cold start).
+                    val created = d.getTimestamp("createdAt") ?: return@forEach
+                    if (System.currentTimeMillis() / 1000 - created.seconds > 60) return@forEach
                     val callerId = d.getString("callerId").orEmpty()
                     scope.launch {
                         val caller = runCatching { FirestoreChat.resolvePeer(callerId) }.getOrNull()
@@ -99,6 +111,8 @@ class CallManager(private val context: Context, private val api: Api) {
         currentCallId = ref.id
         createPeer(offer = true)
         watchCall(ref.id, caller = true)
+        // Ring the callee's phone even when their app is closed.
+        runCatching { PushNotify.call(ref.id) }
         // WhatsApp-like: no answer after ~45s is a missed call, not an endless ring.
         scope.launch {
             kotlinx.coroutines.delay(45_000)
@@ -120,21 +134,37 @@ class CallManager(private val context: Context, private val api: Api) {
         isCaller = false
         accepted = true
         scope.launch {
-            val snap = db.collection("calls").document(callId).get().await()
-            val offer = snap.get("offer") as? Map<String, String>
+            var sdp = ""
+            // The caller writes the SDP a beat after the ring doc appears, so retry briefly:
+            // answering fast used to hang because the offer was not there yet.
+            for (attempt in 0 until 12) {
+                val snap = runCatching { db.collection("calls").document(callId).get().await() }.getOrNull()
+                @Suppress("UNCHECKED_CAST")
+                val offer = snap?.get("offer") as? Map<String, String>
+                sdp = offer?.get("sdp").orEmpty()
+                if (sdp.isNotBlank()) break
+                kotlinx.coroutines.delay(250)
+            }
             createPeer(offer = false)
-            val sdp = offer?.get("sdp").orEmpty()
             if (sdp.isNotBlank()) {
                 pc?.setRemoteDescription(
                     object : SdpObserverBase() {
                         override fun onSetSuccess() {
+                            flushPendingCandidates()
                             pc?.createAnswer(object : SdpObserverBase() {
                                 override fun onCreateSuccess(d: SessionDescription) {
                                     pc?.setLocalDescription(this, d)
                                     scope.launch {
-                                        db.collection("calls").document(callId)
-                                            .update(mapOf("answer" to mapOf("sdp" to d.description), "status" to "accepted"))
-                                            .await()
+                                        runCatching {
+                                            db.collection("calls").document(callId)
+                                                .update(
+                                                    mapOf(
+                                                        "answer" to mapOf("sdp" to d.description),
+                                                        "status" to "accepted"
+                                                    )
+                                                )
+                                                .await()
+                                        }
                                     }
                                 }
                             }, MediaConstraints())
@@ -143,7 +173,7 @@ class CallManager(private val context: Context, private val api: Api) {
                     SessionDescription(SessionDescription.Type.OFFER, sdp)
                 )
             } else {
-                db.collection("calls").document(callId).update("status", "accepted").await()
+                runCatching { db.collection("calls").document(callId).update("status", "accepted").await() }
             }
         }
         watchCall(callId, caller = false)
@@ -200,7 +230,17 @@ class CallManager(private val context: Context, private val api: Api) {
         candReg?.remove(); candReg = null
         currentCallId = null
         answerApplied = false
+        remoteSet = false
+        pendingCandidates.clear()
         seenCandidates.clear()
+    }
+
+    /** Remote description is in place: apply any ICE that arrived early. */
+    private fun flushPendingCandidates() {
+        remoteSet = true
+        val p = pc ?: return
+        pendingCandidates.toList().forEach { runCatching { p.addIceCandidate(it) } }
+        pendingCandidates.clear()
     }
 
     private fun watchCall(callId: String, caller: Boolean) {
@@ -218,7 +258,9 @@ class CallManager(private val context: Context, private val api: Api) {
                     if (sdp.isNotBlank()) {
                         answerApplied = true
                         pc?.setRemoteDescription(
-                            SdpObserverBase(),
+                            object : SdpObserverBase() {
+                                override fun onSetSuccess() { flushPendingCandidates() }
+                            },
                             SessionDescription(SessionDescription.Type.ANSWER, sdp)
                         )
                     }
@@ -247,16 +289,21 @@ class CallManager(private val context: Context, private val api: Api) {
         when (data["kind"] as? String) {
             "answer" -> {
                 val sdp = data["sdp"] as? String ?: return
-                p.setRemoteDescription(SdpObserverBase(), SessionDescription(SessionDescription.Type.ANSWER, sdp))
+                p.setRemoteDescription(
+                    object : SdpObserverBase() {
+                        override fun onSetSuccess() { flushPendingCandidates() }
+                    },
+                    SessionDescription(SessionDescription.Type.ANSWER, sdp)
+                )
             }
             "candidate" -> {
-                p.addIceCandidate(
-                    IceCandidate(
-                        data["sdpMid"] as? String,
-                        (data["sdpMLineIndex"] as? Long)?.toInt() ?: 0,
-                        data["candidate"] as? String ?: return
-                    )
+                val cand = IceCandidate(
+                    data["sdpMid"] as? String,
+                    (data["sdpMLineIndex"] as? Long)?.toInt() ?: 0,
+                    data["candidate"] as? String ?: return
                 )
+                // Buffer until the offer/answer is set; adding early silently fails otherwise.
+                if (remoteSet) runCatching { p.addIceCandidate(cand) } else pendingCandidates.add(cand)
             }
         }
     }
@@ -291,12 +338,23 @@ class CallManager(private val context: Context, private val api: Api) {
 
     private fun createPeer(offer: Boolean) {
         val f = factory ?: return
+        remoteSet = false
+        pendingCandidates.clear()
+        // STUN alone fails on many carrier NATs, which looked like "calls never connect".
+        // A public TURN relay is added so audio/video can get through.
         val rtc = PeerConnection.RTCConfiguration(
             listOf(
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
+                PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("turn:openrelay.metered.ca:80")
+                    .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer(),
+                PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443")
+                    .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer()
             )
-        ).apply { sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN }
+        ).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            iceCandidatePoolSize = 2
+        }
         pc = f.createPeerConnection(rtc, object : PeerConnection.Observer {
             override fun onIceCandidate(c: IceCandidate) {
                 sendSignal("candidate", cand = c)

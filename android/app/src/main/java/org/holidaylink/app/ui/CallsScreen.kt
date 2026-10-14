@@ -75,10 +75,14 @@ fun CallsScreen(
         val uid = FirebaseBackend.uid.orEmpty()
         val out = mutableListOf<CallRecord>()
         for (field in listOf("callerId", "calleeId")) {
-            val snap = FirebaseBackend.db.collection("calls")
-                .whereEqualTo(field, uid)
-                .orderBy("createdAt", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(100).get(source).await()
+            // No orderBy here: a whereEqualTo+orderBy pair needs a composite index the
+            // deployed rules may not have, which made the whole history fail to load.
+            // We fetch and sort on the client instead.
+            val snap = runCatching {
+                FirebaseBackend.db.collection("calls")
+                    .whereEqualTo(field, uid)
+                    .limit(200).get(source).await()
+            }.getOrNull() ?: continue
             snap.documents.forEach { d ->
                 val callerId = d.getString("callerId").orEmpty()
                 val calleeId = d.getString("calleeId").orEmpty()

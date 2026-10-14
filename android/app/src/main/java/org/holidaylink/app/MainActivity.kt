@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.AutoAwesome
@@ -134,6 +135,7 @@ import org.holidaylink.app.ui.UserProfileScreen
 import org.holidaylink.app.ui.rememberNotificationPermissionState
 import org.holidaylink.app.ui.theme.HolidayLinkTheme
 import org.holidaylink.app.ui.FeatureHubScreen
+import org.holidaylink.app.ui.GroupInfoScreen
 import org.holidaylink.app.ui.StoreScreen
 import org.holidaylink.app.ui.WebFeatureScreen
 import org.holidaylink.app.ui.HolidayFeature
@@ -193,6 +195,7 @@ private enum class Tab(val title: String) {
 private sealed interface Destination {
     data object Tabs : Destination
     data class Chat(val chat: ChatItem) : Destination
+    data class GroupInfo(val chat: ChatItem) : Destination
     data class PersonProfile(val user: User) : Destination
     data object MyProfile : Destination
     data object NewChat : Destination
@@ -270,6 +273,7 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
         ) {
         AppLockGate {
             var signedIn by remember { mutableStateOf(FirebaseBackend.currentUser != null) }
+            var addingAccount by remember { mutableStateOf(false) }
             var bannedMsg by remember { mutableStateOf<String?>(null) }
             val scope = rememberCoroutineScope()
             val banMsg = bannedMsg
@@ -280,10 +284,15 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
                     bannedMsg = null
                     signedIn = false
                 })
+            } else if (signedIn && addingAccount) {
+                // Adding / switching account: keep the current session until verification
+                // completes, and allow backing out so nobody gets stranded on the login screen.
+                AuthFlow(api, prefs, onCancel = { addingAccount = false }) { addingAccount = false }
             } else if (signedIn) {
                 SignedInApp(
                     api = api,
                     prefs = prefs,
+                    onAddAccount = { addingAccount = true },
                     onLoggedOut = {
                         scope.launch { runCatching { FirebaseBackend.goOffline() } }
                         FirebaseBackend.signOut()
@@ -310,6 +319,7 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
 private fun SignedInApp(
     api: Api,
     prefs: SharedPreferences,
+    onAddAccount: () -> Unit,
     onLoggedOut: () -> Unit,
     onBanned: (String) -> Unit
 ) {
@@ -379,15 +389,18 @@ private fun SignedInApp(
         if (userId.isBlank()) return@DisposableEffect onDispose {}
         val seen = mutableSetOf<String>()
         var primed = false
+        // Query wide with a single equality filter and order client-side: a
+        // `whereEqualTo + orderBy` pair needs a composite index, which would fail silently.
         val reg = FirebaseBackend.db.collection("notifications")
             .whereEqualTo("userId", userId)
-            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-            .limit(20)
-            .addSnapshotListener { snap, _ ->
-                if (snap == null) return@addSnapshotListener
+            .limit(40)
+            .addSnapshotListener { snap, e ->
+                if (snap == null || e != null) return@addSnapshotListener
+                val ordered = snap.documents
+                    .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
                 if (!primed) {
                     // First snapshot is the existing backlog: learn it, don't buzz for it.
-                    snap.documents.forEach { seen.add(it.id) }
+                    ordered.forEach { seen.add(it.id) }
                     primed = true
                     return@addSnapshotListener
                 }
@@ -402,12 +415,13 @@ private fun SignedInApp(
                     if (type == "message") return@forEach
                     val title = d.getString("title") ?: "HolidayLink"
                     val body = d.getString("body") ?: ""
-                    val target = d.getString("chatId") ?: d.getString("conversationId")
-                        ?: d.getString("callId")
+                    // A call alert opens no conversation of its own — passing the callId as a
+                    // chat id would open (and even create) a bogus "direct" chat.
+                    val chatTarget = d.getString("chatId") ?: d.getString("conversationId")
                     if (type == "call") {
-                        Notifier.call(context, d.id.hashCode(), title, body, target)
+                        Notifier.call(context, d.id.hashCode(), title, body, chatTarget)
                     } else {
-                        Notifier.message(context, d.id.hashCode(), title, body, target)
+                        Notifier.message(context, d.id.hashCode(), title, body, chatTarget)
                     }
                 }
             }
@@ -532,9 +546,18 @@ private fun SignedInApp(
             currentUserId = userId,
             onBack = pop,
             onOpenProfile = { push(Destination.PersonProfile(it)) },
+            onOpenGroupInfo = { push(Destination.GroupInfo(it)) },
             onOpenCalls = {
                 stack.add(Destination.Calls)
             }
+        )
+
+        is Destination.GroupInfo -> GroupInfoScreen(
+            chat = current.chat,
+            meId = userId,
+            onBack = pop,
+            onOpenUser = openDirectChat,
+            onLeft = { while (stack.size > 1) stack.removeAt(stack.lastIndex) }
         )
 
         is Destination.PersonProfile -> UserProfileScreen(
@@ -644,21 +667,8 @@ private fun SignedInApp(
             prefs = prefs,
             me = me,
             onBack = pop,
-            onAddAccount = {
-                // Firebase Auth holds one session: adding means signing in again.
-                prefs.edit().remove("token").remove("userId").apply()
-                stack.clear()
-                stack.add(Destination.Tabs)
-                onLoggedOut()
-            },
-            onSwitchAccount = { account ->
-                // Stored Firebase sessions can't be restored silently; sign in again.
-                prefs.edit().remove("token").remove("userId").apply()
-                me = null
-                stack.clear()
-                stack.add(Destination.Tabs)
-                onLoggedOut()
-            },
+            onAddAccount = onAddAccount,
+            onSwitchAccount = { _ -> onAddAccount() },
             onLoggedOut = {
                 prefs.edit().remove("token").remove("userId").apply()
                 stack.clear()
@@ -1208,7 +1218,7 @@ private const val OTP_LENGTH = 6
  * 2FA is the website's device-approval flow (twoFactorRequests + sessions).
  */
 @Composable
-fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
+fun AuthFlow(api: Api, prefs: SharedPreferences, onCancel: (() -> Unit)? = null, onLoggedIn: () -> Unit) {
     val context = LocalContext.current
     var country by remember {
         mutableStateOf(Countries.byIso(prefs.getString("countryIso", Countries.DEFAULT_ISO)))
@@ -1400,6 +1410,20 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onLoggedIn: () -> Unit) {
             .padding(20.dp),
         verticalArrangement = Arrangement.Center
     ) {
+        if (onCancel != null) {
+            androidx.compose.material3.TextButton(
+                onClick = onCancel,
+                modifier = Modifier.align(Alignment.Start)
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back"
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("Back to HolidayLink")
+            }
+            Spacer(Modifier.height(4.dp))
+        }
         Surface(
             Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.large,

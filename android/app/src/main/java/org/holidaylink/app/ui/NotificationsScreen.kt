@@ -93,11 +93,14 @@ fun NotificationListScreen(
 
     suspend fun loadNotifications(source: com.google.firebase.firestore.Source): List<AppNotification> {
         val uid = FirebaseBackend.uid.orEmpty()
+        // Single equality filter only — `whereEqualTo + orderBy` needs a composite index,
+        // so ordering happens after the read instead.
         val snap = FirebaseBackend.db.collection("notifications")
             .whereEqualTo("userId", uid)
-            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
             .limit(100).get(source).await()
-        return snap.documents.map { d ->
+        return snap.documents
+            .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+            .map { d ->
             val data = d.get("data")
             AppNotification(
                 id = d.id,

@@ -13,6 +13,9 @@ import admin from 'firebase-admin';
  * Firestore (`otpCodes/{phone}`, 5-minute expiry), and on verify returns a
  * Firebase custom token so the app signs in with Firebase Auth.
  *
+ * It also relays "tell the other side" pushes (POST /push/send) between devices:
+ * no chat content is stored there, the preview is handed straight to FCM.
+ *
  * No chat, message, or user content lives here. No Postgres.
  */
 
@@ -108,6 +111,7 @@ app.get('/health', (_req, res) => {
     service: 'holidaylink-otp',
     smsProviderConfigured: Boolean(process.env.INFOBIP_BASE_URL && process.env.INFOBIP_API_KEY),
     firebaseConfigured: Boolean(serviceAccount),
+    pushConfigured: Boolean(serviceAccount),
     defaultCountryCode: DEFAULT_COUNTRY_CODE,
     otpTtlMinutes: OTP_TTL_MINUTES
   });
@@ -249,6 +253,211 @@ app.post('/otp/verify', async (req, res) => {
 
   const token = await auth().createCustomToken(uid);
   res.json({ ok: true, token, uid, isNew, phone });
+});
+
+// ---------------------------------------------------------------- push notifications
+
+const PUSH_WINDOW_MS = 60_000;
+const PUSH_MAX_PER_WINDOW = 90;
+const PUSH_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
+const pushHits = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [uid, hits] of pushHits) {
+    const fresh = hits.filter((t) => now - t < PUSH_WINDOW_MS);
+    if (fresh.length) pushHits.set(uid, fresh);
+    else pushHits.delete(uid);
+  }
+}, 60_000).unref();
+
+/** Cheap in-memory guard so a stuck client cannot spin this endpoint. */
+function pushAllowed(uid) {
+  const now = Date.now();
+  const hits = (pushHits.get(uid) || []).filter((t) => now - t < PUSH_WINDOW_MS);
+  if (hits.length >= PUSH_MAX_PER_WINDOW) {
+    pushHits.set(uid, hits);
+    return false;
+  }
+  hits.push(now);
+  pushHits.set(uid, hits);
+  return true;
+}
+
+function bearer(req) {
+  const raw = String((req.headers && req.headers.authorization) || '').trim();
+  const match = /^Bearer\s+(.+)$/i.exec(raw);
+  return match ? match[1].trim() : '';
+}
+
+/** Display name exactly like the app resolves it: `name`, then `displayName`. */
+async function displayName(uid) {
+  try {
+    const snap = await db().collection('users').doc(uid).get();
+    const doc = snap.data() || {};
+    return String(doc.name || doc.displayName || '').trim() || 'HolidayLink user';
+  } catch {
+    return 'HolidayLink user';
+  }
+}
+
+/** `lastSeen` may be a Firestore Timestamp, millis, or an ISO string. */
+function lastSeenMillis(value) {
+  if (!value) return 0;
+  if (typeof value.toMillis === 'function') return value.toMillis();
+  if (typeof value === 'number') return value;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Sends one high-priority FCM data message to every device on a user's row and
+ * prunes tokens FCM reports as dead, so the list stays clean.
+ *
+ * `skipIfActive` drops the push when the recipient is demonstrably in the app
+ * already (recent heartbeat), which stops tray duplicates while they are chatting.
+ */
+async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
+  const snap = await db().collection('users').doc(uid).get();
+  if (!snap.exists) return { sent: 0, failed: 0, skipped: true };
+  const doc = snap.data() || {};
+
+  if (skipIfActive && doc.online === true) {
+    const fresh = Date.now() - lastSeenMillis(doc.lastSeen) < PUSH_ACTIVE_WINDOW_MS;
+    if (fresh) return { sent: 0, failed: 0, skipped: true };
+  }
+
+  const tokens = Array.from(new Set(
+    (doc.fcmTokens || []).filter((t) => typeof t === 'string' && t.length > 0)
+  ));
+  if (!tokens.length) return { sent: 0, failed: 0, skipped: true };
+
+  const result = await admin.messaging().sendEachForMulticast({
+    tokens,
+    data,
+    android: { priority: 'high', ttl: ttlSeconds * 1000 },
+    apns: { headers: { 'apns-priority': '10' } }
+  });
+
+  const dead = [];
+  result.responses.forEach((r, i) => {
+    if (r.success) return;
+    const code = r.error && r.error.code;
+    if (
+      code === 'messaging/registration-token-not-registered'
+      || code === 'messaging/invalid-registration-token'
+      || code === 'messaging/invalid-argument'
+    ) {
+      dead.push(tokens[i]);
+    }
+  });
+  if (dead.length) {
+    await db().collection('users').doc(uid)
+      .update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(...dead) })
+      .catch(() => {});
+  }
+  return { sent: result.successCount, failed: result.failureCount };
+}
+
+/**
+ * POST /push/send — "buzz the other side" for a message or an incoming call.
+ *
+ * The caller proves identity with a Firebase ID token (`Authorization: Bearer`).
+ * Recipients are read from the chat/call document, never from the request body,
+ * so a signed-in user can only alert people they are already talking to.
+ *
+ * Body: { chatId? , callId?, type? "message"|"call", title?, body?, id? }
+ */
+app.post('/push/send', async (req, res) => {
+  if (!serviceAccount) {
+    return res.status(503).json({ error: 'PUSH_UNAVAILABLE', message: 'Push is not configured on the server.' });
+  }
+  const idToken = bearer(req);
+  if (!idToken) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+
+  let sender;
+  try {
+    sender = await auth().verifyIdToken(idToken);
+  } catch {
+    return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  }
+  if (!pushAllowed(sender.uid)) {
+    return res.status(429).json({ error: 'PUSH_RATE_LIMITED', message: 'Too many notifications in a short time.' });
+  }
+
+  const chatId = String(req.body.chatId || '').trim().slice(0, 200);
+  const callId = String(req.body.callId || '').trim().slice(0, 200);
+  if (!chatId && !callId) {
+    return res.status(400).json({ error: 'NO_TARGET', message: 'Provide chatId or callId.' });
+  }
+
+  const preview = String(req.body.body || '').slice(0, 240);
+  const idOverride = String(req.body.id || '').slice(0, 200);
+
+  let recipients = [];
+  let type = String(req.body.type || '') === 'call' ? 'call' : 'message';
+  let title = String(req.body.title || '').slice(0, 120);
+  let body = preview;
+
+  try {
+    if (callId) {
+      const call = await db().collection('calls').doc(callId).get();
+      if (!call.exists) return res.status(404).json({ error: 'CALL_NOT_FOUND' });
+      if (call.get('callerId') !== sender.uid) return res.status(403).json({ error: 'NOT_CALLER' });
+      const callee = call.get('calleeId');
+      if (callee) recipients = [callee];
+      type = 'call';
+      if (!title) title = await displayName(sender.uid);
+      if (!body) body = String(call.get('kind') || '') === 'video' ? 'Incoming video call' : 'Incoming audio call';
+    } else {
+      const chat = await db().collection('chats').doc(chatId).get();
+      if (!chat.exists) return res.status(404).json({ error: 'CHAT_NOT_FOUND' });
+      const users = (chat.get('users') || []).filter((u) => typeof u === 'string');
+      if (!users.includes(sender.uid)) return res.status(403).json({ error: 'NOT_A_MEMBER' });
+      recipients = users.filter((u) => u !== sender.uid);
+      if (recipients.length) {
+        const groupName = String(chat.get('groupName') || '').trim();
+        const senderName = await displayName(sender.uid);
+        if (!title) title = groupName || senderName;
+        // In a group the sender matters: "Alice: see you at 6".
+        if (groupName && preview) body = `${senderName}: ${preview}`;
+      }
+    }
+  } catch (err) {
+    console.error('[push/send] lookup failed:', err.message);
+    return res.status(500).json({ error: 'LOOKUP_FAILED' });
+  }
+
+  if (!title) title = 'HolidayLink';
+  if (!body) body = type === 'call' ? 'Incoming call' : 'New message';
+  if (!recipients.length) return res.json({ ok: true, recipients: 0, sent: 0, failed: 0, skipped: true });
+
+  const data = {
+    type,
+    title,
+    body,
+    chatId: chatId || '',
+    callId: callId || '',
+    from: sender.uid
+  };
+  if (idOverride) data.id = idOverride;
+
+  // Calls are urgent and short-lived; messages can wait a day.
+  const ttlSeconds = type === 'call' ? 60 : 24 * 3600;
+  const results = await Promise.all(recipients.map((uid) =>
+    pushToUser(uid, data, ttlSeconds, type === 'message')
+      .catch(() => ({ sent: 0, failed: 0, skipped: false }))
+  ));
+
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+  results.forEach((r) => {
+    sent += r.sent;
+    failed += r.failed;
+    if (r.skipped) skipped += 1;
+  });
+
+  res.json({ ok: true, recipients: recipients.length, sent, failed, skipped });
 });
 
 app.listen(PORT, '0.0.0.0', () => {

@@ -212,8 +212,9 @@ object FirestoreChat {
         val chatRef = db.collection("chats").document(chatId)
         val preview = when {
             viewOnce -> "View-once photo"
+            !audioBlob.isNullOrBlank() -> "Voice message"
             imageUrl != null -> "Photo"
-            fileUrl != null -> fileName ?: "File"
+            fileUrl != null -> if (kind == "video") "Video" else fileName ?: "File"
             else -> text.take(80)
         }
         val msgRef = chatRef.collection("messages").document()
@@ -229,6 +230,10 @@ object FirestoreChat {
             members.filter { it != uid }.forEach { updates["unread_$it"] = ((snap.getLong("unread_$it") ?: 0) + 1) }
             tx.update(chatRef, updates)
         }.await()
+
+        // Nudge the other side's phones so the alert lands even if their app is closed.
+        // Best effort only: on failure the message is already in Firestore for them.
+        runCatching { PushNotify.message(chatId, preview, msgRef.id) }
     }
 
     suspend fun markRead(chatId: String) {

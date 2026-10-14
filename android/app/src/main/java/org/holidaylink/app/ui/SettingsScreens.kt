@@ -257,6 +257,7 @@ fun SettingsHub(
         }
 
         SettingsSection("About") {
+            SettingsNavRow("App updates", Icons.Default.CloudDownload, "Download new versions in-app", onClick = { onOpen(SettingsRoute.Update) })
             SettingsNavRow("About HolidayLink", Icons.Default.Info, "Version and what's new", onClick = { onOpen(SettingsRoute.About) })
             SettingsNavRow("Help", Icons.Default.Info, "Get help using HolidayLink", onClick = { onOpen(SettingsRoute.Help) })
             SettingsNavRow("Terms of service", Icons.Default.Info, onClick = { onOpen(SettingsRoute.Terms) })
@@ -1659,7 +1660,7 @@ fun AboutScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(14.dp))
             Text("HolidayLink", style = MaterialTheme.typography.headlineSmall)
             Text(
-                "Version 2.1.1",
+                "Version ${org.holidaylink.app.BuildConfig.VERSION_NAME} (${org.holidaylink.app.BuildConfig.VERSION_CODE})",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

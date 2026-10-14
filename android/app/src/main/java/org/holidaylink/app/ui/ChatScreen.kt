@@ -20,10 +20,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -147,6 +149,7 @@ fun ChatScreen(
     currentUserId: String,
     onBack: () -> Unit,
     onOpenProfile: (User) -> Unit,
+    onOpenGroupInfo: (ChatItem) -> Unit,
     onOpenCalls: (User) -> Unit
 ) {
     val context = LocalContext.current
@@ -459,6 +462,7 @@ fun ChatScreen(
     val isBlocked = blockedPeerId != null && AppSettings.isUserBlocked(blockedPeerId)
 
     Scaffold(
+        modifier = Modifier.imePadding(),
         topBar = {
             if (searching) {
                 TopAppBar(
@@ -490,7 +494,9 @@ fun ChatScreen(
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 title = {
                     Row(
-                        Modifier.clickable { peerUser?.let(onOpenProfile) },
+                        Modifier.clickable {
+                            if (chat.kind != "direct") onOpenGroupInfo(chat) else peerUser?.let(onOpenProfile)
+                        },
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Avatar(name = title, photo = peerUser?.avatarUrl ?: chat.peer?.avatarUrl, size = 38.dp)
@@ -1159,7 +1165,8 @@ private fun FsMessageBubble(
                             url = url,
                             modifier = Modifier.widthIn(max = 260.dp).heightIn(max = 320.dp)
                                 .clip(RoundedCornerShape(12.dp))
-                                .clickable { onOpenImage(url) }
+                                .clickable { onOpenImage(url) },
+                            preserveAspect = true
                         )
                         Spacer(Modifier.height(6.dp))
                     }
@@ -1809,7 +1816,12 @@ private fun ReportDialog(onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
 }
 
 @Composable
-internal fun RemoteImage(url: String, modifier: Modifier = Modifier) {
+internal fun RemoteImage(
+    url: String,
+    modifier: Modifier = Modifier,
+    contentScale: androidx.compose.ui.layout.ContentScale = androidx.compose.ui.layout.ContentScale.Fit,
+    preserveAspect: Boolean = false
+) {
     var bitmap by remember(url) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(url) {
         bitmap = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -1828,11 +1840,15 @@ internal fun RemoteImage(url: String, modifier: Modifier = Modifier) {
             Text("Loading…", style = MaterialTheme.typography.labelSmall)
         }
     } else {
+        // Match the box to the picture's aspect ratio so ContentScale.Fit never leaves the
+        // bubble colour (the "green bit") showing along an edge of the photo.
+        val ratio = image.width.toFloat() / image.height.toFloat().coerceAtLeast(1f)
+        val sized = if (preserveAspect && ratio > 0f) modifier.aspectRatio(ratio) else modifier
         androidx.compose.foundation.Image(
             bitmap = image.asImageBitmap(),
             contentDescription = "Attachment",
-            modifier = modifier,
-            contentScale = androidx.compose.ui.layout.ContentScale.Fit
+            modifier = sized,
+            contentScale = contentScale
         )
     }
 }

@@ -24,6 +24,7 @@ enum class SettingsRoute {
     ChatSettings,
     AiSettings,
     Server,
+    Update,
     About,
     Help,
     Terms,
@@ -93,6 +94,9 @@ fun SettingsHost(
 
         SettingsRoute.Server ->
             ServerSettingsScreen(api = api, onBack = onBack)
+
+        SettingsRoute.Update ->
+            UpdateScreen(onBack = onBack)
 
         SettingsRoute.About ->
             AboutScreen(onBack = onBack)
