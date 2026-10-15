@@ -202,7 +202,7 @@ fun ChatScreen(
     val title = peerUser?.displayName?.takeIf { it.isNotBlank() }
         ?: chat.peer?.displayName?.takeIf { it.isNotBlank() }
         ?: chat.title?.takeIf { it.isNotBlank() }
-        ?: if (chat.kind == "direct") "Chat" else "Group"
+        ?: if (chat.kind == "direct") "Contact" else "Group"
 
     val rawMessages by remember(chat.id) { FirestoreChat.messagesFlow(chat.id) }
         .collectAsState(initial = emptyList())
@@ -275,7 +275,7 @@ fun ChatScreen(
                 forwardChats = rows
                 forwardNames = rows.mapNotNull { r ->
                     r.peerId?.let { pid ->
-                        pid to runCatching { FirestoreChat.resolvePeer(pid).displayName }.getOrDefault("Chat")
+                        pid to runCatching { FirestoreChat.resolvePeer(pid).displayName }.getOrDefault("Contact")
                     }
                 }.toMap()
             }
@@ -837,7 +837,7 @@ fun ChatScreen(
                         items(forwardChats, key = { it.id }) { row ->
                             val label = forwardNames[row.peerId]
                                 ?: row.title.ifBlank {
-                                    if (row.isGroup || row.isBroadcast || row.isCommunity) "Group" else "Chat"
+                                    if (row.isGroup || row.isBroadcast || row.isCommunity) "Group" else "Contact"
                                 }
                             Row(
                                 Modifier

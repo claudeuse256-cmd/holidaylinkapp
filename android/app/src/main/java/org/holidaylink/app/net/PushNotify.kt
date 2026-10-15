@@ -1,6 +1,7 @@
 package org.holidaylink.app.net
 
 import android.content.Context
+import android.util.Log
 import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -75,8 +76,17 @@ object PushNotify {
                 .addHeader("Authorization", "Bearer $token")
                 .post(payload.toString().toRequestBody(jsonType))
                 .build()
-            client.newCall(request).execute().use { it.body?.string() }
+            client.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    Log.w("HolidayLinkPush", "Push relay returned HTTP ${response.code}: ${responseBody.take(300)}")
+                } else {
+                    Log.d("HolidayLinkPush", "Push relay accepted request: ${responseBody.take(200)}")
+                }
+            }
             Unit
+        }.onFailure { error ->
+            Log.w("HolidayLinkPush", "Could not contact push relay", error)
         }
     }
 }

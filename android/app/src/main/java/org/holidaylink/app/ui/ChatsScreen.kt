@@ -116,12 +116,20 @@ fun ChatsScreen(
     // peer resolves the row updates its title. (Wrapping this in remember(rows, query, peerCache)
     // froze the names because the map instance never changes.)
     val needle = query.trim().lowercase()
-    // Pinned chats float to the top, WhatsApp-style. Archived chats live behind a toggle.
-    val all = rows.map { toItem(it) }.sortedByDescending { it.pinned }
+    // Pinned chats float to the top; all remaining conversations follow last-message time.
+    // Firestore snapshots are not guaranteed to arrive in timestamp order.
+    val all = rows.map { toItem(it) }.sortedWith(
+        compareByDescending<ChatItem> { it.pinned }
+            .thenByDescending { item ->
+                item.lastAt?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrDefault(0L) } ?: 0L
+            }
+            .thenBy { it.id }
+    )
     val archivedCount = all.count { it.archived }
     val mapped = all.filter { it.archived == archivedOpen }
     val visible = if (needle.isBlank()) mapped else mapped.filter {
-        val title = it.peer?.displayName ?: it.title.orEmpty()
+        val title = it.peer?.displayName?.takeIf { name -> name.isNotBlank() }
+            ?: it.title.orEmpty()
         title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
     }
 
@@ -289,7 +297,7 @@ private fun ChatRow(
     onLongPress: () -> Unit
 ) {
     // A 1-1 chat must never borrow the word "Group" while its peer name is still resolving.
-    val title = chat.peer?.displayName ?: chat.title ?: if (chat.kind == "direct") "Chat" else "Group"
+    val title = chat.peer?.displayName?.takeIf { it.isNotBlank() } ?: chat.title?.takeIf { it.isNotBlank() } ?: if (chat.kind == "direct") "Loading contact…" else "Group"
     val unread = chat.unreadCount > 0
     val preview = when {
         chat.peerTyping -> "typing…"

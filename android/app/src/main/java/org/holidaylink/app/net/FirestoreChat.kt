@@ -62,7 +62,10 @@ object FirestoreChat {
                             lastAt = d.safeTimestamp("lastAt") ?: d.safeTimestamp("updatedAt"),
                             unread = (d.getLong("unread_$uid") ?: 0).toInt()
                         )
-                    }?.sortedByDescending { it.lastAt?.seconds ?: 0 } ?: emptyList()
+                    }?.sortedWith(
+                        compareByDescending<ChatRow> { it.lastAt?.seconds ?: 0L }
+                            .thenByDescending { it.lastAt?.nanoseconds ?: 0 }
+                    ) ?: emptyList()
                     trySend(rows)
                 } catch (_: Exception) {
                     // Keep the previous list on screen rather than crashing.
