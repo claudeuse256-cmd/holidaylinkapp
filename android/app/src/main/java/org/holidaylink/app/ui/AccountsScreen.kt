@@ -26,11 +26,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.data.AccountStore
+import org.holidaylink.app.net.AccountSession
 import org.holidaylink.app.net.Me
 import org.holidaylink.app.phone.PhoneNumbers
 
@@ -42,13 +47,21 @@ fun AccountsScreen(
     onAddAccount: () -> Unit,
     onSwitchAccount: (AccountStore.Account) -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var confirm by remember { mutableStateOf<AccountStore.Account?>(null) }
-    val accounts = AccountStore.all(prefs)
+    // AccountStore bumps `version` on every write, so an account whose token was minted in
+    // the background shows up here without needing a restart.
+    val version = AccountStore.version
+    val accounts = remember(version) { AccountStore.all(prefs) }
+    val full = accounts.size >= AccountStore.MAX
     val snackbar = remember { SnackbarHostState() }
     SettingsScaffold("Accounts", onBack, snackbar) {
         Column(Modifier.padding(bottom = 30.dp)) {
             Text(
-                "Keep multiple HolidayLink accounts on this phone and switch between them without signing out permanently.",
+                "Keep up to ${AccountStore.MAX} HolidayLink accounts on this phone and switch " +
+                    "between them without signing in again. Messages and calls for both still " +
+                    "reach this phone.",
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -80,8 +93,12 @@ fun AccountsScreen(
             SettingsNavRow(
                 title = "Add account",
                 icon = Icons.Default.Add,
-                subtitle = "Sign in to another HolidayLink number",
-                onClick = onAddAccount
+                subtitle = if (full) {
+                    "This phone already has ${AccountStore.MAX} accounts — remove one first."
+                } else {
+                    "Sign in to another HolidayLink number"
+                },
+                onClick = { if (!full) onAddAccount() }
             )
             if (accounts.isEmpty()) {
                 Row(Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -97,8 +114,23 @@ fun AccountsScreen(
         AlertDialog(
             onDismissRequest = { confirm = null },
             title = { Text("Remove saved account?") },
-            text = { Text("This removes the saved sign-in from this phone. It does not delete the HolidayLink account." ) },
-            confirmButton = { TextButton(onClick = { AccountStore.remove(prefs, account.userId); confirm = null }) { Text("Remove") } },
+            text = { Text("This removes the saved sign-in from this phone, so it stops notifying you here. It does not delete the HolidayLink account.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirm = null
+                    val token = account.token
+                    val userId = account.userId
+                    AccountStore.remove(prefs, userId)
+                    // Also take this device off the account's push list server-side, otherwise
+                    // its messages would keep landing on a phone that no longer lists it.
+                    scope.launch {
+                        val fcm = runCatching {
+                            com.google.firebase.messaging.FirebaseMessaging.getInstance().token.await()
+                        }.getOrNull()
+                        runCatching { AccountSession.revoke(context, token, fcm) }
+                    }
+                }) { Text("Remove") }
+            },
             dismissButton = { TextButton(onClick = { confirm = null }) { Text("Cancel") } }
         )
     }

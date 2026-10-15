@@ -1,12 +1,23 @@
 package org.holidaylink.app.data
 
 import android.content.SharedPreferences
+import androidx.compose.runtime.mutableStateOf
 import org.json.JSONArray
 import org.json.JSONObject
 
 /** Local multi-account vault. Tokens remain only in the app's private SharedPreferences. */
 object AccountStore {
     private const val KEY = "accounts.v1"
+
+    /** How many accounts one phone may keep, WhatsApp-style. */
+    const val MAX = 2
+
+    /**
+     * Bumped on every write so Compose screens re-read the vault. Without it a token
+     * minted in the background would not appear in Settings ▸ Accounts until a restart.
+     */
+    private val revision = mutableStateOf(0)
+    val version: Int get() = revision.value
 
     data class Account(
         val userId: String,
@@ -34,7 +45,7 @@ object AccountStore {
     fun upsert(prefs: SharedPreferences, account: Account) {
         val list = all(prefs).filterNot { it.userId == account.userId }.toMutableList()
         list.add(0, account)
-        write(prefs, list.take(5))
+        write(prefs, list.take(MAX))
     }
 
     fun remove(prefs: SharedPreferences, userId: String) {
@@ -49,5 +60,6 @@ object AccountStore {
             a.put(JSONObject().put("userId", x.userId).put("token", x.token).put("phone", x.phone).put("displayName", x.displayName).put("username", x.username))
         }
         prefs.edit().putString(KEY, a.toString()).apply()
+        revision.value += 1
     }
 }

@@ -68,6 +68,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -93,6 +94,7 @@ import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AccountStore
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.AccountSession
 import org.holidaylink.app.net.safeTimestamp
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.FirebaseBackend
@@ -153,13 +155,8 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppSettings.init(this)
-        // A crash on the previous run leaves a report behind; show it instead of dying again
-        // so the user can copy it (and reset the app if the loop is caused by local state).
-        val crashReport = CrashGuard.lastCrash(this)
-        if (crashReport != null) {
-            setContent { CrashReportScreen(this, crashReport) }
-            return
-        }
+        // A crash report from a previous run no longer replaces the app: crashes are still
+        // recorded privately (see CrashGuard) for support, but they never block opening.
         NotificationRouter.consume(intent)
         setContent { HolidayLinkApp(this) }
     }
@@ -282,34 +279,84 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
         AppLockGate {
             var signedIn by remember { mutableStateOf(FirebaseBackend.currentUser != null) }
             var addingAccount by remember { mutableStateOf(false) }
+            var switchingTo by remember { mutableStateOf<String?>(null) }
+            var sessionKey by remember { mutableStateOf(0) }
             var bannedMsg by remember { mutableStateOf<String?>(null) }
             val scope = rememberCoroutineScope()
             val banMsg = bannedMsg
-            if (banMsg != null) {
-                BannedScreen(message = banMsg, onSwitchNumber = {
-                    FirebaseBackend.signOut()
-                    prefs.edit().remove("token").remove("userId").apply()
-                    bannedMsg = null
-                    signedIn = false
-                })
-            } else if (signedIn && addingAccount) {
-                // Adding / switching account: keep the current session until verification
-                // completes, and allow backing out so nobody gets stranded on the login screen.
-                AuthFlow(api, prefs, onCancel = { addingAccount = false }) { addingAccount = false }
-            } else if (signedIn) {
-                SignedInApp(
-                    api = api,
-                    prefs = prefs,
-                    onAddAccount = { addingAccount = true },
-                    onLoggedOut = {
-                        scope.launch { runCatching { FirebaseBackend.goOffline() } }
+
+            // Hop to an account already saved on this phone. Its stored token buys a fresh
+            // Firebase session (no code, no SMS); if that token has expired or the server is
+            // unreachable we fall back to the normal sign-in screen so nobody gets stuck.
+            val switchAccount: (AccountStore.Account) -> Unit = { account ->
+                if (account.token.isBlank()) {
+                    addingAccount = true
+                } else {
+                    switchingTo = account.userId
+                    scope.launch {
+                        val ok = runCatching {
+                            val session = AccountSession.switch(context, account.token)
+                            FirebaseBackend.signInWithCustomToken(session.customToken)
+                            val phone = session.phone.takeIf { it.isNotBlank() } ?: account.phone
+                            finishFirebaseLogin(prefs, session.uid, phone, countryIsoFor(phone, prefs))
+                            // This device belongs on the new account's push list too.
+                            runCatching { PushTokens.register() }
+                        }.isSuccess
+                        // A stale/expired token (or an unreachable server) sends the user to the
+                        // normal sign-in screen rather than leaving them nowhere.
+                        if (ok) sessionKey += 1 else addingAccount = true
+                        switchingTo = null
+                    }
+                }
+            }
+
+            Box(Modifier.fillMaxSize()) {
+                when {
+                    banMsg != null -> BannedScreen(message = banMsg, onSwitchNumber = {
                         FirebaseBackend.signOut()
+                        prefs.edit().remove("token").remove("userId").apply()
+                        bannedMsg = null
                         signedIn = false
-                    },
-                    onBanned = { bannedMsg = it }
-                )
-            } else {
-                AuthFlow(api, prefs) { signedIn = true }
+                    })
+
+                    // Adding / switching account: keep the current session until verification
+                    // completes, and allow backing out so nobody gets stranded on the login screen.
+                    signedIn && addingAccount ->
+                        AuthFlow(api, prefs, onCancel = { addingAccount = false }) { addingAccount = false }
+
+                    signedIn -> key(sessionKey) {
+                        // Make sure this account is in the local list (and has a token) so it can
+                        // be switched back to later. A no-op once it is already saved.
+                        LaunchedEffect(sessionKey) { rememberCurrentAccount(context, prefs) }
+                        SignedInApp(
+                            api = api,
+                            prefs = prefs,
+                            onAddAccount = { addingAccount = true },
+                            onSwitchAccount = switchAccount,
+                            onLoggedOut = {
+                                scope.launch { runCatching { FirebaseBackend.goOffline() } }
+                                FirebaseBackend.signOut()
+                                signedIn = false
+                            },
+                            onBanned = { bannedMsg = it }
+                        )
+                    }
+
+                    else -> AuthFlow(api, prefs) { signedIn = true }
+                }
+
+                if (switchingTo != null) {
+                    Box(
+                        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(color = Color.White)
+                            Spacer(Modifier.height(14.dp))
+                            Text("Switching account…", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
             }
         }
         }
@@ -328,6 +375,7 @@ private fun SignedInApp(
     api: Api,
     prefs: SharedPreferences,
     onAddAccount: () -> Unit,
+    onSwitchAccount: (AccountStore.Account) -> Unit,
     onLoggedOut: () -> Unit,
     onBanned: (String) -> Unit
 ) {
@@ -686,7 +734,7 @@ private fun SignedInApp(
             me = me,
             onBack = pop,
             onAddAccount = onAddAccount,
-            onSwitchAccount = { _ -> onAddAccount() },
+            onSwitchAccount = onSwitchAccount,
             onLoggedOut = {
                 prefs.edit().remove("token").remove("userId").apply()
                 stack.clear()
@@ -1211,76 +1259,6 @@ private fun BannedScreen(message: String, onSwitchNumber: () -> Unit) {
     }
 }
 
-// ---------------------------------------------------------------- crash report
-
-/**
- * Shown in place of the app when the previous run crashed. It turns a silent crash loop
- * into something actionable: copy the trace to send us, try again, or reset the local
- * session (which is what usually unblocks a loop) and start over at sign-in.
- */
-@Composable
-private fun CrashReportScreen(activity: FragmentActivity, report: String) {
-    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
-    var copied by remember { mutableStateOf(false) }
-    HolidayLinkTheme(
-        themeMode = AppSettings.state.themeMode,
-        fontScale = AppSettings.state.fontScale
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxSize(),
-            color = MaterialTheme.colorScheme.background
-        ) {
-            Column(
-                Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Icon(Icons.Default.Block, null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(44.dp))
-                Text("HolidayLink closed unexpectedly", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                Text(
-                    "Here is what went wrong. Copy it and send it to support, or reset the app to open it again.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Surface(
-                    Modifier.fillMaxWidth().height(300.dp),
-                    shape = MaterialTheme.shapes.medium,
-                    color = MaterialTheme.colorScheme.surfaceVariant
-                ) {
-                    Text(
-                        report,
-                        modifier = Modifier.verticalScroll(rememberScrollState()).padding(12.dp),
-                        fontSize = 11.sp,
-                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
-                    )
-                }
-                Button(
-                    onClick = {
-                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(report))
-                        copied = true
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text(if (copied) "Copied — paste it to support" else "Copy details") }
-                OutlinedButton(
-                    onClick = {
-                        CrashGuard.acknowledge(activity)
-                        activity.recreate()
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("Try again") }
-                OutlinedButton(
-                    onClick = {
-                        CrashGuard.resetLocalState(activity)
-                        activity.recreate()
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("Reset app and sign in again") }
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------- auth
 
 private fun friendlyMessage(e: Throwable, fallback: String): String =
@@ -1296,6 +1274,35 @@ private fun saveSession(prefs: SharedPreferences, token: String?, userId: String
     if (!token.isNullOrBlank()) editor.putString("token", token)
     if (!userId.isNullOrBlank()) editor.putString("userId", userId)
     editor.apply()
+}
+
+/**
+ * Keeps the account that is signed in right now in the local account list so it can be
+ * switched back to later. The long-lived token is minted only the first time (or after it
+ * was revoked), so this is a no-op on every later launch.
+ */
+private suspend fun rememberCurrentAccount(context: Context, prefs: SharedPreferences) {
+    val uid = FirebaseBackend.uid ?: return
+    if (AccountStore.all(prefs).any { it.userId == uid && it.token.isNotBlank() }) return
+    val token = runCatching { AccountSession.mintToken(context) }.getOrNull() ?: return
+    val profile = runCatching { FirebaseBackend.loadProfile(uid) }.getOrNull()
+    AccountStore.upsert(
+        prefs,
+        AccountStore.Account(
+            userId = uid,
+            token = token,
+            phone = profile?.phone?.takeIf { it.isNotBlank() }
+                ?: prefs.getString("phone", "").orEmpty(),
+            displayName = profile?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user",
+            username = profile?.username.orEmpty()
+        )
+    )
+}
+
+/** Best guess at the country of a switched-to number; keeps the stored one when unsure. */
+private fun countryIsoFor(phone: String, prefs: SharedPreferences): String {
+    val hit = Countries.ALL.firstOrNull { phone.startsWith("+${it.dialCode}") }
+    return hit?.iso ?: prefs.getString("countryIso", Countries.DEFAULT_ISO) ?: Countries.DEFAULT_ISO
 }
 
 private const val OTP_LENGTH = 6

@@ -44,11 +44,23 @@ object Notifier {
         }
     }
 
-    fun message(context: Context, id: Int, title: String, body: String, targetId: String? = null) =
-        post(context, CHANNEL_MESSAGES, id, title, body, targetId)
+    fun message(
+        context: Context,
+        id: Int,
+        title: String,
+        body: String,
+        targetId: String? = null,
+        subText: String? = null
+    ) = post(context, CHANNEL_MESSAGES, id, title, body, targetId, subText)
 
-    fun call(context: Context, id: Int, title: String, body: String, targetId: String? = null) =
-        post(context, CHANNEL_CALLS, id, title, body, targetId)
+    fun call(
+        context: Context,
+        id: Int,
+        title: String,
+        body: String,
+        targetId: String? = null,
+        subText: String? = null
+    ) = post(context, CHANNEL_CALLS, id, title, body, targetId, subText)
 
     private fun post(
         context: Context,
@@ -56,7 +68,8 @@ object Notifier {
         id: Int,
         title: String,
         body: String,
-        targetId: String?
+        targetId: String?,
+        subText: String?
     ) {
         ensureChannels(context)
         val nm = NotificationManagerCompat.from(context)
@@ -95,6 +108,7 @@ object Notifier {
             .setColor(androidx.core.content.ContextCompat.getColor(context, R.color.notification_accent))
             .setContentTitle(title)
             .setContentText(body)
+            .setSubText(subText)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)

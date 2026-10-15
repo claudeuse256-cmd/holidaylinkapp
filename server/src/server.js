@@ -451,7 +451,9 @@ app.post('/push/send', async (req, res) => {
   // Calls are urgent and short-lived; messages can wait a day.
   const ttlSeconds = type === 'call' ? 60 : 24 * 3600;
   const results = await Promise.all(recipients.map((uid) =>
-    pushToUser(uid, data, ttlSeconds, type === 'message')
+    // `forUid` lets a phone that holds several accounts label the notification with the
+    // account it arrived for, the way WhatsApp marks its linked accounts.
+    pushToUser(uid, { ...data, forUid: uid }, ttlSeconds, type === 'message')
       .catch(() => ({ sent: 0, failed: 0, skipped: false }))
   ));
 
@@ -465,6 +467,132 @@ app.post('/push/send', async (req, res) => {
   });
 
   res.json({ ok: true, recipients: recipients.length, sent, failed, skipped });
+});
+
+// ---------------------------------------------------------------- in-app account switching
+
+/**
+ * A phone can hold two HolidayLink accounts and switch between them without a new SMS.
+ *
+ * Firebase Auth only ever has one signed-in user, so the app keeps a long-lived
+ * *account token* per saved account and trades it for a fresh Firebase custom token.
+ * Only its SHA-256 hash is stored, exactly like the OTP codes; the raw value never
+ * leaves the phone that earned it.
+ */
+const LOGIN_TOKEN_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+const ACCOUNT_TOKEN_WINDOW_MS = 60 * 60 * 1000;
+const ACCOUNT_TOKEN_MAX_PER_WINDOW = 10;
+const accountTokenHits = new Map();
+
+function loginTokenHash(raw) {
+  return crypto.createHash('sha256').update(String(raw)).digest('hex');
+}
+
+/** Cheap per-user guard so a looping client cannot fill Firestore with token rows. */
+function accountTokenAllowed(uid) {
+  const now = Date.now();
+  const hits = (accountTokenHits.get(uid) || []).filter((t) => now - t < ACCOUNT_TOKEN_WINDOW_MS);
+  if (hits.length >= ACCOUNT_TOKEN_MAX_PER_WINDOW) {
+    accountTokenHits.set(uid, hits);
+    return false;
+  }
+  hits.push(now);
+  accountTokenHits.set(uid, hits);
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [uid, hits] of accountTokenHits) {
+    const fresh = hits.filter((t) => now - t < ACCOUNT_TOKEN_WINDOW_MS);
+    if (fresh.length) accountTokenHits.set(uid, fresh);
+    else accountTokenHits.delete(uid);
+  }
+}, ACCOUNT_TOKEN_WINDOW_MS).unref();
+
+/** The decoded ID token behind an `Authorization: Bearer` header, or null. */
+async function verifyBearer(req) {
+  const idToken = bearer(req);
+  if (!idToken) return null;
+  try {
+    return await auth().verifyIdToken(idToken);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * POST /account/token — mint a long-lived account token for whoever is signed in now.
+ *
+ * Identity comes from the Firebase ID token (same as /push/send), so this can only ever
+ * mint a token for the account that already holds the session.
+ */
+app.post('/account/token', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const decoded = await verifyBearer(req);
+  if (!decoded) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  if (!accountTokenAllowed(decoded.uid)) {
+    return res.status(429).json({ error: 'RATE_LIMITED', message: 'Please try again in a little while.' });
+  }
+  const accountToken = crypto.randomBytes(32).toString('hex');
+  await db().collection('loginTokens').doc(loginTokenHash(accountToken)).set({
+    uid: decoded.uid,
+    phone: String(decoded.phone_number || ''),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: Date.now() + LOGIN_TOKEN_TTL_MS
+  });
+  res.json({ ok: true, accountToken });
+});
+
+/**
+ * POST /account/switch — trade a stored account token for a fresh Firebase custom token.
+ * This is what makes switching instant: no code, no SMS.
+ */
+app.post('/account/switch', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const raw = String(req.body.accountToken || '').trim();
+  const invalid = (message) => ({ error: 'ACCOUNT_TOKEN_INVALID', message });
+  if (!raw || raw.length > 200) {
+    return res.status(400).json(invalid('Sign in to this account again.'));
+  }
+  const ref = db().collection('loginTokens').doc(loginTokenHash(raw));
+  const snap = await ref.get();
+  const doc = snap.exists ? snap.data() || {} : null;
+  const expired = !doc || (doc.expiresAt && Number(doc.expiresAt) <= Date.now());
+  if (expired) {
+    if (doc) await ref.delete().catch(() => {});
+    return res.status(401).json(invalid('Sign in to this account again.'));
+  }
+  const uid = String(doc.uid || '');
+  if (!uid) return res.status(401).json(invalid('Sign in to this account again.'));
+
+  const token = await auth().createCustomToken(uid);
+  await ref.update({ lastUsedAt: admin.firestore.FieldValue.serverTimestamp() }).catch(() => {});
+  res.json({ ok: true, token, uid, phone: String(doc.phone || '') });
+});
+
+/**
+ * POST /account/revoke — "remove this account from the phone". Deletes the account token
+ * and takes this device's FCM token off that account, so a phone that no longer lists an
+ * account stops being notified for it.
+ */
+app.post('/account/revoke', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const raw = String(req.body.accountToken || '').trim();
+  if (!raw || raw.length > 200) return res.status(400).json({ error: 'ACCOUNT_TOKEN_INVALID' });
+  const ref = db().collection('loginTokens').doc(loginTokenHash(raw));
+  const snap = await ref.get();
+  if (!snap.exists) return res.json({ ok: true });
+  const doc = snap.data() || {};
+  const uid = String(doc.uid || '');
+  const fcmToken = String(req.body.fcmToken || '').trim();
+  await ref.delete().catch(() => {});
+  if (uid && fcmToken) {
+    await db().collection('users').doc(uid)
+      .update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(fcmToken) })
+      .catch(() => {});
+  }
+  res.json({ ok: true });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
