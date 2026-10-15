@@ -96,6 +96,7 @@ import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AutoDownload
 import org.holidaylink.app.data.DisappearingDuration
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Audience
 import org.holidaylink.app.net.DeviceSession
@@ -610,8 +611,8 @@ fun SecurityScreen(api: Api, onBack: () -> Unit, onOpenBlocked: () -> Unit) {
                 id = d.id,
                 label = d.getString("deviceLabel") ?: "Device",
                 platform = "android",
-                createdAt = d.getTimestamp("createdAt")?.toDate()?.toInstant()?.toString().orEmpty(),
-                lastSeenAt = d.getTimestamp("lastActiveAt")?.toDate()?.toInstant()?.toString(),
+                createdAt = d.safeTimestamp("createdAt")?.toDate()?.toInstant()?.toString().orEmpty(),
+                lastSeenAt = d.safeTimestamp("lastActiveAt")?.toDate()?.toInstant()?.toString(),
                 current = d.id == myDevice
             )
         }.sortedByDescending { it.current }

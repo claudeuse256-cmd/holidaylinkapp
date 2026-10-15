@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.CallRecord
 import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
@@ -92,8 +93,8 @@ fun CallsScreen(
                     runCatching { FirestoreChat.resolvePeer(peerId) }.getOrNull()
                         ?: User(peerId, "Unknown number", "")
                 }
-                val created = d.getTimestamp("createdAt")
-                val ended = d.getTimestamp("endedAt")
+                val created = d.safeTimestamp("createdAt")
+                val ended = d.safeTimestamp("endedAt")
                 val duration = if (created != null && ended != null) {
                     ((ended.seconds - created.seconds).coerceAtLeast(0)).toInt()
                 } else 0

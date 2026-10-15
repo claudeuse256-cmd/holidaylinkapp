@@ -43,24 +43,30 @@ object FirestoreChat {
     fun chatsFlow(uid: String): Flow<List<ChatRow>> = callbackFlow {
         val reg = db.collection("chats").whereArrayContains("users", uid)
             .addSnapshotListener { snap, _ ->
-                val rows = snap?.documents?.mapNotNull { d ->
-                    val users = (d.get("users") as? List<String>) ?: emptyList()
-                    if (!users.contains(uid)) return@mapNotNull null
-                    val isGroup = d.getBoolean("isGroup") == true
-                    val others = users.filter { it != uid }
-                    ChatRow(
-                        id = d.id,
-                        isGroup = isGroup,
-                        isBroadcast = d.getBoolean("isBroadcast") == true,
-                        isCommunity = d.getBoolean("isCommunity") == true,
-                        title = d.getString("groupName").orEmpty(),
-                        peerId = if (!isGroup) others.firstOrNull() else null,
-                        lastBody = d.getString("lastText"),
-                        lastAt = d.getTimestamp("lastAt") ?: d.getTimestamp("updatedAt"),
-                        unread = (d.getLong("unread_$uid") ?: 0).toInt()
-                    )
-                }?.sortedByDescending { it.lastAt?.seconds ?: 0 } ?: emptyList()
-                trySend(rows)
+                // Snapshot listeners run on the main thread: a document with an unexpected
+                // field type must never be allowed to crash the app, so a bad row is skipped.
+                try {
+                    val rows = snap?.documents?.mapNotNull { d ->
+                        val users = (d.get("users") as? List<String>) ?: emptyList()
+                        if (!users.contains(uid)) return@mapNotNull null
+                        val isGroup = d.getBoolean("isGroup") == true
+                        val others = users.filter { it != uid }
+                        ChatRow(
+                            id = d.id,
+                            isGroup = isGroup,
+                            isBroadcast = d.getBoolean("isBroadcast") == true,
+                            isCommunity = d.getBoolean("isCommunity") == true,
+                            title = d.getString("groupName").orEmpty(),
+                            peerId = if (!isGroup) others.firstOrNull() else null,
+                            lastBody = d.getString("lastText"),
+                            lastAt = d.safeTimestamp("lastAt") ?: d.safeTimestamp("updatedAt"),
+                            unread = (d.getLong("unread_$uid") ?: 0).toInt()
+                        )
+                    }?.sortedByDescending { it.lastAt?.seconds ?: 0 } ?: emptyList()
+                    trySend(rows)
+                } catch (_: Exception) {
+                    // Keep the previous list on screen rather than crashing.
+                }
             }
         awaitClose { reg.remove() }
     }
@@ -143,30 +149,34 @@ object FirestoreChat {
         val reg = db.collection("chats").document(chatId).collection("messages")
             .orderBy("timestamp").limitToLast(200)
             .addSnapshotListener { snap, _ ->
-                val rows = snap?.documents?.mapNotNull { d ->
-                    ChatMessage(
-                        id = d.id,
-                        senderId = d.getString("senderId").orEmpty(),
-                        text = d.getString("text").orEmpty(),
-                        type = d.getString("type") ?: "text",
-                        createdAt = d.getTimestamp("timestamp"),
-                        read = d.getBoolean("read") == true,
-                        imageUrl = d.getString("imageUrl"),
-                        fileUrl = d.getString("fileUrl"),
-                        fileName = d.getString("fileName"),
-                        durationMs = d.getLong("durationMs"),
-                        viewOnce = d.getBoolean("viewOnce") == true,
-                        expiresAt = d.getTimestamp("expiresAt"),
-                        replyToId = d.getString("replyToId"),
-                        replyToBody = d.getString("replyToBody"),
-                        replyToName = d.getString("replyToName"),
-                        audioBlob = d.getString("audioBlob"),
-                        edited = d.getBoolean("edited") == true,
-                        delivered = d.getBoolean("delivered") == true,
-                        reactions = parseReactions(d.get("reactions"))
-                    )
-                } ?: emptyList()
-                trySend(rows)
+                try {
+                    val rows = snap?.documents?.mapNotNull { d ->
+                        ChatMessage(
+                            id = d.id,
+                            senderId = d.getString("senderId").orEmpty(),
+                            text = d.getString("text").orEmpty(),
+                            type = d.getString("type") ?: "text",
+                            createdAt = d.safeTimestamp("timestamp"),
+                            read = d.getBoolean("read") == true,
+                            imageUrl = d.getString("imageUrl"),
+                            fileUrl = d.getString("fileUrl"),
+                            fileName = d.getString("fileName"),
+                            durationMs = d.getLong("durationMs"),
+                            viewOnce = d.getBoolean("viewOnce") == true,
+                            expiresAt = d.safeTimestamp("expiresAt"),
+                            replyToId = d.getString("replyToId"),
+                            replyToBody = d.getString("replyToBody"),
+                            replyToName = d.getString("replyToName"),
+                            audioBlob = d.getString("audioBlob"),
+                            edited = d.getBoolean("edited") == true,
+                            delivered = d.getBoolean("delivered") == true,
+                            reactions = parseReactions(d.get("reactions"))
+                        )
+                    } ?: emptyList()
+                    trySend(rows)
+                } catch (_: Exception) {
+                    // A single malformed message must not close the whole conversation.
+                }
             }
         awaitClose { reg.remove() }
     }
@@ -279,7 +289,7 @@ object FirestoreChat {
         val batch = db.batch()
         var dirty = false
         snap.documents.forEach { d ->
-            val exp = d.getTimestamp("expiresAt")
+            val exp = d.safeTimestamp("expiresAt")
             if (exp != null && exp.seconds <= now.seconds) {
                 batch.delete(d.reference)
                 dirty = true

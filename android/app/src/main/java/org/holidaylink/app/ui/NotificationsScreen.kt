@@ -50,6 +50,7 @@ import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.AppNotification
 import org.holidaylink.app.net.DeviceCache
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.FirebaseBackend
 
 /**
@@ -99,7 +100,7 @@ fun NotificationListScreen(
             .whereEqualTo("userId", uid)
             .limit(100).get(source).await()
         return snap.documents
-            .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+            .sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
             .map { d ->
             val data = d.get("data")
             AppNotification(
@@ -108,7 +109,7 @@ fun NotificationListScreen(
                 title = d.getString("title") ?: "HolidayLink",
                 body = d.getString("message") ?: d.getString("body").orEmpty(),
                 read = d.getBoolean("read") == true,
-                createdAt = d.getTimestamp("timestamp")?.toDate()?.toInstant()?.toString(),
+                createdAt = d.safeTimestamp("timestamp")?.toDate()?.toInstant()?.toString(),
                 conversationId = when (data) {
                     is Map<*, *> -> data["conversationId"] as? String
                     else -> d.getString("conversationId")

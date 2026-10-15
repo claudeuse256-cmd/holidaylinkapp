@@ -38,6 +38,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.data.AppSettings
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.FirebaseBackend
 
 /** One starred message recovered from Firestore. */
@@ -79,7 +80,7 @@ fun StarredMessagesScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                     messageId = msgId,
                     text = snap.getString("text").orEmpty(),
                     hasImage = !snap.getString("imageUrl").isNullOrBlank(),
-                    atSeconds = snap.getTimestamp("timestamp")?.seconds ?: 0L
+                    atSeconds = snap.safeTimestamp("timestamp")?.seconds ?: 0L
                 )
             )
         }

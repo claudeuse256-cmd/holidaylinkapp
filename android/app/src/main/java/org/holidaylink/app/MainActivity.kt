@@ -93,6 +93,7 @@ import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AccountStore
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.safeTimestamp
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestoreChat
@@ -404,33 +405,39 @@ private fun SignedInApp(
             .limit(40)
             .addSnapshotListener { snap, e ->
                 if (snap == null || e != null) return@addSnapshotListener
-                val ordered = snap.documents
-                    .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
-                if (!primed) {
-                    // First snapshot is the existing backlog: learn it, don't buzz for it.
-                    ordered.forEach { seen.add(it.id) }
-                    primed = true
-                    return@addSnapshotListener
-                }
-                snap.documentChanges.forEach { change ->
-                    if (change.type.name != "ADDED") return@forEach
-                    val d = change.document
-                    if (!seen.add(d.id)) return@forEach
-                    if (d.getBoolean("read") == true) return@forEach
-                    val type = d.getString("type") ?: "message"
-                    // Plain messages are already covered by the unread-counter listener below;
-                    // skipping them here stops the same message buzzing twice.
-                    if (type == "message") return@forEach
-                    val title = d.getString("title") ?: "HolidayLink"
-                    val body = d.getString("body") ?: ""
-                    // A call alert opens no conversation of its own — passing the callId as a
-                    // chat id would open (and even create) a bogus "direct" chat.
-                    val chatTarget = d.getString("chatId") ?: d.getString("conversationId")
-                    if (type == "call") {
-                        Notifier.call(context, d.id.hashCode(), title, body, chatTarget)
-                    } else {
-                        Notifier.message(context, d.id.hashCode(), title, body, chatTarget)
+                // This runs on the main thread, so a single document with an unexpected
+                // field type must never be allowed to crash the process.
+                try {
+                    val ordered = snap.documents
+                        .sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
+                    if (!primed) {
+                        // First snapshot is the existing backlog: learn it, don't buzz for it.
+                        ordered.forEach { seen.add(it.id) }
+                        primed = true
+                        return@addSnapshotListener
                     }
+                    snap.documentChanges.forEach { change ->
+                        if (change.type.name != "ADDED") return@forEach
+                        val d = change.document
+                        if (!seen.add(d.id)) return@forEach
+                        if (d.getBoolean("read") == true) return@forEach
+                        val type = d.getString("type") ?: "message"
+                        // Plain messages are already covered by the unread-counter listener below;
+                        // skipping them here stops the same message buzzing twice.
+                        if (type == "message") return@forEach
+                        val title = d.getString("title") ?: "HolidayLink"
+                        val body = d.getString("body") ?: ""
+                        // A call alert opens no conversation of its own — passing the callId as a
+                        // chat id would open (and even create) a bogus "direct" chat.
+                        val chatTarget = d.getString("chatId") ?: d.getString("conversationId")
+                        if (type == "call") {
+                            Notifier.call(context, d.id.hashCode(), title, body, chatTarget)
+                        } else {
+                            Notifier.message(context, d.id.hashCode(), title, body, chatTarget)
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Notifications are best effort; a bad document must never be fatal.
                 }
             }
         onDispose { reg.remove() }
@@ -1081,7 +1088,7 @@ private fun ChannelsScreen(
                         title = d.getString("groupName").orEmpty(),
                         peerId = null,
                         lastBody = d.getString("lastText"),
-                        lastAt = d.getTimestamp("lastAt"),
+                        lastAt = d.safeTimestamp("lastAt"),
                         unread = 0
                     )
                 }

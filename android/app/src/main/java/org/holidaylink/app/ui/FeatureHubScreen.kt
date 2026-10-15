@@ -39,6 +39,7 @@ import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Imgbb
 import androidx.compose.foundation.shape.CircleShape
@@ -221,7 +222,7 @@ fun StoreScreen(api: Api?, onBack: () -> Unit) {
             .limit(50).addSnapshotListener { snap, _ ->
                 @Suppress("UNCHECKED_CAST")
                 orders = snap?.documents
-                    ?.sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+                    ?.sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
                     ?.map { it.data.orEmpty() as Map<String, Any?> }
                     .orEmpty()
             }

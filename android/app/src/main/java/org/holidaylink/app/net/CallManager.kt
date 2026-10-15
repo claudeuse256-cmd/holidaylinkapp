@@ -72,7 +72,7 @@ class CallManager(private val context: Context, private val api: Api) {
                     if (d.getString("status") != "ringing") return@forEach
                     if (!ringingCalls.add(d.id)) return@forEach
                     // Ignore stale rings (e.g. replayed from the on-disk cache on cold start).
-                    val created = d.getTimestamp("createdAt") ?: return@forEach
+                    val created = d.safeTimestamp("createdAt") ?: return@forEach
                     if (System.currentTimeMillis() / 1000 - created.seconds > 60) return@forEach
                     val callerId = d.getString("callerId").orEmpty()
                     scope.launch {

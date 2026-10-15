@@ -69,6 +69,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Imgbb
@@ -595,7 +596,7 @@ private suspend fun loadFirestoreStatuses(
         .whereGreaterThan("expiresAt", now)
         .orderBy("expiresAt")
         .limit(200).get(source).await()
-    val docs = snap.documents.sortedByDescending { it.getTimestamp("createdAt")?.seconds ?: 0 }
+    val docs = snap.documents.sortedByDescending { it.safeTimestamp("createdAt")?.seconds ?: 0 }
     val authors = mutableMapOf<String, Pair<String, String?>>()
     return docs.mapNotNull { d ->
         val userId = d.getString("userId").orEmpty()
@@ -612,7 +613,7 @@ private suspend fun loadFirestoreStatuses(
             kind = if (d.getString("mediaUrl").isNullOrBlank() && d.getString("imageUrl").isNullOrBlank()) "text" else "image",
             body = d.getString("body") ?: d.getString("caption"),
             mediaUrl = d.getString("mediaUrl") ?: d.getString("imageUrl"),
-            createdAt = (d.getTimestamp("createdAt")?.toDate()?.toInstant()?.toString()).orEmpty(),
+            createdAt = (d.safeTimestamp("createdAt")?.toDate()?.toInstant()?.toString()).orEmpty(),
             viewerCount = 0,
             seenByMe = false
         )

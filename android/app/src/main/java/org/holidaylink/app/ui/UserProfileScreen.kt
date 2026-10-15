@@ -55,6 +55,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Profile
 import org.holidaylink.app.net.User
@@ -106,7 +107,7 @@ fun UserProfileScreen(
                 about = snap.getString("bio"),
                 phone = snap.getString("phone"),
                 online = snap.getBoolean("online"),
-                lastSeen = snap.getTimestamp("lastSeen")?.toDate()?.toInstant()?.toString(),
+                lastSeen = snap.safeTimestamp("lastSeen")?.toDate()?.toInstant()?.toString(),
                 isBlocked = myBlocked.contains(user.id),
                 blockedByThem = theirBlocked.contains(me)
             )

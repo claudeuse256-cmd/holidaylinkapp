@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestoreChat
@@ -132,7 +133,7 @@ fun SearchScreen(
                 ChatItem(
                     id = d.id, kind = kind, title = title, peer = peer,
                     lastBody = d.getString("lastText"),
-                    lastAt = d.getTimestamp("lastAt")?.toDate()?.toInstant()?.toString(),
+                    lastAt = d.safeTimestamp("lastAt")?.toDate()?.toInstant()?.toString(),
                     unreadCount = 0, pinned = false, archived = false, peerTyping = false
                 )
             }
@@ -159,7 +160,7 @@ fun SearchScreen(
                             id = m.id,
                             senderId = m.getString("senderId").orEmpty(),
                             body = body,
-                            createdAt = m.getTimestamp("timestamp")?.toDate()?.toInstant()?.toString().orEmpty(),
+                            createdAt = m.safeTimestamp("timestamp")?.toDate()?.toInstant()?.toString().orEmpty(),
                             conversationId = doc.id,
                             conversationKind = if (isGroup) "group" else "direct",
                             conversationTitle = doc.getString("groupName"),

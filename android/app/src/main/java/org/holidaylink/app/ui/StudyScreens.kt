@@ -74,6 +74,7 @@ import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Imgbb
 // ==================================================================== feed
@@ -1026,7 +1027,7 @@ private fun MyTickets(uid: String) {
                 .whereEqualTo("userId", uid).whereEqualTo("type", "event")
                 .limit(50).get().await()
             val docs = snap.documents
-                .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+                .sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
             ids = docs.map { it.id }
             @Suppress("UNCHECKED_CAST")
             tickets = docs.map { it.data.orEmpty() as Map<String, Any?> }
@@ -1093,12 +1094,12 @@ fun WalletScreen(api: Api, onBack: () -> Unit) {
             @Suppress("UNCHECKED_CAST")
             withdrawals = FirebaseBackend.db.collection("withdrawals").whereEqualTo("userId", uid)
                 .limit(50).get().await().documents
-                .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+                .sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
                 .map { it.data.orEmpty() as Map<String, Any?> }
             @Suppress("UNCHECKED_CAST")
             transactions = FirebaseBackend.db.collection("transactions").whereEqualTo("userId", uid)
                 .limit(50).get().await().documents
-                .sortedByDescending { it.getTimestamp("timestamp")?.seconds ?: 0L }
+                .sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
                 .map { it.data.orEmpty() as Map<String, Any?> }
         } catch (e: Exception) {
             snackbar.showSnackbar("Couldn't load wallet. Check your internet.")
