@@ -16,7 +16,9 @@ class HolidayLinkApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        PushNotify.init(this)
+        // First, so anything below can never take the app down without a trace.
+        CrashGuard.install(this)
+        runCatching { PushNotify.init(this) }
         runCatching { Notifier.ensureChannels(this) }
     }
 }

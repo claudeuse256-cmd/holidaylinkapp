@@ -152,6 +152,13 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppSettings.init(this)
+        // A crash on the previous run leaves a report behind; show it instead of dying again
+        // so the user can copy it (and reset the app if the loop is caused by local state).
+        val crashReport = CrashGuard.lastCrash(this)
+        if (crashReport != null) {
+            setContent { CrashReportScreen(this, crashReport) }
+            return
+        }
         NotificationRouter.consume(intent)
         setContent { HolidayLinkApp(this) }
     }
@@ -380,8 +387,9 @@ private fun SignedInApp(
     // Real system notifications: create the channels and register this device's FCM token…
     LaunchedEffect(userId) {
         if (userId.isBlank()) return@LaunchedEffect
-        Notifier.ensureChannels(context)
-        PushTokens.register()
+        // Belt and braces: a failure here (channels, FCM token) must never kill startup.
+        runCatching { Notifier.ensureChannels(context) }
+        runCatching { PushTokens.register() }
     }
     // …then watch this user's notification documents so a new alert actually lands in the
     // phone's notification shade while the app is alive (FCM covers the app-killed case).
@@ -434,26 +442,29 @@ private fun SignedInApp(
         if (userId.isBlank()) return@LaunchedEffect
         val lastUnread = HashMap<String, Int>()
         var primed = false
-        FirestoreChat.chatsFlow(userId).collect { rows ->
-            if (!primed) {
-                rows.forEach { lastUnread[it.id] = it.unread }
-                primed = true
-                return@collect
-            }
-            rows.forEach { row ->
-                val prev = lastUnread[row.id] ?: 0
-                if (row.unread > prev) {
-                    val openHere = (stack.lastOrNull() as? Destination.Chat)?.chat?.id == row.id
-                    if (!openHere) {
-                        val who = row.title.takeIf { it.isNotBlank() }
-                            ?: runCatching {
-                                FirestoreChat.resolvePeer(row.peerId.orEmpty()).displayName
-                            }.getOrNull()
-                            ?: "New message"
-                        Notifier.message(context, row.id.hashCode(), who, row.lastBody ?: "New message", row.id)
-                    }
+        // A Firestore/flow error must not escape into the composition and crash the app.
+        runCatching {
+            FirestoreChat.chatsFlow(userId).collect { rows ->
+                if (!primed) {
+                    rows.forEach { lastUnread[it.id] = it.unread }
+                    primed = true
+                    return@collect
                 }
-                lastUnread[row.id] = row.unread
+                rows.forEach { row ->
+                    val prev = lastUnread[row.id] ?: 0
+                    if (row.unread > prev) {
+                        val openHere = (stack.lastOrNull() as? Destination.Chat)?.chat?.id == row.id
+                        if (!openHere) {
+                            val who = row.title.takeIf { it.isNotBlank() }
+                                ?: runCatching {
+                                    FirestoreChat.resolvePeer(row.peerId.orEmpty()).displayName
+                                }.getOrNull()
+                                ?: "New message"
+                            Notifier.message(context, row.id.hashCode(), who, row.lastBody ?: "New message", row.id)
+                        }
+                    }
+                    lastUnread[row.id] = row.unread
+                }
             }
         }
     }
@@ -1190,6 +1201,76 @@ private fun BannedScreen(message: String, onSwitchNumber: () -> Unit) {
         Text(message, style = MaterialTheme.typography.bodyMedium, color = scheme.onSurfaceVariant)
         Spacer(Modifier.height(24.dp))
         Button(onClick = onSwitchNumber) { Text("Use a different number") }
+    }
+}
+
+// ---------------------------------------------------------------- crash report
+
+/**
+ * Shown in place of the app when the previous run crashed. It turns a silent crash loop
+ * into something actionable: copy the trace to send us, try again, or reset the local
+ * session (which is what usually unblocks a loop) and start over at sign-in.
+ */
+@Composable
+private fun CrashReportScreen(activity: FragmentActivity, report: String) {
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    HolidayLinkTheme(
+        themeMode = AppSettings.state.themeMode,
+        fontScale = AppSettings.state.fontScale
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background
+        ) {
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Icon(Icons.Default.Block, null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(44.dp))
+                Text("HolidayLink closed unexpectedly", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "Here is what went wrong. Copy it and send it to support, or reset the app to open it again.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Surface(
+                    Modifier.fillMaxWidth().height(300.dp),
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.surfaceVariant
+                ) {
+                    Text(
+                        report,
+                        modifier = Modifier.verticalScroll(rememberScrollState()).padding(12.dp),
+                        fontSize = 11.sp,
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                    )
+                }
+                Button(
+                    onClick = {
+                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(report))
+                        copied = true
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (copied) "Copied — paste it to support" else "Copy details") }
+                OutlinedButton(
+                    onClick = {
+                        CrashGuard.acknowledge(activity)
+                        activity.recreate()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Try again") }
+                OutlinedButton(
+                    onClick = {
+                        CrashGuard.resetLocalState(activity)
+                        activity.recreate()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Reset app and sign in again") }
+            }
+        }
     }
 }
 

@@ -48,10 +48,16 @@ class CallManager(private val context: Context, private val api: Api) {
 
     fun connect() {
         if (factory != null) return
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions()
-        )
-        factory = PeerConnectionFactory.builder().createPeerConnectionFactory()
+        factory = try {
+            PeerConnectionFactory.initialize(
+                PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions()
+            )
+            PeerConnectionFactory.builder().createPeerConnectionFactory()
+        } catch (_: Throwable) {
+            // A device with no usable WebRTC native library must not take the whole app
+            // down with it; calls simply stay unavailable until the next launch.
+            null
+        }
         val uid = FirebaseBackend.uid ?: return
         // Calls addressed to this device. Only one equality filter: pairing it with
         // `status` needs a composite index that may not be deployed, which is exactly
