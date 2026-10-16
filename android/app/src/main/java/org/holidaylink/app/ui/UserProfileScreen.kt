@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -51,6 +52,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.Api
@@ -224,33 +226,39 @@ fun UserProfileScreen(
                 }
 
                 Spacer(Modifier.height(24.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = { onOpenChat(user) },
                         enabled = !blocked && !shown.blockedByThem && !busy,
-                        modifier = Modifier.weight(1f)
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+                        modifier = Modifier.weight(1f).heightIn(min = 64.dp)
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.Message, null, Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Message")
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.AutoMirrored.Filled.Message, null, Modifier.size(19.dp))
+                            Text("Message", maxLines = 1, softWrap = false, fontSize = 12.sp)
+                        }
                     }
                     OutlinedButton(
                         onClick = { onStartCall(user, "audio") },
                         enabled = !blocked && !shown.blockedByThem && !busy,
-                        modifier = Modifier.weight(1f)
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+                        modifier = Modifier.weight(1f).heightIn(min = 64.dp)
                     ) {
-                        Icon(Icons.Default.Call, null, Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Audio")
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.Call, null, Modifier.size(19.dp))
+                            Text("Audio", maxLines = 1, softWrap = false, fontSize = 12.sp)
+                        }
                     }
                     OutlinedButton(
                         onClick = { onStartCall(user, "video") },
                         enabled = !blocked && !shown.blockedByThem && !busy,
-                        modifier = Modifier.weight(1f)
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+                        modifier = Modifier.weight(1f).heightIn(min = 64.dp)
                     ) {
-                        Icon(Icons.Default.Videocam, null, Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Video")
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.Videocam, null, Modifier.size(19.dp))
+                            Text("Video", maxLines = 1, softWrap = false, fontSize = 12.sp)
+                        }
                     }
                 }
 

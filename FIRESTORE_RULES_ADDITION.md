@@ -115,3 +115,19 @@ service firebase.storage {
   }
 }
 ```
+
+## Status videos (Firebase Storage)
+
+Status videos are uploaded to `statuses/{uid}/{filename}` and are limited to 30 MB by the app. Merge this Storage rule with the existing chat-media rules (do not replace the entire ruleset):
+
+```storage
+match /statuses/{uid}/{fileName} {
+  allow read: if request.auth != null;
+  allow write: if request.auth != null
+    && request.auth.uid == uid
+    && request.resource.size < 30 * 1024 * 1024
+    && request.resource.contentType.matches('video/.*');
+}
+```
+
+Cloud backup records are written only by the Render Admin SDK to `userBackups/{uid}`; clients should not be granted direct access to that collection. Email verification codes in `backupEmailCodes/{uid}` must also remain server-only.

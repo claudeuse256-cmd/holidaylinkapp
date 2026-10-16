@@ -24,8 +24,8 @@ android {
         applicationId = "org.holidaylink.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "2.3.3"
+        versionCode = 9
+        versionName = "2.3.4"
 
         buildConfigField("String", "API_BASE_URL", "\"$apiBaseUrl\"")
     }

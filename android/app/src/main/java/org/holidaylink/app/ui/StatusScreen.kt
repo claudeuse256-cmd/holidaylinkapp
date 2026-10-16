@@ -1,6 +1,7 @@
 package org.holidaylink.app.ui
 
 import android.net.Uri
+import android.widget.VideoView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -44,6 +46,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -61,12 +64,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.tasks.await
+import com.google.firebase.storage.FirebaseStorage
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.safeTimestamp
@@ -78,7 +83,7 @@ import org.holidaylink.app.net.Me
 import org.holidaylink.app.net.StatusUpdate
 
 /**
- * Status updates: text and single-image updates that disappear after 24 hours.
+ * Status updates: text, photo and video updates that disappear from the feed after 24 hours.
  *
  * Visibility is decided by the server from the "Who can see my status updates" rule in Privacy.
  * The audience is therefore not re-implemented here; this screen only reads what the server sends.
@@ -433,13 +438,21 @@ private fun StatusRow(
             }
             if (!status.mediaUrl.isNullOrBlank()) {
                 Spacer(Modifier.height(8.dp))
-                RemoteImage(
-                    url = status.mediaUrl,
-                    modifier = Modifier
-                        .fillMaxWidth(0.7f)
-                        .height(190.dp)
-                        .clip(MaterialTheme.shapes.medium)
-                )
+                if (status.kind == "video") {
+                    Row(
+                        Modifier.fillMaxWidth(0.7f).height(88.dp).clip(MaterialTheme.shapes.medium)
+                            .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.VideoLibrary, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(30.dp))
+                        Spacer(Modifier.width(10.dp)); Text("Video status · tap to play", style = MaterialTheme.typography.bodyMedium)
+                    }
+                } else {
+                    RemoteImage(
+                        url = status.mediaUrl,
+                        modifier = Modifier.fillMaxWidth(0.7f).height(190.dp).clip(MaterialTheme.shapes.medium)
+                    )
+                }
             }
             if (mine) {
                 Spacer(Modifier.height(4.dp))
@@ -493,6 +506,8 @@ private fun StatusComposer(
 ) {
     var text by remember { mutableStateOf("") }
     var media by remember { mutableStateOf<String?>(null) }
+    var mediaUri by remember { mutableStateOf<Uri?>(null) }
+    var mediaKind by remember { mutableStateOf("text") }
     var posting by remember { mutableStateOf(false) }
     var encoding by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
@@ -505,10 +520,24 @@ private fun StatusComposer(
         if (uri == null) return@rememberLauncherForActivityResult
         encoding = true
         scope.launch {
-            // Re-encoding a photo must never run on the main thread.
-            val dataUrl = withContext(Dispatchers.IO) { MediaPicker.imageDataUrl(context, uri) }
+            val mime = context.contentResolver.getType(uri).orEmpty()
+            if (mime.startsWith("video/")) {
+                val file = MediaPicker.inspect(context, uri)
+                if (file.sizeBytes > 30L * 1024 * 1024) {
+                    error = "Status videos must be 30 MB or smaller."
+                } else {
+                    media = null
+                    mediaUri = uri
+                    mediaKind = "video"
+                    error = ""
+                }
+            } else {
+                // Re-encoding a photo must never run on the main thread.
+                val dataUrl = withContext(Dispatchers.IO) { MediaPicker.imageDataUrl(context, uri) }
+                if (dataUrl == null) error = "That photo couldn't be read."
+                else { media = dataUrl; mediaUri = null; mediaKind = "image"; error = "" }
+            }
             encoding = false
-            if (dataUrl == null) error = "That photo couldn't be read." else media = dataUrl
         }
     }
 
@@ -533,27 +562,22 @@ private fun StatusComposer(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
                         onClick = {
-                            picker.launch(
-                                PickVisualMediaRequest(
-                                    ActivityResultContracts.PickVisualMedia.ImageOnly
-                                )
-                            )
+                            picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                         }
-                    ) {
-                        Icon(Icons.Default.Image, "Add a photo")
-                    }
-                    if (media != null) {
-                        Text("Photo attached", style = MaterialTheme.typography.bodySmall)
+                    ) { Icon(Icons.Default.Image, "Add a photo") }
+                    IconButton(
+                        onClick = {
+                            picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly))
+                        }
+                    ) { Icon(Icons.Default.VideoLibrary, "Add a video") }
+                    if (media != null || mediaUri != null) {
+                        Text(if (mediaKind == "video") "Video attached" else "Photo attached", style = MaterialTheme.typography.bodySmall)
                         Spacer(Modifier.width(8.dp))
-                        IconButton(onClick = { media = null }) {
-                            Icon(Icons.Default.Close, "Remove photo")
+                        IconButton(onClick = { media = null; mediaUri = null; mediaKind = "text" }) {
+                            Icon(Icons.Default.Close, "Remove media")
                         }
                     } else {
-                        Text(
-                            "Photo optional",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Text("Photo or video optional", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
                 if (error.isNotBlank()) {
@@ -569,7 +593,7 @@ private fun StatusComposer(
                     posting = true
                     error = ""
                     scope.launch {
-                        runCatching { postFirestoreStatus(text.trim(), media) }
+                        runCatching { postFirestoreStatus(context, text.trim(), media, mediaUri, mediaKind) }
                             .onSuccess {
                                 onPosted()
                             }
@@ -580,7 +604,7 @@ private fun StatusComposer(
                     }
                 },
                 // A photo on its own is allowed too.
-                enabled = (text.isNotBlank() || media != null) && !posting && !encoding
+                enabled = (text.isNotBlank() || media != null || mediaUri != null) && !posting && !encoding
             ) { Text(if (posting) "Posting…" else "Post") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
@@ -610,7 +634,8 @@ private suspend fun loadFirestoreStatuses(
             userId = userId,
             userName = author.first,
             avatarUrl = author.second,
-            kind = if (d.getString("mediaUrl").isNullOrBlank() && d.getString("imageUrl").isNullOrBlank()) "text" else "image",
+            kind = d.getString("kind")?.takeIf { it in setOf("text", "image", "video") }
+                ?: if (d.getString("mediaUrl").isNullOrBlank() && d.getString("imageUrl").isNullOrBlank()) "text" else "image",
             body = d.getString("body") ?: d.getString("caption"),
             mediaUrl = d.getString("mediaUrl") ?: d.getString("imageUrl"),
             createdAt = (d.safeTimestamp("createdAt")?.toDate()?.toInstant()?.toString()).orEmpty(),
@@ -620,10 +645,18 @@ private suspend fun loadFirestoreStatuses(
     }
 }
 
-/** Post text + optional photo (imgbb, like the website) with 24h expiry. */
-private suspend fun postFirestoreStatus(text: String, mediaDataUrl: String?) {
+/** Post text/photo/video status with 24-hour expiry. Photos use imgbb; videos use Firebase Storage. */
+private suspend fun postFirestoreStatus(context: android.content.Context, text: String, mediaDataUrl: String?, mediaUri: Uri?, mediaKind: String) {
     val uid = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
     var mediaUrl: String? = null
+    if (mediaKind == "video" && mediaUri != null) {
+        val file = MediaPicker.inspect(context, mediaUri)
+        if (file.sizeBytes > 30L * 1024 * 1024) throw ApiException("Status videos must be 30 MB or smaller.")
+        val extension = if (file.mimeType == "video/3gpp") "3gp" else "mp4"
+        val ref = FirebaseStorage.getInstance().reference.child("statuses/$uid/${System.currentTimeMillis()}.$extension")
+        ref.putFile(mediaUri).await()
+        mediaUrl = ref.downloadUrl.await().toString()
+    }
     if (!mediaDataUrl.isNullOrBlank() && mediaDataUrl.startsWith("data:")) {
         val base64 = mediaDataUrl.substringAfter(",", "")
         if (base64.isBlank()) throw ApiException("That photo couldn't be read.")
@@ -634,7 +667,7 @@ private suspend fun postFirestoreStatus(text: String, mediaDataUrl: String?) {
     FirebaseBackend.db.collection("statuses").add(
         mapOf(
             "userId" to uid,
-            "kind" to if (mediaUrl != null) "image" else "text",
+            "kind" to when { mediaUrl == null -> "text"; mediaKind == "video" -> "video"; else -> "image" },
             "body" to text,
             "mediaUrl" to mediaUrl,
             "createdAt" to now,
@@ -729,6 +762,7 @@ private fun StatusViewer(
     var index by remember(updates) { mutableIntStateOf(startIndex.coerceIn(0, updates.lastIndex)) }
     var progress by remember { mutableFloatStateOf(0f) }
     var paused by remember { mutableStateOf(false) }
+    var videoPlayer by remember { mutableStateOf<VideoView?>(null) }
     val current = updates[index.coerceIn(0, updates.lastIndex)]
 
     fun stepForward() {
@@ -740,18 +774,44 @@ private fun StatusViewer(
         }
     }
 
-    LaunchedEffect(index, paused) {
-        if (paused) return@LaunchedEffect
-        while (progress < 1f) {
-            kotlinx.coroutines.delay(80)
-            progress = (progress + 0.016f).coerceAtMost(1f)
+    LaunchedEffect(index, paused, current.kind) {
+        if (paused) {
+            videoPlayer?.pause()
+            return@LaunchedEffect
         }
-        stepForward()
+        if (current.kind == "video") {
+            // Video status progress follows actual playback; do not skip a video after the
+            // five-second image timer. VideoView's completion callback advances the reel.
+            while (true) {
+                kotlinx.coroutines.delay(80)
+                val player = videoPlayer ?: continue
+                val duration = player.duration
+                if (duration > 0) progress = (player.currentPosition.toFloat() / duration).coerceIn(0f, 1f)
+            }
+        } else {
+            while (progress < 1f) {
+                kotlinx.coroutines.delay(80)
+                progress = (progress + 0.016f).coerceAtMost(1f)
+            }
+            stepForward()
+        }
     }
 
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
-            if (!current.mediaUrl.isNullOrBlank()) {
+            if (!current.mediaUrl.isNullOrBlank() && current.kind == "video") {
+                key(current.id) {
+                    AndroidView(
+                        factory = { ctx -> VideoView(ctx).apply {
+                            videoPlayer = this
+                            setVideoURI(Uri.parse(current.mediaUrl))
+                            setOnPreparedListener { if (paused) pause() else start() }
+                            setOnCompletionListener { stepForward() }
+                        } },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            } else if (!current.mediaUrl.isNullOrBlank()) {
                 RemoteImage(url = current.mediaUrl, modifier = Modifier.fillMaxSize())
             } else {
                 Box(

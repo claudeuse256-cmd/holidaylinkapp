@@ -34,6 +34,11 @@ class CallManager(private val context: Context, private val api: Api) {
     private var factory: PeerConnectionFactory? = null
     private var localVideo: VideoTrack? = null
     private var localAudio: AudioTrack? = null
+    private var audioSource: AudioSource? = null
+    private var videoSource: VideoSource? = null
+    private var videoCapturer: VideoCapturer? = null
+    private var surfaceTextureHelper: SurfaceTextureHelper? = null
+    private var cameraEgl: EglBase? = null
     private var currentCallId: String? = null
     private var currentKind = "audio"
     private var isCaller = false
@@ -91,6 +96,7 @@ class CallManager(private val context: Context, private val api: Api) {
         callReg?.remove(); callReg = null
         candReg?.remove(); candReg = null
         pc?.close(); pc = null
+        cleanupCall()
         factory?.dispose(); factory = null
         currentCallId = null
     }
@@ -104,6 +110,11 @@ class CallManager(private val context: Context, private val api: Api) {
         connect()
         currentKind = kind
         isCaller = true
+        accepted = false
+        answerApplied = false
+        remoteSet = false
+        pendingCandidates.clear()
+        seenCandidates.clear()
         val uid = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
         val ref = db.collection("calls").add(
             mapOf(
@@ -239,6 +250,17 @@ class CallManager(private val context: Context, private val api: Api) {
         remoteSet = false
         pendingCandidates.clear()
         seenCandidates.clear()
+        // Release camera/microphone resources on hang-up so the next call does not inherit
+        // a busy camera or keep the microphone active in the background.
+        runCatching { videoCapturer?.stopCapture() }
+        runCatching { videoCapturer?.dispose() }
+        videoCapturer = null
+        runCatching { localVideo?.dispose() }; localVideo = null
+        runCatching { localAudio?.dispose() }; localAudio = null
+        runCatching { videoSource?.dispose() }; videoSource = null
+        runCatching { audioSource?.dispose() }; audioSource = null
+        runCatching { surfaceTextureHelper?.dispose() }; surfaceTextureHelper = null
+        runCatching { cameraEgl?.release() }; cameraEgl = null
     }
 
     /** Remote description is in place: apply any ICE that arrived early. */
@@ -383,16 +405,23 @@ class CallManager(private val context: Context, private val api: Api) {
             override fun onAddTrack(r: RtpReceiver, m: Array<MediaStream>) {}
         }) ?: return
         val audio = f.createAudioSource(MediaConstraints())
+        audioSource = audio
         localAudio = f.createAudioTrack("audio", audio)
         pc!!.addTrack(localAudio)
         if (currentKind == "video") {
             val egl = EglBase.create()
-            val capt = Camera2Enumerator(context).deviceNames.firstOrNull()?.let { name ->
-                Camera2Enumerator(context).createCapturer(name, null)
-            }
+            cameraEgl = egl
+            val enumerator = Camera2Enumerator(context)
+            val cameraName = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
+                ?: enumerator.deviceNames.firstOrNull()
+            val capt = cameraName?.let { name -> enumerator.createCapturer(name, null) }
             if (capt != null) {
+                videoCapturer = capt
+                val helper = SurfaceTextureHelper.create("HL-Cam", egl.eglBaseContext)
+                surfaceTextureHelper = helper
                 val src = f.createVideoSource(false)
-                capt.initialize(SurfaceTextureHelper.create("HL-Cam", egl.eglBaseContext), context, src.capturerObserver)
+                videoSource = src
+                capt.initialize(helper, context, src.capturerObserver)
                 capt.startCapture(640, 480, 24)
                 localVideo = f.createVideoTrack("video", src)
                 pc!!.addTrack(localVideo)

@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import admin from 'firebase-admin';
+import nodemailer from 'nodemailer';
 
 /**
  * HolidayLink OTP service (v3).
@@ -23,7 +24,7 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '3mb' }));
 
 const PORT = Number(process.env.PORT || 8080);
 const DEFAULT_COUNTRY_CODE = String(process.env.DEFAULT_COUNTRY_CODE || '256').replace(/\D/g, '') || '256';
@@ -467,6 +468,135 @@ app.post('/push/send', async (req, res) => {
   });
 
   res.json({ ok: true, recipients: recipients.length, sent, failed, skipped });
+});
+
+
+// ---------------------------------------------------------------- encrypted cloud settings backup + email recovery verification
+
+const BACKUP_EMAIL_TTL_MS = 10 * 60 * 1000;
+const backupEmailHits = new Map();
+const SMTP_HOST = String(process.env.SMTP_HOST || '').trim();
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = String(process.env.SMTP_USER || '').trim();
+const SMTP_PASS = String(process.env.SMTP_PASS || '').trim();
+const SMTP_FROM = String(process.env.SMTP_FROM || SMTP_USER).trim();
+const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
+function smtpConfigured() { return Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS && SMTP_FROM); }
+function smtpTransport() {
+  if (!smtpConfigured()) throw new Error('SMTP is not configured');
+  return nodemailer.createTransport({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE,
+    auth: { user: SMTP_USER, pass: SMTP_PASS }, connectionTimeout: 12000, socketTimeout: 15000 });
+}
+function validEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
+}
+function backupCodeHash(uid, email, code) {
+  return crypto.createHash('sha256').update(`${uid}:${email}:${code}`).digest('hex');
+}
+function backupEmailRateAllowed(uid) {
+  const now = Date.now();
+  const prev = backupEmailHits.get(uid) || 0;
+  if (now - prev < 60_000) return false;
+  backupEmailHits.set(uid, now);
+  return true;
+}
+
+app.get('/backup/email/status', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const user = await verifyBearer(req);
+  if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  const snap = await db().collection('users').doc(user.uid).get();
+  const row = snap.data() || {};
+  return res.json({ verified: Boolean(row.backupEmailVerifiedAt && row.backupEmail), email: row.backupEmail || '' });
+});
+
+app.post('/backup/email/start', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const user = await verifyBearer(req);
+  if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  const email = validEmail(req.body.email);
+  if (!email) return res.status(400).json({ error: 'INVALID_EMAIL', message: 'Enter a valid email address.' });
+  if (!smtpConfigured()) return res.status(503).json({ error: 'SMTP_NOT_CONFIGURED', message: 'Email recovery is not configured on the server yet.' });
+  if (!backupEmailRateAllowed(user.uid)) return res.status(429).json({ error: 'RATE_LIMITED', message: 'Wait one minute before requesting another code.' });
+  const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+  const ref = db().collection('backupEmailCodes').doc(user.uid);
+  await ref.set({ email, codeHash: backupCodeHash(user.uid, email, code), attempts: 0, createdAt: Date.now(), expiresAt: Date.now() + BACKUP_EMAIL_TTL_MS });
+  try {
+    await smtpTransport().sendMail({
+      from: SMTP_FROM, to: email, subject: 'HolidayLink backup verification code',
+      text: `Your HolidayLink backup email verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`,
+      html: `<p>Your HolidayLink backup email verification code is:</p><p style="font-size:28px;font-weight:bold;letter-spacing:6px">${code}</p><p>It expires in 10 minutes. If you did not request this, ignore this email.</p>`
+    });
+  } catch (err) {
+    await ref.delete().catch(() => {});
+    console.error('[backup/email/start] SMTP send failed:', err.message);
+    return res.status(502).json({ error: 'EMAIL_SEND_FAILED', message: 'Could not send the email. Check the SMTP settings on Render.' });
+  }
+  return res.json({ ok: true, message: 'Verification code sent.' });
+});
+
+app.post('/backup/email/verify', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const user = await verifyBearer(req);
+  if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  const code = String(req.body.code || '').replace(/\D/g, '').slice(0, 6);
+  if (code.length !== 6) return res.status(400).json({ error: 'INVALID_CODE', message: 'Enter the six-digit code.' });
+  const ref = db().collection('backupEmailCodes').doc(user.uid);
+  const snap = await ref.get();
+  if (!snap.exists) return res.status(400).json({ error: 'CODE_EXPIRED', message: 'Request a new email code.' });
+  const row = snap.data() || {};
+  if (Number(row.expiresAt || 0) < Date.now()) {
+    await ref.delete().catch(() => {});
+    return res.status(400).json({ error: 'CODE_EXPIRED', message: 'Request a new email code.' });
+  }
+  if (Number(row.attempts || 0) >= 5) {
+    await ref.delete().catch(() => {});
+    return res.status(429).json({ error: 'TOO_MANY_ATTEMPTS', message: 'Too many attempts. Request a new code.' });
+  }
+  const expected = String(row.codeHash || '');
+  const supplied = backupCodeHash(user.uid, String(row.email || ''), code);
+  const a = Buffer.from(expected, 'hex'); const b = Buffer.from(supplied, 'hex');
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    await ref.update({ attempts: admin.firestore.FieldValue.increment(1) });
+    return res.status(400).json({ error: 'INVALID_CODE', message: 'That code is not correct.' });
+  }
+  const email = String(row.email || '');
+  await db().collection('users').doc(user.uid).set({ backupEmail: email, backupEmailVerifiedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+  await ref.delete().catch(() => {});
+  return res.json({ ok: true, email });
+});
+
+// The app encrypts the settings JSON with a passphrase before upload. The server only stores
+// ciphertext and cannot read the settings or recover the passphrase.
+app.put('/backup/cloud', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const user = await verifyBearer(req);
+  if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  const doc = await db().collection('users').doc(user.uid).get();
+  if (!doc.exists || !doc.get('backupEmailVerifiedAt') || !doc.get('backupEmail')) {
+    return res.status(403).json({ error: 'EMAIL_NOT_VERIFIED', message: 'Verify a backup email first.' });
+  }
+  const encrypted = String(req.body.encrypted || '');
+  const salt = String(req.body.salt || '');
+  const iv = String(req.body.iv || '');
+  if (encrypted.length < 16 || encrypted.length > 900_000 || salt.length > 100 || iv.length > 100) {
+    return res.status(400).json({ error: 'INVALID_BACKUP', message: 'Backup data is invalid or too large.' });
+  }
+  await db().collection('userBackups').doc(user.uid).set({ encrypted, salt, iv, version: 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+  return res.json({ ok: true, updatedAt: new Date().toISOString() });
+});
+
+app.get('/backup/cloud', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const user = await verifyBearer(req);
+  if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  const doc = await db().collection('users').doc(user.uid).get();
+  if (!doc.exists || !doc.get('backupEmailVerifiedAt')) return res.status(403).json({ error: 'EMAIL_NOT_VERIFIED', message: 'Verify a backup email first.' });
+  const backup = await db().collection('userBackups').doc(user.uid).get();
+  if (!backup.exists) return res.status(404).json({ error: 'BACKUP_NOT_FOUND', message: 'No cloud backup exists for this account yet.' });
+  const row = backup.data() || {};
+  return res.json({ encrypted: row.encrypted, salt: row.salt, iv: row.iv, version: row.version || 1, updatedAt: row.updatedAt?.toDate?.()?.toISOString?.() || null });
 });
 
 // ---------------------------------------------------------------- in-app account switching

@@ -9,6 +9,7 @@ import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.ui.theme.ChatDensity
 import org.holidaylink.app.ui.theme.ThemeMode
 import java.util.Locale
+import org.json.JSONObject
 
 /** Media auto-download policy, mirroring the three states users expect. */
 enum class AutoDownload { ALWAYS, WIFI_ONLY, NEVER }
@@ -201,6 +202,72 @@ object AppSettings {
         state = read()
         listeners.toList().forEach { runCatching { it(state) } }
         return state
+    }
+
+    /**
+     * Export device-side preferences for a user-controlled local backup file.
+     * Authentication material and app-lock secrets are deliberately never exported.
+     */
+    fun exportSettingsBackup(): String {
+        check(::prefs.isInitialized) { "App settings have not been initialized" }
+        val excluded = setOf("set.pin", "set.appLock", "set.biometric")
+        val values = JSONObject()
+        prefs.all.forEach { (key, value) ->
+            if (!key.startsWith("set.") || key in excluded || value == null) return@forEach
+            val item = JSONObject()
+            when (value) {
+                is String -> item.put("type", "string").put("value", value)
+                is Boolean -> item.put("type", "boolean").put("value", value)
+                is Int -> item.put("type", "int").put("value", value)
+                is Long -> item.put("type", "long").put("value", value)
+                is Float -> item.put("type", "float").put("value", value.toDouble())
+                is Set<*> -> item.put("type", "string_set").put("value", org.json.JSONArray(value.filterIsInstance<String>()))
+                else -> return@forEach
+            }
+            values.put(key, item)
+        }
+        return JSONObject()
+            .put("format", "holidaylink-settings-backup")
+            .put("version", 1)
+            .put("createdAt", System.currentTimeMillis())
+            .put("settings", values)
+            .toString(2)
+    }
+
+    /** Restore only supported device settings; never imports credentials or lock secrets. */
+    fun importSettingsBackup(json: String) {
+        check(::prefs.isInitialized) { "App settings have not been initialized" }
+        val root = JSONObject(json)
+        require(root.optString("format") == "holidaylink-settings-backup") {
+            "This is not a HolidayLink settings backup"
+        }
+        require(root.optInt("version", -1) == 1) { "Unsupported backup version" }
+        val values = root.optJSONObject("settings") ?: error("Backup has no settings")
+        val excluded = setOf("set.pin", "set.appLock", "set.biometric")
+        val editor = prefs.edit()
+        // Replace only this app's setting keys; leave auth/session and unrelated preferences alone.
+        prefs.all.keys.filter { it.startsWith("set.") && it !in excluded }.forEach(editor::remove)
+        val keys = values.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            if (!key.startsWith("set.") || key in excluded) continue
+            val item = values.optJSONObject(key) ?: continue
+            val value = item.opt("value")
+            when (item.optString("type")) {
+                "string" -> if (value is String) editor.putString(key, value)
+                "boolean" -> if (value is Boolean) editor.putBoolean(key, value)
+                "int" -> if (value is Number) editor.putInt(key, value.toInt())
+                "long" -> if (value is Number) editor.putLong(key, value.toLong())
+                "float" -> if (value is Number) editor.putFloat(key, value.toFloat())
+                "string_set" -> {
+                    val array = item.optJSONArray("value") ?: continue
+                    val set = buildSet { for (i in 0 until array.length()) array.optString(i).takeIf { it.isNotEmpty() }?.let(::add) }
+                    editor.putStringSet(key, set)
+                }
+            }
+        }
+        check(editor.commit()) { "Could not save restored settings" }
+        commit()
     }
 
     // ------------------------------------------------------------------ mutations

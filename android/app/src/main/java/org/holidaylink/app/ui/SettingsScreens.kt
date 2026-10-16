@@ -87,15 +87,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AutoDownload
 import org.holidaylink.app.data.DisappearingDuration
 import org.holidaylink.app.net.Api
+import org.holidaylink.app.net.CloudSettingsBackup
 import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Audience
@@ -1244,9 +1248,54 @@ fun DataStorageScreen(onBack: () -> Unit) {
     var photosPicker by remember { mutableStateOf(false) }
     var videosPicker by remember { mutableStateOf(false) }
     var docsPicker by remember { mutableStateOf(false) }
+    var backupEmail by remember { mutableStateOf("") }
+    var backupCode by remember { mutableStateOf("") }
+    var backupPassphrase by remember { mutableStateOf("") }
+    var backupEmailVerified by remember { mutableStateOf(false) }
+    var backupEmailCodeSent by remember { mutableStateOf(false) }
+    var cloudBackupBusy by remember { mutableStateOf(false) }
+
+    val exportBackup = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val json = AppSettings.exportSettingsBackup()
+                    context.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { it.write(json) }
+                        ?: error("Could not open the selected backup file")
+                }
+            }.onSuccess {
+                snackbar.showSnackbar("Settings backup saved. Chats and media are not included.")
+            }.onFailure {
+                snackbar.showSnackbar("Backup failed: ${it.message ?: "unknown error"}")
+            }
+        }
+    }
+    val importBackup = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) scope.launch {
+            runCatching {
+                val json = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                        ?: error("Could not read the selected backup file")
+                }
+                AppSettings.importSettingsBackup(json)
+            }.onSuccess {
+                snackbar.showSnackbar("Settings restored. App-lock security must be configured again if needed.")
+            }.onFailure {
+                snackbar.showSnackbar("Restore failed: ${it.message ?: "invalid backup"}")
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         cacheBytes = directorySize(context.cacheDir)
+        runCatching { CloudSettingsBackup.emailStatus(context) }.onSuccess { (verified, email) ->
+            backupEmailVerified = verified
+            if (verified) backupEmail = email
+        }
     }
 
     SettingsScaffold("Data and storage", onBack, snackbar) {
@@ -1268,6 +1317,113 @@ fun DataStorageScreen(onBack: () -> Unit) {
                             )
                         }
                     }
+                )
+            }
+
+            SettingsSection("Backup and restore") {
+                SettingsNavRow(
+                    title = "Create settings backup",
+                    icon = Icons.Default.Storage,
+                    subtitle = "Save preferences to a JSON file on your device",
+                    onClick = { exportBackup.launch("holidaylink-settings-backup.json") }
+                )
+                SettingsNavRow(
+                    title = "Restore settings backup",
+                    icon = Icons.Default.CloudDownload,
+                    subtitle = "Restore preferences from a saved JSON file",
+                    onClick = { importBackup.launch(arrayOf("application/json", "text/*")) }
+                )
+                Text(
+                    "This backup includes app preferences such as theme, chat display, and notification options. It does not back up chat messages, photos, videos, account credentials, or the app-lock PIN.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 8.dp)
+                )
+            }
+
+            SettingsSection("Encrypted cloud backup and email recovery") {
+                Text(
+                    "Your settings backup is encrypted on this phone before upload. The server stores ciphertext only. Set a backup email and verify it first.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 8.dp)
+                )
+                if (!backupEmailVerified) {
+                    androidx.compose.material3.OutlinedTextField(
+                        value = backupEmail, onValueChange = { backupEmail = it.take(254) },
+                        label = { Text("Recovery email") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)
+                    )
+                    Button(
+                        enabled = !cloudBackupBusy && backupEmail.contains("@") && backupEmail.contains("."),
+                        onClick = {
+                            scope.launch {
+                                cloudBackupBusy = true
+                                runCatching { CloudSettingsBackup.startEmailVerification(context, backupEmail) }
+                                    .onSuccess { backupEmailCodeSent = true; snackbar.showSnackbar("Verification code sent. Check your email.") }
+                                    .onFailure { snackbar.showSnackbar(it.message ?: "Could not send verification email.") }
+                                cloudBackupBusy = false
+                            }
+                        }, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)
+                    ) { Text(if (cloudBackupBusy) "Please wait…" else "Send verification code") }
+                    if (backupEmailCodeSent) {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = backupCode, onValueChange = { backupCode = it.filter(Char::isDigit).take(6) },
+                            label = { Text("6-digit email code") }, singleLine = true,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)
+                        )
+                        OutlinedButton(
+                            enabled = !cloudBackupBusy && backupCode.length == 6,
+                            onClick = {
+                                scope.launch {
+                                    cloudBackupBusy = true
+                                    runCatching { CloudSettingsBackup.verifyEmail(context, backupCode) }
+                                        .onSuccess { email -> backupEmail = email; backupEmailVerified = true; backupEmailCodeSent = false; backupCode = ""; snackbar.showSnackbar("Recovery email verified.") }
+                                        .onFailure { snackbar.showSnackbar(it.message ?: "Code verification failed.") }
+                                    cloudBackupBusy = false
+                                }
+                            }, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
+                        ) { Text("Verify email") }
+                    }
+                } else {
+                    Text("Verified recovery email: $backupEmail", modifier = Modifier.padding(horizontal = 22.dp, vertical = 8.dp), style = MaterialTheme.typography.bodyMedium)
+                    TextButton(onClick = { backupEmailVerified = false; backupEmailCodeSent = false; backupCode = "" }) { Text("Change recovery email") }
+                }
+                androidx.compose.material3.OutlinedTextField(
+                    value = backupPassphrase, onValueChange = { backupPassphrase = it.take(128) },
+                    label = { Text("Backup passphrase (8+ characters)") }, singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)
+                )
+                Button(
+                    enabled = backupEmailVerified && !cloudBackupBusy && backupPassphrase.length >= 8,
+                    onClick = {
+                        scope.launch {
+                            cloudBackupBusy = true
+                            runCatching { CloudSettingsBackup.save(context, backupPassphrase.toCharArray()) }
+                                .onSuccess { snackbar.showSnackbar("Encrypted cloud settings backup saved.") }
+                                .onFailure { snackbar.showSnackbar(it.message ?: "Cloud backup failed.") }
+                            cloudBackupBusy = false
+                        }
+                    }, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
+                ) { Text("Back up settings to cloud") }
+                OutlinedButton(
+                    enabled = backupEmailVerified && !cloudBackupBusy && backupPassphrase.length >= 8,
+                    onClick = {
+                        scope.launch {
+                            cloudBackupBusy = true
+                            runCatching { CloudSettingsBackup.restore(context, backupPassphrase.toCharArray()) }
+                                .onSuccess { snackbar.showSnackbar("Cloud settings backup restored.") }
+                                .onFailure { snackbar.showSnackbar(it.message ?: "Cloud restore failed.") }
+                            cloudBackupBusy = false
+                        }
+                    }, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
+                ) { Text("Restore settings from cloud") }
+                Text(
+                    "Keep this passphrase safe. It is never uploaded or emailed; if you lose it, HolidayLink cannot decrypt the backup. This backs up app settings only, not chats, media, credentials, or the app-lock PIN.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 8.dp)
                 )
             }
 

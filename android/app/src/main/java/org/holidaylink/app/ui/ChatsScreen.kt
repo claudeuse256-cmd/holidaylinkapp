@@ -116,20 +116,19 @@ fun ChatsScreen(
     // peer resolves the row updates its title. (Wrapping this in remember(rows, query, peerCache)
     // froze the names because the map instance never changes.)
     val needle = query.trim().lowercase()
-    // Pinned chats float to the top; all remaining conversations follow last-message time.
-    // Firestore snapshots are not guaranteed to arrive in timestamp order.
+    // Pinned chats float to the top; within each section, newest activity comes first.
+    // Keep the timestamp from the source row so empty chats naturally sort to the bottom.
+    val activityById = rows.associate { row ->
+        row.id to (row.lastAt?.toDate()?.time ?: 0L)
+    }
     val all = rows.map { toItem(it) }.sortedWith(
         compareByDescending<ChatItem> { it.pinned }
-            .thenByDescending { item ->
-                item.lastAt?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrDefault(0L) } ?: 0L
-            }
-            .thenBy { it.id }
+            .thenByDescending { activityById[it.id] ?: 0L }
     )
     val archivedCount = all.count { it.archived }
     val mapped = all.filter { it.archived == archivedOpen }
     val visible = if (needle.isBlank()) mapped else mapped.filter {
-        val title = it.peer?.displayName?.takeIf { name -> name.isNotBlank() }
-            ?: it.title.orEmpty()
+        val title = it.peer?.displayName ?: it.title.orEmpty()
         title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
     }
 
@@ -297,7 +296,7 @@ private fun ChatRow(
     onLongPress: () -> Unit
 ) {
     // A 1-1 chat must never borrow the word "Group" while its peer name is still resolving.
-    val title = chat.peer?.displayName?.takeIf { it.isNotBlank() } ?: chat.title?.takeIf { it.isNotBlank() } ?: if (chat.kind == "direct") "Loading contact…" else "Group"
+    val title = chat.peer?.displayName ?: chat.title ?: if (chat.kind == "direct") "Chat" else "Group"
     val unread = chat.unreadCount > 0
     val preview = when {
         chat.peerTyping -> "typing…"

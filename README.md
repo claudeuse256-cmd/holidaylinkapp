@@ -53,3 +53,13 @@ the website config).
 
 `FIREBASE_SERVICE_ACCOUNT_JSON`, `YOOLA_API_KEY`, `YOOLA_SENDER`,
 `DEFAULT_COUNTRY_CODE=256`, `OTP_COOLDOWN_SECONDS=45`.
+
+## Recent source update (2.3.4)
+
+- Status composer now supports text, photo, and video updates (video uploads use Firebase Storage and are limited to 30 MB); status expiry remains 24 hours.
+- Added optional email-verified, client-side encrypted cloud backup for supported app settings. See `CLOUD_BACKUP_SETUP.md` before deploying; SMTP must be configured on Render.
+- Profile action buttons now use compact stacked icon/label layout on narrow phones.
+- Outgoing call setup resets its connection state before a new call and prefers the front camera for video calls.
+- Existing FCM relay, WebRTC signaling, group management, status viewers, and local settings backup remain in the source.
+
+This is a source ZIP. Build and test on a machine with Android SDK/Gradle before installing; real background delivery and video uploads also depend on deployed Firebase/Render configuration.

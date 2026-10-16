@@ -159,7 +159,8 @@ fun Avatar(
             Image(
                 bitmap = image.asImageBitmap(),
                 contentDescription = name,
-                modifier = Modifier.fillMaxSize().clip(shape)
+                modifier = Modifier.fillMaxSize().clip(shape),
+                contentScale = ContentScale.Crop
             )
         } else {
             Text(
