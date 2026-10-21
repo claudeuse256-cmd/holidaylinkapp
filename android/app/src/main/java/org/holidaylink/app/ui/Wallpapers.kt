@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -280,6 +281,7 @@ fun WallpaperSwatch(
  * The wallpaper picker used from Settings (default for every chat) and from a chat
  * (this conversation only).
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WallpaperSheet(
     current: String,

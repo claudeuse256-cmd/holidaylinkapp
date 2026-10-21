@@ -62,7 +62,12 @@ object FirestoreChat {
                             lastAt = d.safeTimestamp("lastAt") ?: d.safeTimestamp("updatedAt"),
                             unread = (d.getLong("unread_$uid") ?: 0).toInt()
                         )
-                    }?.sortedByDescending { it.lastAt?.seconds ?: 0 } ?: emptyList()
+                    }?.sortedWith(
+                        // Two chats can share a whole second; the nanoseconds decide the tie
+                        // so the list stops reshuffling between snapshots.
+                        compareByDescending<ChatRow> { it.lastAt?.seconds ?: 0L }
+                            .thenByDescending { it.lastAt?.nanoseconds ?: 0 }
+                    ) ?: emptyList()
                     trySend(rows)
                 } catch (_: Exception) {
                     // Keep the previous list on screen rather than crashing.
@@ -74,9 +79,13 @@ object FirestoreChat {
     suspend fun resolvePeer(peerId: String): User {
         val doc = db.collection("users").document(peerId).get().await()
         val data = doc.data.orEmpty()
-        val name = (doc.getString("name") ?: doc.getString("displayName")).orEmpty()
-            .takeIf { it.isNotBlank() } ?: "HolidayLink user"
         val username = doc.getString("username").orEmpty()
+        val name = (doc.getString("name") ?: doc.getString("displayName")).orEmpty()
+            .takeIf { it.isNotBlank() }
+            // A profile with no name must never render an empty row: fall back to the
+            // handle, then to the neutral placeholder.
+            ?: username.takeIf { it.isNotBlank() }?.let { "@$it" }
+            ?: "HolidayLink user"
         val avatar = (doc.getString("profilePic") ?: doc.getString("avatarUrl"))?.takeIf { it.isNotBlank() }
         val online = doc.getBoolean("online") == true
         val seen = FirebaseBackend.docLastSeenMillis(data)?.let { java.time.Instant.ofEpochMilli(it).toString() }

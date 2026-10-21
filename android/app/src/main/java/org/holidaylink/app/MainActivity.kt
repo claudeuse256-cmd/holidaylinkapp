@@ -1313,7 +1313,12 @@ private fun ChannelsScreen(
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(chat.title ?: chat.peer?.displayName ?: badge, fontWeight = FontWeight.Bold, color = scheme.onSurface)
+                            Text(
+                                chat.title?.takeIf { it.isNotBlank() }
+                                    ?: chat.peer?.displayName?.takeIf { it.isNotBlank() }
+                                    ?: badge,
+                                fontWeight = FontWeight.Bold, color = scheme.onSurface
+                            )
                             Text("$badge • ${chat.lastBody?.take(60) ?: "No messages yet"}", fontSize = 12.sp, color = scheme.onSurfaceVariant, maxLines = 1)
                         }
                     }

@@ -124,11 +124,15 @@ fun ChatsScreen(
     val all = rows.map { toItem(it) }.sortedWith(
         compareByDescending<ChatItem> { it.pinned }
             .thenByDescending { activityById[it.id] ?: 0L }
+            // Two chats touched in the same millisecond would otherwise swap places on
+            // every snapshot; the id makes the order deterministic.
+            .thenBy { it.id }
     )
     val archivedCount = all.count { it.archived }
     val mapped = all.filter { it.archived == archivedOpen }
     val visible = if (needle.isBlank()) mapped else mapped.filter {
-        val title = it.peer?.displayName ?: it.title.orEmpty()
+        val title = it.peer?.displayName?.takeIf { name -> name.isNotBlank() }
+            ?: it.title.orEmpty()
         title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
     }
 
@@ -295,8 +299,11 @@ private fun ChatRow(
     onClick: () -> Unit,
     onLongPress: () -> Unit
 ) {
-    // A 1-1 chat must never borrow the word "Group" while its peer name is still resolving.
-    val title = chat.peer?.displayName ?: chat.title ?: if (chat.kind == "direct") "Chat" else "Group"
+    // A 1-1 chat must never borrow the word "Group" (or show an empty line) while its
+    // peer name is still resolving.
+    val title = chat.peer?.displayName?.takeIf { it.isNotBlank() }
+        ?: chat.title?.takeIf { it.isNotBlank() }
+        ?: if (chat.kind == "direct") "Loading contact…" else "Group"
     val unread = chat.unreadCount > 0
     val preview = when {
         chat.peerTyping -> "typing…"

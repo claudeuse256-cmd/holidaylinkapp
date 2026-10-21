@@ -36,15 +36,18 @@ object MediaEditor {
     fun preview(file: File, maxDimension: Int = 1080): Bitmap? = try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        var sample = 1
-        while (bounds.outWidth / (sample * 2) >= maxDimension ||
-            bounds.outHeight / (sample * 2) >= maxDimension
-        ) {
-            sample *= 2
+        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= maxDimension ||
+                bounds.outHeight / (sample * 2) >= maxDimension
+            ) {
+                sample *= 2
+            }
+            val options = BitmapFactory.Options().apply { inSampleSize = sample }
+            BitmapFactory.decodeFile(file.absolutePath, options)
+        } else {
+            null
         }
-        val options = BitmapFactory.Options().apply { inSampleSize = sample }
-        BitmapFactory.decodeFile(file.absolutePath, options)
     } catch (_: Throwable) {
         null
     }
@@ -111,63 +114,65 @@ object MediaEditor {
      * Stream-copies the samples between [startMs] and [endMs] into [out].
      * Uses MediaExtractor + MediaMuxer, so no re-encode happens.
      */
-    private fun trimWithMuxer(file: File, startMs: Long, endMs: Long, out: File): File? = try {
-        val extractor = android.media.MediaExtractor()
-        // Read the file by path: the extractor needs the data to stay readable for as long
-        // as it copies samples, which a closed stream would not allow.
-        extractor.setDataSource(file.absolutePath)
-        val muxer = android.media.MediaMuxer(
-            out.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
-        )
-        val trackMap = HashMap<Int, Int>()
-        var maxInputSize = 1L shl 20
-        for (i in 0 until extractor.trackCount) {
-            val format = extractor.getTrackFormat(i)
-            val mime = format.getString(android.media.MediaFormat.KEY_MIME) ?: continue
-            if (!mime.startsWith("video/") && !mime.startsWith("audio/")) continue
-            extractor.selectTrack(i)
-            trackMap[i] = muxer.addTrack(format)
-            if (format.containsKey(android.media.MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                maxInputSize = maxOf(
-                    maxInputSize,
-                    format.getLong(android.media.MediaFormat.KEY_MAX_INPUT_SIZE)
-                )
+    private fun trimWithMuxer(file: File, startMs: Long, endMs: Long, out: File): File? {
+        return try {
+            val extractor = android.media.MediaExtractor()
+            // Read the file by path: the extractor needs the data to stay readable for as long
+            // as it copies samples, which a closed stream would not allow.
+            extractor.setDataSource(file.absolutePath)
+            val muxer = android.media.MediaMuxer(
+                out.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+            )
+            val trackMap = HashMap<Int, Int>()
+            var maxInputSize = 1L shl 20
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(android.media.MediaFormat.KEY_MIME) ?: continue
+                if (!mime.startsWith("video/") && !mime.startsWith("audio/")) continue
+                extractor.selectTrack(i)
+                trackMap[i] = muxer.addTrack(format)
+                if (format.containsKey(android.media.MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                    maxInputSize = maxOf(
+                        maxInputSize,
+                        format.getLong(android.media.MediaFormat.KEY_MAX_INPUT_SIZE)
+                    )
+                }
             }
-        }
-        if (trackMap.isEmpty()) {
-            extractor.release()
-            muxer.release()
-            return null
-        }
-        muxer.start()
-        val buffer = java.nio.ByteBuffer.allocateDirect(maxInputSize.toInt())
-        val info = android.media.MediaCodec.BufferInfo()
-        val startUs = startMs * 1000
-        val endUs = endMs * 1000
-        extractor.seekTo(startUs, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-        while (true) {
-            val size = extractor.readSampleData(buffer, 0)
-            if (size < 0) break
-            val time = extractor.sampleTime
-            if (time < startUs) {
+            if (trackMap.isEmpty()) {
+                extractor.release()
+                muxer.release()
+                return null
+            }
+            muxer.start()
+            val buffer = java.nio.ByteBuffer.allocateDirect(maxInputSize.toInt())
+            val info = android.media.MediaCodec.BufferInfo()
+            val startUs = startMs * 1000
+            val endUs = endMs * 1000
+            extractor.seekTo(startUs, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            while (true) {
+                val size = extractor.readSampleData(buffer, 0)
+                if (size < 0) break
+                val time = extractor.sampleTime
+                if (time < startUs) {
+                    extractor.advance()
+                    continue
+                }
+                if (time > endUs) break
+                info.offset = 0
+                info.size = size
+                info.presentationTimeUs = (time - startUs).coerceAtLeast(0)
+                info.flags = extractor.sampleFlags
+                val outTrack = trackMap[extractor.sampleTrackIndex]
+                if (outTrack != null) muxer.writeSampleData(outTrack, buffer, info)
                 extractor.advance()
-                continue
             }
-            if (time > endUs) break
-            info.offset = 0
-            info.size = size
-            info.presentationTimeUs = (time - startUs).coerceAtLeast(0)
-            info.flags = extractor.sampleFlags
-            val outTrack = trackMap[extractor.sampleTrackIndex]
-            if (outTrack != null) muxer.writeSampleData(outTrack, buffer, info)
-            extractor.advance()
+            muxer.stop()
+            muxer.release()
+            extractor.release()
+            if (out.length() > 0L) out else null
+        } catch (_: Throwable) {
+            runCatching { out.delete() }
+            null
         }
-        muxer.stop()
-        muxer.release()
-        extractor.release()
-        if (out.length() > 0L) out else null
-    } catch (_: Throwable) {
-        runCatching { out.delete() }
-        null
     }
 }

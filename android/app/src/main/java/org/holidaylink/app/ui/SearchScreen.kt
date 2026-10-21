@@ -138,7 +138,8 @@ fun SearchScreen(
                 )
             }
             chats = mapped.filter {
-                val title = it.peer?.displayName ?: it.title.orEmpty()
+                val title = it.peer?.displayName?.takeIf { name -> name.isNotBlank() }
+                    ?: it.title.orEmpty()
                 title.lowercase().contains(needle) || (it.lastBody ?: "").lowercase().contains(needle)
             }.take(20)
             val hits = mutableListOf<Message>()
@@ -281,9 +282,9 @@ fun SearchScreen(
                                         peer = if (hit.conversationKind == "direct") {
                                             User(
                                                 id = hit.conversationPeerId.orEmpty(),
-                                                displayName = hit.conversationPeerName
-                                                    ?: hit.conversationLabel
-                                                    ?: "Chat",
+                                                displayName = hit.conversationPeerName?.takeIf { it.isNotBlank() }
+                                                    ?: hit.conversationLabel?.takeIf { it.isNotBlank() }
+                                                    ?: "Contact",
                                                 username = ""
                                             )
                                         } else {
@@ -372,7 +373,9 @@ private fun SearchPersonRow(user: User, onClick: () -> Unit) {
 
 @Composable
 private fun SearchChatRow(chat: ChatItem, onClick: () -> Unit) {
-    val title = chat.peer?.displayName ?: chat.title ?: "Group"
+    val title = chat.peer?.displayName?.takeIf { it.isNotBlank() }
+        ?: chat.title?.takeIf { it.isNotBlank() }
+        ?: if (chat.kind == "direct") "Contact" else "Group"
     Row(
         Modifier
             .fillMaxWidth()

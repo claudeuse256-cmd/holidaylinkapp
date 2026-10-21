@@ -327,18 +327,27 @@ function lastSeenMillis(value) {
  */
 async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
   const snap = await db().collection('users').doc(uid).get();
-  if (!snap.exists) return { sent: 0, failed: 0, skipped: true };
+  if (!snap.exists) {
+    console.log(`[push] skip ${uid}: no user document`);
+    return { sent: 0, failed: 0, skipped: true };
+  }
   const doc = snap.data() || {};
 
   if (skipIfActive && doc.online === true) {
     const fresh = Date.now() - lastSeenMillis(doc.lastSeen) < PUSH_ACTIVE_WINDOW_MS;
-    if (fresh) return { sent: 0, failed: 0, skipped: true };
+    if (fresh) {
+      console.log(`[push] skip ${uid}: recipient already has the app open`);
+      return { sent: 0, failed: 0, skipped: true };
+    }
   }
 
   const tokens = Array.from(new Set(
     (doc.fcmTokens || []).filter((t) => typeof t === 'string' && t.length > 0)
   ));
-  if (!tokens.length) return { sent: 0, failed: 0, skipped: true };
+  if (!tokens.length) {
+    console.log(`[push] skip ${uid}: no registered device tokens (app never opened here, or tokens were revoked)`);
+    return { sent: 0, failed: 0, skipped: true };
+  }
 
   // The push carries BOTH a `notification` block and the raw `data`. Android draws the
   // notification itself while the app is closed or in the background (so the alert really
@@ -376,6 +385,10 @@ async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
       }
     },
     apns: { headers: { 'apns-priority': '10' } }
+  }).catch((err) => {
+    // Without this line a rejected FCM call looked exactly like a successful push.
+    console.error(`[push] FCM send failed for ${uid}:`, err && err.message);
+    return { successCount: 0, failureCount: tokens.length, responses: [] };
   });
 
   const dead = [];
@@ -394,6 +407,16 @@ async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
     await db().collection('users').doc(uid)
       .update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(...dead) })
       .catch(() => {});
+  }
+  if (result.failureCount > 0) {
+    const first = (result.responses || []).find((r) => !r.success);
+    console.warn(
+      `[push] ${uid}: sent ${result.successCount}/${tokens.length}, ` +
+      `failed ${result.failureCount}` +
+      (first && first.error ? ` (first: ${first.error.code})` : '')
+    );
+  } else {
+    console.log(`[push] ${uid}: delivered to ${result.successCount}/${tokens.length} device(s)`);
   }
   return { sent: result.successCount, failed: result.failureCount };
 }
@@ -487,7 +510,10 @@ app.post('/push/send', async (req, res) => {
     // `forUid` lets a phone that holds several accounts label the notification with the
     // account it arrived for, the way WhatsApp marks its linked accounts.
     pushToUser(uid, { ...data, forUid: uid }, ttlSeconds, type === 'message')
-      .catch(() => ({ sent: 0, failed: 0, skipped: false }))
+      .catch((err) => {
+        console.error(`[push/send] push failed for ${uid}:`, err && err.message);
+        return { sent: 0, failed: 0, skipped: false };
+      })
   ));
 
   let sent = 0;
