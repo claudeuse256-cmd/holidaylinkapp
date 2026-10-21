@@ -4,11 +4,11 @@ import android.content.Context
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.SetOptions
-import com.google.firebase.messaging.FirebaseMessaging
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.data.AccountStore
+import org.holidaylink.app.net.AppPresence
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Notifier
 
@@ -17,7 +17,8 @@ import org.holidaylink.app.net.Notifier
  * arrive when the app is closed/killed — the server sends a data message and we draw it.
  *
  * Expected data payload: { type: "message"|"call", title, body, chatId?/callId?, forUid? }
- * If the server only sends a `notification` payload, Android displays it automatically.
+ * If the server sends the notification block as well, Android draws it while the app is in
+ * the background and this callback simply is not invoked; tapping it opens the chat.
  */
 class HolidayMessagingService : FirebaseMessagingService() {
 
@@ -34,12 +35,26 @@ class HolidayMessagingService : FirebaseMessagingService() {
         // own, so tapping its alert just brings the app forward — if the call is still
         // ringing, the incoming-call screen is already waiting there.
         val chatTarget = data["chatId"]?.takeIf { it.isNotBlank() }
-        val id = (data["id"] ?: chatTarget ?: data["callId"] ?: body.take(24)).hashCode()
+        // While the app is on screen the in-app listener already raises the alert, so
+        // drawing a second one here would only buzz twice.
+        if (AppPresence.foreground) return
+        // One alert per conversation: the same id the in-app listener uses, so an alert
+        // that already exists is replaced rather than duplicated.
+        val id = when {
+            type == "call" -> Notifier.idFor(data["callId"] ?: body.take(24))
+            chatTarget != null -> Notifier.idFor(chatTarget)
+            else -> (data["id"] ?: body.take(24)).hashCode()
+        }
+        // Already looking at that conversation: no alert at all.
+        if (AppPresence.isReading(chatTarget)) {
+            Notifier.clearChat(applicationContext, chatTarget!!)
+            return
+        }
         // One phone can hold several accounts, so say which one a notification is for —
         // the way WhatsApp labels notifications from a linked account.
         val account = accountLabel(applicationContext, data["forUid"])
         if (type == "call") {
-            Notifier.call(applicationContext, id, title, body, chatTarget, account)
+            Notifier.call(applicationContext, id, title, body, null, account)
         } else {
             Notifier.message(applicationContext, id, title, body, chatTarget, account)
         }

@@ -12,6 +12,11 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -85,6 +90,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
@@ -168,6 +177,18 @@ class MainActivity : FragmentActivity() {
         setContent { HolidayLinkApp(this) }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // Presence is tied to the visible app: the moment we leave the screen we go offline
+        // so the server stops treating this phone as "already reading" and pushes instead.
+        org.holidaylink.app.net.AppPresence.onForeground()
+    }
+
+    override fun onStop() {
+        org.holidaylink.app.net.AppPresence.onBackground()
+        super.onStop()
+    }
+
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -184,8 +205,12 @@ private object NotificationRouter {
         private set
 
     fun consume(intent: android.content.Intent?) {
-        val id = intent?.getStringExtra(org.holidaylink.app.net.Notifier.EXTRA_TARGET)
-        if (!id.isNullOrBlank()) pendingChatId = id
+        if (intent == null) return
+        // Our own notifications carry "hl_target"; notifications drawn by the system from a
+        // Firebase push carry the raw data payload instead, so accept both shapes.
+        val id = intent.getStringExtra(org.holidaylink.app.net.Notifier.EXTRA_TARGET)
+            ?: intent.getStringExtra("chatId")
+        if (!id.isNullOrBlank() && id != "null") pendingChatId = id
     }
 
     fun clear() {
@@ -478,10 +503,11 @@ private fun SignedInApp(
             )
         }
         // A website-admin ban lands mid-session too: re-check quietly every minute.
-        // Same tick keeps presence truthful (online + fresh lastSeen).
+        // Same tick keeps presence truthful (online + fresh lastSeen) — but only while the
+        // app is actually on screen, otherwise the server would never push a notification.
         while (true) {
             delay(60_000)
-            runCatching { FirebaseBackend.touchPresence() }
+            runCatching { org.holidaylink.app.net.AppPresence.heartbeatIfVisible() }
             val uid = FirebaseBackend.uid
             val banned = uid != null && runCatching {
                 FirebaseBackend.loadProfile(uid)?.banned == true
@@ -573,13 +599,16 @@ private fun SignedInApp(
                     val prev = lastUnread[row.id] ?: 0
                     if (row.unread > prev) {
                         val openHere = (stack.lastOrNull() as? Destination.Chat)?.chat?.id == row.id
-                        if (!openHere) {
+                        if (openHere) {
+                            // Reading it here and now: no alert, and any old alert disappears.
+                            Notifier.clearChat(context, row.id)
+                        } else {
                             val who = row.title.takeIf { it.isNotBlank() }
                                 ?: runCatching {
                                     FirestoreChat.resolvePeer(row.peerId.orEmpty()).displayName
                                 }.getOrNull()
                                 ?: "New message"
-                            Notifier.message(context, row.id.hashCode(), who, row.lastBody ?: "New message", row.id)
+                            Notifier.message(context, Notifier.idFor(row.id), who, row.lastBody ?: "New message", row.id)
                         }
                     }
                     lastUnread[row.id] = row.unread
@@ -918,6 +947,24 @@ private fun TabShell(
     )
     var fabOpen by remember { mutableStateOf(false) }
 
+    // Collapsing header: the status row and the search bar slide out of the way while the
+    // user scrolls down the list and slide back in as soon as they scroll up, so the
+    // conversation rows get the whole screen without losing the header forever.
+    val headerHidden = remember { mutableStateOf(false) }
+    val headerScroller = object : NestedScrollConnection {
+        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+            if (source == NestedScrollSource.UserInput) {
+                // Fingers dragging up (list moving down the screen) hides the header,
+                // dragging down brings it back.
+                if (available.y < -1f) headerHidden.value = true
+                else if (available.y > 1f) headerHidden.value = false
+            }
+            return Offset.Zero
+        }
+    }
+    // A new tab always starts with its header in place.
+    LaunchedEffect(tab) { headerHidden.value = false }
+
     Scaffold(
         containerColor = scheme.background,
         bottomBar = {
@@ -965,17 +1012,30 @@ private fun TabShell(
             )
 
             if (tab == Tab.Chats) {
-                GlassStatusRow(
-                    api = api,
-                    me = me,
-                    onOpenStatus = onOpenStatus,
-                    onPostStatus = onPostStatus
-                )
+                // Auto-hiding: the status row and the search bar collapse while the list
+                // is scrolled and return as soon as the user scrolls back up.
+                AnimatedVisibility(
+                    visible = !headerHidden.value,
+                    enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
+                    exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut()
+                ) {
+                    Column(Modifier.fillMaxWidth()) {
+                        GlassStatusRow(
+                            api = api,
+                            me = me,
+                            onOpenStatus = onOpenStatus,
+                            onPostStatus = onPostStatus
+                        )
 
-                GlassSearchBar(onClick = onSearch)
+                        GlassSearchBar(onClick = {
+                            headerHidden.value = false
+                            onSearch()
+                        })
+                    }
+                }
             }
 
-            Box(Modifier.weight(1f).fillMaxWidth()) {
+            Box(Modifier.weight(1f).fillMaxWidth().nestedScroll(headerScroller)) {
                 when (tab) {
                     Tab.Chats -> ChatsScreen(
                         api = api,

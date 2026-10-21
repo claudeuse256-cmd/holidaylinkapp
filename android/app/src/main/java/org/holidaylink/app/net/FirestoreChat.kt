@@ -195,7 +195,7 @@ object FirestoreChat {
         replyToBody: String? = null,
         replyToName: String? = null,
         audioBlob: String? = null
-    ) {
+    ): String {
         val uid = myUid()
         val now = Timestamp.now()
         val data = hashMapOf<String, Any?>(
@@ -244,6 +244,8 @@ object FirestoreChat {
         // Nudge the other side's phones so the alert lands even if their app is closed.
         // Best effort only: on failure the message is already in Firestore for them.
         runCatching { PushNotify.message(chatId, preview, msgRef.id) }
+        // The id lets the sender match its optimistic bubble to the stored one.
+        return msgRef.id
     }
 
     suspend fun markRead(chatId: String) {

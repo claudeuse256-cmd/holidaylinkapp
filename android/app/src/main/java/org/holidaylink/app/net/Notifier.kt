@@ -1,6 +1,5 @@
 package org.holidaylink.app.net
 
-import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -11,19 +10,24 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import org.holidaylink.app.MainActivity
 import org.holidaylink.app.R
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * System-tray notifications (the ones that pop up outside the app), WhatsApp-style:
  * a high-importance "Messages" channel and a "Calls" channel.
  *
- * Two things feed this: a live Firestore listener over the user's `notifications`
- * documents (works while the app process is alive) and Firebase Cloud Messaging
- * (works when the app is killed, once the server sends a push).
+ * One notification per conversation (the notification id is derived from the chat id),
+ * so a new message in the same chat replaces the previous alert instead of stacking.
+ * A conversation's notification is removed the moment it is *seen* — opening the chat
+ * clears it even when the alert itself was never tapped.
  */
 object Notifier {
     const val CHANNEL_MESSAGES = "hl_messages"
     const val CHANNEL_CALLS = "hl_calls"
     const val EXTRA_TARGET = "hl_target"
+
+    /** chatId → notification ids posted for it, so "seen" can clear every variant. */
+    private val posted = ConcurrentHashMap<String, MutableSet<Int>>()
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -32,6 +36,7 @@ object Notifier {
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_MESSAGES, "Messages", NotificationManager.IMPORTANCE_HIGH).apply {
                     description = "New chat messages"
+                    enableVibration(true)
                 }
             )
         }
@@ -39,6 +44,7 @@ object Notifier {
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_CALLS, "Calls", NotificationManager.IMPORTANCE_HIGH).apply {
                     description = "Incoming audio and video calls"
+                    enableVibration(true)
                 }
             )
         }
@@ -62,6 +68,32 @@ object Notifier {
         subText: String? = null
     ) = post(context, CHANNEL_CALLS, id, title, body, targetId, subText)
 
+    /** A stable per-conversation notification id (same value the FCM service uses). */
+    fun idFor(chatId: String): Int = chatId.hashCode()
+
+    /** The tag the server asks Android to use, so one alert per conversation. */
+    fun tagFor(chatId: String): String = "chat-$chatId"
+
+    /**
+     * Removes every alert for this conversation. Called when the chat is opened or when new
+     * messages arrive while it is already on screen — WhatsApp's "seen means gone".
+     */
+    fun clearChat(context: Context, chatId: String) {
+        if (chatId.isBlank()) return
+        val nm = NotificationManagerCompat.from(context)
+        runCatching { nm.cancel(idFor(chatId)) }
+        // Alerts drawn by Android itself (from a Firebase push) carry the conversation tag.
+        runCatching { nm.cancel(tagFor(chatId), 0) }
+        posted.remove(chatId)?.forEach { runCatching { nm.cancel(it) } }
+    }
+
+    /** Clears the active announcement/pinned alert (kept from the announcement card). */
+    fun clearAnnouncement(context: Context) {
+        runCatching {
+            NotificationManagerCompat.from(context).cancel(AnnouncementNotifier.NOTIFICATION_ID)
+        }
+    }
+
     private fun post(
         context: Context,
         channel: String,
@@ -74,6 +106,12 @@ object Notifier {
         ensureChannels(context)
         val nm = NotificationManagerCompat.from(context)
         if (!nm.areNotificationsEnabled()) return
+        // Never buzz for the conversation that is already open on screen. A call always
+        // alerts, even when the conversation it belongs to happens to be on display.
+        if (channel == CHANNEL_MESSAGES && AppPresence.isReading(targetId)) {
+            clearChat(context, targetId!!)
+            return
+        }
         // Respect the per-type switches in Settings ▸ Notifications.
         runCatching {
             val allowed = if (channel == CHANNEL_CALLS) {
@@ -82,6 +120,12 @@ object Notifier {
                 org.holidaylink.app.data.AppSettings.state.notifyMessages
             }
             if (!allowed) return
+        }
+        // A muted conversation stays silent in the shade too.
+        if (channel == CHANNEL_MESSAGES && targetId != null) {
+            val muted = runCatching { org.holidaylink.app.data.AppSettings.isChatMuted(targetId) }
+                .getOrDefault(false)
+            if (muted) return
         }
         val intent = Intent(context, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -93,9 +137,11 @@ object Notifier {
         // straight by FCM (activity never ran) the settings aren't loaded yet, so default on.
         var sound = true
         var vibrate = true
+        var preview = true
         runCatching {
             sound = org.holidaylink.app.data.AppSettings.state.notifySound
             vibrate = org.holidaylink.app.data.AppSettings.state.notifyVibration
+            preview = org.holidaylink.app.data.AppSettings.state.notifyPreview
         }
         val defaults = when {
             sound && vibrate -> NotificationCompat.DEFAULT_ALL
@@ -103,19 +149,23 @@ object Notifier {
             vibrate -> NotificationCompat.DEFAULT_VIBRATE
             else -> 0
         }
+        val shownBody = if (preview) body else "New message"
         val notification = NotificationCompat.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_stat_holidaylink)
             .setColor(androidx.core.content.ContextCompat.getColor(context, R.color.notification_accent))
             .setContentTitle(title)
-            .setContentText(body)
+            .setContentText(shownBody)
             .setSubText(subText)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(shownBody))
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(if (channel == CHANNEL_CALLS) NotificationCompat.CATEGORY_CALL else NotificationCompat.CATEGORY_MESSAGE)
             .setDefaults(defaults)
             .setContentIntent(pi)
             .build()
+        if (targetId != null) {
+            posted.getOrPut(targetId) { ConcurrentHashMap.newKeySet() }.add(id)
+        }
         try {
             nm.notify(id, notification)
         } catch (_: SecurityException) {

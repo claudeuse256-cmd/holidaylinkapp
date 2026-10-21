@@ -123,12 +123,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AutoDownload
+import org.holidaylink.app.media.MediaEditor
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.AiBot
+import org.holidaylink.app.net.AppPresence
 import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.Cloudinary
 import org.holidaylink.app.net.FirebaseBackend
@@ -137,6 +140,7 @@ import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.Imgbb
 import org.holidaylink.app.net.MediaCache
 import org.holidaylink.app.net.Message
+import org.holidaylink.app.net.Notifier
 import org.holidaylink.app.net.StudyBuddy
 import org.holidaylink.app.net.User
 import org.holidaylink.app.voice.VoiceRecorder
@@ -172,6 +176,13 @@ fun ChatScreen(
     var editingId by remember { mutableStateOf<String?>(null) }
     var sending by remember { mutableStateOf(false) }
     var uploading by remember { mutableStateOf(false) }
+    // Messages that are on their way out. They appear the moment send is tapped and keep
+    // showing what is happening (upload %, sending, failed + retry).
+    var outbox by remember { mutableStateOf<List<OutgoingItem>>(emptyList()) }
+    // The "edit before sending" screen for a picked photo, video or document.
+    var editorFor by remember { mutableStateOf<EditorSource?>(null) }
+    // Chat background picker for this conversation only.
+    var showWallpaper by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var peerUser by remember { mutableStateOf(chat.peer) }
     var peerOnline by remember { mutableStateOf<Boolean?>(null) }
@@ -220,6 +231,23 @@ fun ChatScreen(
         if (hiddenMessages.isEmpty()) rawMessages
         else rawMessages.filter { hiddenMessages["${chat.id}/${it.id}"] != true }
     }
+    // Server copies of the messages that are still travelling. They are hidden while the
+    // local bubble stands in for them, so a message is never shown twice.
+    val hiddenServerIds = remember(outbox, messages, uid) {
+        val ids = mutableSetOf<String>()
+        val mine = messages.filter { it.senderId == uid }
+        outbox.forEach { item ->
+            item.serverId?.let { ids.add(it) }
+            if (item.stage == OutgoingStage.UPLOADING || item.stage == OutgoingStage.SENDING) {
+                mine.filter { m ->
+                    m.text == item.text &&
+                        (item.kind == "text" || m.fileName == item.fileName)
+                }.forEach { ids.add(it.id) }
+            }
+        }
+        ids
+    }
+    val shownMessages = remember(messages, hiddenServerIds) { messages.filter { it.id !in hiddenServerIds } }
 
     // Fetch every attachment once, the moment the conversation opens, and keep the file on
     // disk. Scrolling back — or reopening the chat — reads the cache instead of downloading
@@ -263,13 +291,17 @@ fun ChatScreen(
         runCatching { aiBots = FirestoreBots.list() }
     }
 
-    LaunchedEffect(messages) {
+    LaunchedEffect(messages, outbox.size) {
+        val total = shownMessages.size + outbox.size
+        if (total > 0) listState.animateScrollToItem(total - 1)
         if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.lastIndex)
             if (pendingTexts.isNotEmpty()) {
                 val echoed = messages.filter { it.senderId == uid }.map { it.text }.toSet()
                 pendingTexts = pendingTexts.filter { it !in echoed }
             }
+            // The conversation is on screen, so its alert goes away — even when the alert
+            // itself was never tapped.
+            Notifier.clearChat(context, chat.id)
             // Remember where the unread block starts before markRead clears the flags.
             if (unreadAnchor < 0) {
                 unreadAnchor = messages.indexOfFirst { it.senderId != uid && !it.read }
@@ -281,6 +313,23 @@ fun ChatScreen(
             if (messages.any { it.senderId != uid && !it.delivered }) {
                 runCatching { FirestoreChat.markDelivered(chat.id) }
             }
+        }
+    }
+
+    // When the stored message finally arrives, the local bubble has done its job.
+    LaunchedEffect(messages, outbox) {
+        val ids = messages.map { it.id }.toSet()
+        val done = outbox.filter { it.serverId != null && it.serverId in ids }.map { it.localId }
+        if (done.isNotEmpty()) outbox = outbox.filter { it.localId !in done }
+    }
+
+    // Reading a conversation marks it as read: the tray alert disappears, and a message
+    // that arrives while we are looking at it does not buzz at all.
+    DisposableEffect(chat.id) {
+        AppPresence.openChatId = chat.id
+        Notifier.clearChat(context, chat.id)
+        onDispose {
+            if (AppPresence.openChatId == chat.id) AppPresence.openChatId = null
         }
     }
 
@@ -317,97 +366,242 @@ fun ChatScreen(
         return Triple("@${bot.username}", bot.id, instruction)
     }
 
-    fun send() {
-        val body = draft.trim()
-        if (body.isEmpty() || sending) return
-        val editId = editingId
-        val reply = replyingTo
-        sending = true
+    /**
+     * Applies a change to one outgoing message.
+     *
+     * The upload progress arrives on a network thread, so the change is always applied on
+     * the main thread — that keeps the list from flickering and the state consistent.
+     */
+    fun updateOutgoing(localId: String, block: (OutgoingItem) -> OutgoingItem) {
+        scope.launch {
+            outbox = outbox.map { if (it.localId == localId) block(it) else it }
+        }
+    }
+
+    /** Writes a text message to Firestore and keeps the local bubble in step with it. */
+    fun deliverText(localId: String, body: String, replyToId: String?, replyToBody: String?) {
         scope.launch {
             try {
-                if (editId != null) {
-                    FirestoreChat.editMessage(chat.id, editId, body)
-                    editingId = null
-                } else {
-                    val reply = replyingTo
-                    pendingTexts = pendingTexts + body
-                    FirestoreChat.send(
-                        chatId = chat.id,
-                        text = body,
-                        kind = "text",
-                        ttlSeconds = 0,
-                        replyToId = reply?.id,
-                        replyToBody = reply?.text?.take(120)?.ifBlank { "[photo]" },
-                        replyToName = null
-                    )
-                }
-                draft = ""
-                replyingTo = null
+                val serverId = FirestoreChat.send(
+                    chatId = chat.id,
+                    text = body,
+                    kind = "text",
+                    ttlSeconds = 0,
+                    replyToId = replyToId,
+                    replyToBody = replyToBody,
+                    replyToName = null
+                )
+                updateOutgoing(localId) { it.copy(stage = OutgoingStage.SENT, serverId = serverId) }
             } catch (e: Exception) {
-                snackbar.showSnackbar("Message not sent. Check your internet.")
-            } finally {
-                sending = false
+                updateOutgoing(localId) {
+                    it.copy(stage = OutgoingStage.FAILED, error = "Not sent — tap to retry")
+                }
             }
         }
     }
 
-    fun sendAttachment(uri: Uri, kind: String) {
-        uploading = true
-        val once = viewOnceSend && (kind == "image" || kind == "video")
-        val ttl = selfDestructSecs
-        scope.launch {
-            try {
-                when (kind) {
-                    "image" -> {
-                        val bytes = MediaPicker.imageJpegBytes(context, uri)
-                            ?: throw ApiException("That image couldn't be read.")
-                        val url = Imgbb.uploadJpeg(bytes)
-                        FirestoreChat.send(chat.id, "", imageUrl = url, kind = "image", viewOnce = once, ttlSeconds = ttl)
-                    }
-                    else -> {
-                        val picked = MediaPicker.inspect(context, uri)
-                        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                            ?: throw ApiException("That file couldn't be read.")
-                        if (bytes.size > MediaPicker.maxAttachmentBytes) {
-                            throw ApiException("That file is too large (max 20 MB).")
-                        }
-                        val name = picked.name ?: if (kind == "video") "Video" else "File"
-                        val mime = picked.mimeType.ifBlank { Cloudinary.mimeOf(name) }
-                        // Videos and documents go to Cloudinary through our server. Until the
-                        // Cloudinary keys are set on the backend, keep working through Firebase
-                        // Storage instead of failing the send outright.
-                        val url = runCatching { Cloudinary.upload(context, bytes, name, mime) }
-                            .getOrElse {
-                                val ext = name.substringAfterLast('.', "").takeIf { it.isNotBlank() } ?: "bin"
-                                val path = "chat_media/${chat.id}/${UUID.randomUUID()}.$ext"
-                                val ref = com.google.firebase.storage.FirebaseStorage.getInstance().getReference(path)
-                                ref.putBytes(bytes).await()
-                                ref.downloadUrl.await().toString()
-                            }
-                        FirestoreChat.send(
-                            chat.id, "", fileUrl = url,
-                            fileName = name,
-                            kind = if (kind == "video") "video" else "file",
-                            viewOnce = once, ttlSeconds = ttl
-                        )
-                    }
+    fun send() {
+        val body = draft.trim()
+        if (body.isEmpty()) return
+        val editId = editingId
+        val reply = replyingTo
+        if (editId != null) {
+            // Editing an existing message: the change lands in place.
+            draft = ""
+            editingId = null
+            replyingTo = null
+            sending = true
+            scope.launch {
+                try {
+                    FirestoreChat.editMessage(chat.id, editId, body)
+                } catch (e: Exception) {
+                    snackbar.showSnackbar("Could not edit the message.")
+                } finally {
+                    sending = false
                 }
-            } catch (e: Exception) {
-                snackbar.showSnackbar((e as? ApiException)?.message ?: "Attachment not sent.")
-            } finally {
-                uploading = false
+            }
+            return
+        }
+        // Sending is instant: the bubble shows up the moment the button is tapped and the
+        // tick follows when the message is really stored.
+        draft = ""
+        replyingTo = null
+        val localId = UUID.randomUUID().toString()
+        outbox = outbox + OutgoingItem(
+            localId = localId,
+            kind = "text",
+            text = body,
+            stage = OutgoingStage.SENDING,
+            replyToId = reply?.id,
+            replyToBody = reply?.text?.take(120)?.ifBlank { "[photo]" }
+        )
+        deliverText(
+            localId,
+            body,
+            reply?.id,
+            reply?.text?.take(120)?.ifBlank { "[photo]" }
+        )
+    }
+
+    /** Puts a picked file into the editor instead of sending it straight away. */
+    fun openEditor(uri: Uri, kind: String) {
+        scope.launch {
+            val source = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                copyToCache(context, uri, kind)
+            }
+            if (source == null) {
+                snackbar.showSnackbar("That file couldn't be read.")
+            } else {
+                editorFor = source
             }
         }
+    }
+
+    /** Copies the picked file into the app cache so the editor and the retry both work. */
+    fun copyToCache(context: Context, uri: Uri, kind: String): EditorSource? {
+        return try {
+            val picked = MediaPicker.inspect(context, uri)
+            val name = picked.name ?: if (kind == "video") "Video" else if (kind == "image") "Photo" else "File"
+            val mime = picked.mimeType.ifBlank { Cloudinary.mimeOf(name) }
+            val ext = name.substringAfterLast('.', "").takeIf { it.isNotBlank() }
+                ?: when (kind) {
+                    "video" -> "mp4"
+                    "image" -> "jpg"
+                    else -> "bin"
+                }
+            val dir = java.io.File(context.cacheDir, "pending").apply { mkdirs() }
+            val file = java.io.File(dir, "p-${System.currentTimeMillis()}.$ext")
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            } ?: return null
+            EditorSource(kind = kind, file = file, fileName = name, mimeType = mime)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Applies the edits the user made and hands the file to the sender. */
+    fun prepareFile(source: EditorSource, item: OutgoingItem): java.io.File {
+        if (item.kind != "video") return source.file
+        val duration = MediaEditor.videoDurationMs(source.file)
+        if (duration <= 0L) return source.file
+        val untouched = item.trimStartMs <= 0L && item.trimEndMs >= duration
+        if (untouched) return source.file
+        val dir = java.io.File(context.cacheDir, "edited").apply { mkdirs() }
+        val out = java.io.File(dir, "trim-${System.currentTimeMillis()}.mp4")
+        return MediaEditor.trimVideo(source.file, item.trimStartMs, item.trimEndMs, out) ?: source.file
+    }
+
+    /** Uploads the attachment and stores the message, reporting progress while it runs. */
+    fun deliverMedia(item: OutgoingItem, source: EditorSource) {
+        scope.launch {
+            try {
+                val prepared = withContext(kotlinx.coroutines.Dispatchers.IO) { prepareFile(source, item) }
+                val bytes = withContext(kotlinx.coroutines.Dispatchers.IO) { prepared.readBytes() }
+                val url: String
+                if (item.kind == "image") {
+                    val jpeg = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        val scaled = MediaEditor.jpegBytes(prepared) ?: bytes
+                        MediaEditor.rotateJpeg(scaled, item.rotation) ?: scaled
+                    }
+                    url = Imgbb.uploadJpeg(jpeg) { p ->
+                        updateOutgoing(item.localId) { it.copy(progress = p) }
+                    }
+                } else {
+                    if (bytes.size > MediaPicker.maxAttachmentBytes) {
+                        throw ApiException("That file is too large (max 20 MB).")
+                    }
+                    val name = item.fileName ?: "File"
+                    val mime = item.mimeType.ifBlank { Cloudinary.mimeOf(name) }
+                    url = runCatching {
+                        Cloudinary.upload(context, bytes, name, mime) { p ->
+                            updateOutgoing(item.localId) { it.copy(progress = p) }
+                        }
+                    }.getOrElse {
+                        // Cloudinary is not set up on the backend yet: keep working through
+                        // Firebase Storage instead of failing the send outright.
+                        val ext = name.substringAfterLast('.', "").takeIf { it.isNotBlank() } ?: "bin"
+                        val path = "chat_media/${chat.id}/${UUID.randomUUID()}.$ext"
+                        val ref = com.google.firebase.storage.FirebaseStorage.getInstance().getReference(path)
+                        ref.putBytes(bytes).await()
+                        ref.downloadUrl.await().toString()
+                    }
+                }
+                updateOutgoing(item.localId) { it.copy(stage = OutgoingStage.SENDING, progress = 100) }
+                val serverId = FirestoreChat.send(
+                    chat.id,
+                    item.text,
+                    imageUrl = if (item.kind == "image") url else null,
+                    fileUrl = if (item.kind == "image") null else url,
+                    fileName = if (item.kind == "image") null else item.fileName,
+                    kind = if (item.kind == "image") "image" else if (item.kind == "video") "video" else "file",
+                    viewOnce = item.viewOnce,
+                    ttlSeconds = item.ttlSeconds
+                )
+                updateOutgoing(item.localId) { it.copy(stage = OutgoingStage.SENT, serverId = serverId) }
+            } catch (e: Exception) {
+                updateOutgoing(item.localId) {
+                    it.copy(
+                        stage = OutgoingStage.FAILED,
+                        error = (e as? ApiException)?.message ?: "Not sent — tap to retry"
+                    )
+                }
+            }
+        }
+    }
+
+    /** Adds the edited attachment to the outbox and starts sending it. */
+    fun enqueueMedia(source: EditorSource, caption: String, rotation: Int, trimStart: Long, trimEnd: Long) {
+        val once = viewOnceSend && (source.kind == "image" || source.kind == "video")
+        val ttl = selfDestructSecs
+        val item = OutgoingItem(
+            localId = UUID.randomUUID().toString(),
+            // "document" is called "file" everywhere else in the app.
+            kind = if (source.kind == "document") "file" else source.kind,
+            text = caption,
+            fileName = source.fileName,
+            localPath = source.file.absolutePath,
+            mimeType = source.mimeType,
+            stage = OutgoingStage.UPLOADING,
+            rotation = rotation,
+            trimStartMs = trimStart,
+            trimEndMs = trimEnd,
+            viewOnce = once,
+            ttlSeconds = ttl
+        )
+        outbox = outbox + item
+        deliverMedia(item, source)
+    }
+
+    /** Tries the failed message once more. */
+    fun retryOutgoing(item: OutgoingItem) {
+        if (item.kind == "text") {
+            updateOutgoing(item.localId) {
+                it.copy(stage = OutgoingStage.SENDING, error = null, progress = 0)
+            }
+            deliverText(item.localId, item.text, item.replyToId, item.replyToBody)
+            return
+        }
+        val path = item.localPath ?: return
+        val source = EditorSource(
+            kind = item.kind,
+            file = java.io.File(path),
+            fileName = item.fileName ?: "File",
+            mimeType = item.mimeType
+        )
+        val revived = item.copy(stage = OutgoingStage.UPLOADING, error = null, progress = 0)
+        updateOutgoing(item.localId) { revived }
+        deliverMedia(revived, source)
     }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        uri?.let { sendAttachment(it, "image") }
+        uri?.let { openEditor(it, "image") }
     }
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        uri?.let { sendAttachment(it, "video") }
+        uri?.let { openEditor(it, "video") }
     }
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri?.let { sendAttachment(it, "document") }
+        uri?.let { openEditor(it, "document") }
     }
 
     // In-app camera: writes the shot into cacheDir/camera and hands the FileProvider URI
@@ -417,7 +611,7 @@ fun ChatScreen(
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         val uri = pendingCameraUri
         pendingCameraUri = null
-        if (ok && uri != null) sendAttachment(uri, "image")
+        if (ok && uri != null) openEditor(uri, "image")
     }
     val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
@@ -592,6 +786,9 @@ fun ChatScreen(
                             Icon(Icons.Default.Videocam, "Video call")
                         }
                     }
+                    IconButton(onClick = { showWallpaper = true }) {
+                        Icon(Icons.Default.MoreVert, "Chat options")
+                    }
                 }
             )
             }
@@ -704,6 +901,7 @@ fun ChatScreen(
             ChatWallpaper(
                 uri = AppSettings.state.chatWallpaper,
                 solid = AppSettings.state.chatWallpaperSolid,
+                preset = AppSettings.wallpaperPresetFor(chat.id),
                 modifier = Modifier.matchParentSize()
             )
             Column(Modifier.fillMaxSize()) {
@@ -726,7 +924,7 @@ fun ChatScreen(
                 ErrorState(error) { error = "" }
                 return@Column
             }
-            if (messages.isEmpty()) {
+            if (messages.isEmpty() && outbox.isEmpty()) {
                 EmptyConversation(title = title)
             } else {
                 LazyColumn(
@@ -735,9 +933,9 @@ fun ChatScreen(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
+                    itemsIndexed(shownMessages, key = { _, m -> m.id }) { index, message ->
                         val day = dayOf(message)
-                        val prevDay = if (index > 0) dayOf(messages[index - 1]) else null
+                        val prevDay = if (index > 0) dayOf(shownMessages[index - 1]) else null
                         Column(Modifier.fillMaxWidth()) {
                         if (day != null && day != prevDay) {
                             DateSeparator(dayLabel(day))
@@ -754,7 +952,7 @@ fun ChatScreen(
                             onLongPress = { sheetFor = message },
                             onOpenImage = { photoUrl = it },
                             onJumpTo = { targetId ->
-                                val i = messages.indexOfFirst { it.id == targetId }
+                                val i = shownMessages.indexOfFirst { it.id == targetId }
                                 if (i >= 0) scope.launch { listState.animateScrollToItem(i) }
                             },
                             onReact = { emoji ->
@@ -774,13 +972,25 @@ fun ChatScreen(
                         )
                         }
                     }
+                    // Messages that are still travelling: they show the upload progress and
+                    // a retry button when something went wrong.
+                    items(outbox, key = { it.localId }) { item ->
+                        OutgoingBubble(
+                            item = item,
+                            onRetry = { retryOutgoing(item) },
+                            onDiscard = { outbox = outbox.filter { it.localId != item.localId } }
+                        )
+                    }
                 }
             }
         }
             // WhatsApp/Telegram-style: only shows when you have scrolled away from the newest.
-            if (!atBottom && messages.isNotEmpty()) {
+            if (!atBottom && (messages.isNotEmpty() || outbox.isNotEmpty())) {
                 SmallFloatingActionButton(
-                    onClick = { scope.launch { listState.animateScrollToItem(messages.lastIndex) } },
+                    onClick = {
+                        val total = shownMessages.size + outbox.size
+                        if (total > 0) scope.launch { listState.animateScrollToItem(total - 1) }
+                    },
                     modifier = Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 14.dp),
                     containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                     contentColor = MaterialTheme.colorScheme.primary
@@ -790,6 +1000,38 @@ fun ChatScreen(
     }
 
     photoUrl?.let { url -> PhotoViewer(url = url, onDismiss = { photoUrl = null }) }
+
+    // Everything the user picks goes through the editor first, exactly like WhatsApp.
+    val editor = editorFor
+    if (editor != null) {
+        MediaEditorDialog(
+            kind = editor.kind,
+            file = editor.file,
+            fileName = editor.fileName,
+            mimeType = editor.mimeType,
+            onCancel = { editorFor = null },
+            onSend = { caption, rotation, trimStart, trimEnd ->
+                editorFor = null
+                enqueueMedia(editor, caption, rotation, trimStart, trimEnd)
+            }
+        )
+    }
+
+    // A background for this conversation only.
+    if (showWallpaper) {
+        WallpaperSheet(
+            current = AppSettings.wallpaperPresetFor(chat.id),
+            title = "Chat background",
+            onPick = { preset -> AppSettings.setChatWallpaperPresetFor(chat.id, preset) },
+            onDismiss = { showWallpaper = false },
+            extra = {
+                TextButton(onClick = {
+                    AppSettings.setChatWallpaperPresetFor(chat.id, null)
+                    showWallpaper = false
+                }) { Text("Use the default background") }
+            }
+        )
+    }
 
     // ---------------------------------------------------------------- sheets
 
@@ -1858,7 +2100,9 @@ private fun ChatComposer(
             )
             IconButton(onClick = onEmoji) { Icon(Icons.Default.EmojiEmotions, "Emoji") }
             if (draft.isNotBlank() || editingId != null) {
-                IconButton(onClick = onSend, enabled = !sending) {
+                // Always tappable: the bubble appears straight away, so the button never
+                // feels stuck while the network is busy.
+                IconButton(onClick = onSend) {
                     Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = MaterialTheme.colorScheme.primary)
                 }
             } else {

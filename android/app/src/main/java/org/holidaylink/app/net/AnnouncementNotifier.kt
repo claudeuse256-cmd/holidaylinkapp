@@ -22,7 +22,7 @@ import org.holidaylink.app.R
 object AnnouncementNotifier {
 
     const val CHANNEL = "hl_announcements"
-    private const val NOTIFICATION_ID = 4701
+    const val NOTIFICATION_ID = 4701
 
     private var registration: com.google.firebase.firestore.ListenerRegistration? = null
     private var lastShown: String = ""

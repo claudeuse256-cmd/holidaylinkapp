@@ -25,13 +25,19 @@ object Imgbb {
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    suspend fun uploadJpeg(bytes: ByteArray): String = withContext(Dispatchers.IO) {
+    /**
+     * Uploads a JPEG to imgbb and returns its public URL.
+     * [onProgress] receives 0..100 so the chat can show an upload bar.
+     */
+    suspend fun uploadJpeg(bytes: ByteArray, onProgress: (Int) -> Unit = {}): String = withContext(Dispatchers.IO) {
         if (bytes.isEmpty()) throw ApiException("That image couldn't be read. Try another one.")
         val body = FormBody.Builder()
             .add("key", KEY)
             .add("image", Base64.encodeToString(bytes, Base64.NO_WRAP))
             .build()
-        val req = Request.Builder().url("https://api.imgbb.com/1/upload").post(body).build()
+        val req = Request.Builder().url("https://api.imgbb.com/1/upload")
+            .post(body.withProgress(onProgress))
+            .build()
         client.newCall(req).execute().use { res ->
             val raw = res.body?.string().orEmpty()
             if (!res.isSuccessful) throw ApiException("Image upload failed. Check your internet and try again.")

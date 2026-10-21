@@ -1086,6 +1086,7 @@ fun AppearanceScreen(onBack: () -> Unit) {
     var themePicker by remember { mutableStateOf(false) }
     var densityPicker by remember { mutableStateOf(false) }
     var fontScale by remember { mutableFloatStateOf(settings.fontScale) }
+    var wallpaperGallery by remember { mutableStateOf(false) }
 
     val wallpaperPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia()
@@ -1151,6 +1152,11 @@ fun AppearanceScreen(onBack: () -> Unit) {
 
             SettingsSection("Chat wallpaper") {
                 SettingsNavRow(
+                    title = "Chat backgrounds",
+                    icon = Icons.Default.Palette,
+                    onClick = { wallpaperGallery = true }
+                )
+                SettingsNavRow(
                     title = "Set chat wallpaper",
                     icon = Icons.Default.Palette,
                     onClick = {
@@ -1173,6 +1179,14 @@ fun AppearanceScreen(onBack: () -> Unit) {
                         onClick = { AppSettings.setChatWallpaper(null) }
                     )
                 }
+                Text(
+                    "The background chosen here is the default for every chat. " +
+                        "Any conversation can have its own background — open the chat and " +
+                        "use the ⋮ menu.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                )
             }
 
             SettingsSection("Preview") {
@@ -1194,6 +1208,23 @@ fun AppearanceScreen(onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    if (wallpaperGallery) {
+        WallpaperSheet(
+            current = settings.chatWallpaperPreset,
+            title = "Chat backgrounds",
+            onPick = { preset -> AppSettings.setChatWallpaperPreset(preset) },
+            onDismiss = { wallpaperGallery = false },
+            extra = {
+                Text(
+                    "This is the default for every chat. A single chat can have its own " +
+                        "background from the ⋮ menu inside the conversation.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        )
     }
 
     if (themePicker) {

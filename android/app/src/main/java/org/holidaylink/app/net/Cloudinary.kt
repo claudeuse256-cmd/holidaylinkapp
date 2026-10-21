@@ -26,12 +26,15 @@ object Cloudinary {
     /**
      * Uploads [bytes] and returns the public HTTPS URL.
      * Throws [ApiException] with a human-readable message when the server refuses.
+     *
+     * [onProgress] receives 0..100 so the chat can draw a progress bar on the attachment.
      */
     suspend fun upload(
         context: Context,
         bytes: ByteArray,
         fileName: String,
-        mimeType: String
+        mimeType: String,
+        onProgress: (Int) -> Unit = {}
     ): String = withContext(Dispatchers.IO) {
         val token = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
             ?.getIdToken(false)?.await()?.token
@@ -53,7 +56,7 @@ object Cloudinary {
             .addHeader("Authorization", "Bearer $token")
             .addHeader("X-Filename", safeName)
             .addHeader("X-Content-Type", mimeType)
-            .post(bytes.toRequestBody(mediaType))
+            .post(bytes.toRequestBody(mediaType).withProgress(onProgress))
             .build()
 
         client.newCall(request).execute().use { response ->

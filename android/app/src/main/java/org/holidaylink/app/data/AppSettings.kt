@@ -35,6 +35,10 @@ data class SettingsSnapshot(
     val animationsEnabled: Boolean = true,
     val chatWallpaper: String? = null,
     val chatWallpaperSolid: Boolean = false,
+    /** Built-in background used by every chat unless the chat overrides it. */
+    val chatWallpaperPreset: String = "default",
+    /** Per-chat background override: chatId -> preset id ("" clears the override). */
+    val chatWallpaperPresets: Map<String, String> = emptyMap(),
     val autoDownloadPhotos: AutoDownload = AutoDownload.WIFI_ONLY,
     val autoDownloadVideos: AutoDownload = AutoDownload.WIFI_ONLY,
     val autoDownloadDocuments: AutoDownload = AutoDownload.NEVER,
@@ -108,6 +112,8 @@ object AppSettings {
         const val ANIMATIONS = "set.animations"
         const val WALLPAPER = "set.wallpaper"
         const val WALLPAPER_SOLID = "set.wallpaperSolid"
+        const val WALLPAPER_PRESET = "set.wallpaperPreset"
+        const val WALLPAPER_PRESETS = "set.wallpaperPresets"
         const val DL_PHOTOS = "set.dlPhotos"
         const val DL_VIDEOS = "set.dlVideos"
         const val DL_DOCS = "set.dlDocs"
@@ -148,6 +154,8 @@ object AppSettings {
             animationsEnabled = p.getBoolean(K.ANIMATIONS, true),
             chatWallpaper = p.getString(K.WALLPAPER, null),
             chatWallpaperSolid = p.getBoolean(K.WALLPAPER_SOLID, false),
+            chatWallpaperPreset = p.getString(K.WALLPAPER_PRESET, "default") ?: "default",
+            chatWallpaperPresets = decodeStringMap(p.getString(K.WALLPAPER_PRESETS, "").orEmpty()),
             autoDownloadPhotos = enumOrDefault(p.getString(K.DL_PHOTOS, null), AutoDownload.WIFI_ONLY),
             autoDownloadVideos = enumOrDefault(p.getString(K.DL_VIDEOS, null), AutoDownload.WIFI_ONLY),
             autoDownloadDocuments = enumOrDefault(p.getString(K.DL_DOCS, null), AutoDownload.NEVER),
@@ -194,6 +202,23 @@ object AppSettings {
         }
         return result
     }
+
+    /** Reads a `key=value` map whose values are plain strings (used for per-chat presets). */
+    private fun decodeStringMap(raw: String): Map<String, String> {
+        if (raw.isBlank()) return emptyMap()
+        val result = LinkedHashMap<String, String>()
+        for (pair in raw.split(';')) {
+            if (pair.isBlank()) continue
+            val idx = pair.indexOf('=')
+            if (idx <= 0) continue
+            val value = pair.substring(idx + 1)
+            if (value.isNotBlank()) result[pair.substring(0, idx)] = value
+        }
+        return result
+    }
+
+    private fun encodeStringMap(map: Map<String, String>): String =
+        map.entries.joinToString(";") { "${it.key}=${it.value}" }
 
     private fun encodeMuted(map: Map<String, Boolean>): String =
         map.entries.joinToString(";") { "${it.key}=${if (it.value) 1 else 0}" }
@@ -300,6 +325,24 @@ object AppSettings {
         prefs.edit().putBoolean(K.WALLPAPER_SOLID, value).apply()
         commit()
     }
+
+    /** The built-in background every chat uses by default. */
+    fun setChatWallpaperPreset(value: String) {
+        prefs.edit().putString(K.WALLPAPER_PRESET, value).apply()
+        commit()
+    }
+
+    /** Background chosen for one conversation only; null removes the override. */
+    fun setChatWallpaperPresetFor(chatId: String, preset: String?) {
+        val next = LinkedHashMap(state.chatWallpaperPresets)
+        if (preset.isNullOrBlank()) next.remove(chatId) else next[chatId] = preset
+        prefs.edit().putString(K.WALLPAPER_PRESETS, encodeStringMap(next)).apply()
+        commit()
+    }
+
+    /** The background actually used by a chat: its own choice, else the global default. */
+    fun wallpaperPresetFor(chatId: String): String =
+        state.chatWallpaperPresets[chatId] ?: state.chatWallpaperPreset
 
     fun setAutoDownloadPhotos(value: AutoDownload) = putEnum(K.DL_PHOTOS, value)
     fun setAutoDownloadVideos(value: AutoDownload) = putEnum(K.DL_VIDEOS, value)

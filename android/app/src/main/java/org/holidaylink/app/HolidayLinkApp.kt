@@ -1,6 +1,7 @@
 package org.holidaylink.app
 
 import android.app.Application
+import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.net.Notifier
 import org.holidaylink.app.net.PushNotify
 
@@ -18,6 +19,9 @@ class HolidayLinkApp : Application() {
         super.onCreate()
         // First, so anything below can never take the app down without a trace.
         CrashGuard.install(this)
+        // The settings have to be readable even when a push wakes the app without any
+        // Activity: the notification switches live here.
+        runCatching { AppSettings.init(this) }
         runCatching { PushNotify.init(this) }
         runCatching { Notifier.ensureChannels(this) }
     }

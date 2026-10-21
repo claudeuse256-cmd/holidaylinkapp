@@ -298,12 +298,28 @@ fun PhotoViewer(url: String?, title: String = "", onDismiss: () -> Unit) {
 
 // ---------------------------------------------------------------- chat wallpaper
 
-/** Draws the user's chat wallpaper (or a themed base) behind the message list. */
+/**
+ * Draws the user's chat wallpaper (or a themed base) behind the message list.
+ *
+ * A built-in preset wins over a personal photo, so a chat can be given one of the
+ * Telegram-style backgrounds while the account default stays a photo if the user
+ * picked one.
+ */
 @Composable
-fun ChatWallpaper(uri: String?, solid: Boolean, modifier: Modifier = Modifier) {
+fun ChatWallpaper(
+    uri: String?,
+    solid: Boolean,
+    modifier: Modifier = Modifier,
+    preset: String? = null
+) {
     val context = LocalContext.current
     val scheme = MaterialTheme.colorScheme
     val source = uri?.takeIf { it.isNotBlank() }
+    val chosen = preset?.takeIf { it.isNotBlank() }?.takeIf { it != "default" }
+    if (chosen != null) {
+        WallpaperBackdrop(chosen, modifier)
+        return
+    }
     if (source == null || solid) {
         Box(modifier.background(scheme.surfaceContainerLowest))
         return

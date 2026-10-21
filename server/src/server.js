@@ -340,10 +340,41 @@ async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
   ));
   if (!tokens.length) return { sent: 0, failed: 0, skipped: true };
 
+  // The push carries BOTH a `notification` block and the raw `data`. Android draws the
+  // notification itself while the app is closed or in the background (so the alert really
+  // arrives without the app running), and the data payload travels with the tap intent so
+  // the right conversation opens. When the app is alive the messaging service takes over
+  // and draws it, which keeps the per-account label ("Account: ...") that the system block
+  // cannot know about.
+  const chatId = String(data.chatId || '');
+  const tag = chatId ? `chat-${chatId}` : `call-${String(data.callId || '')}`;
+  const channelId = data.type === 'call' ? 'hl_calls' : 'hl_messages';
+  // The cross-platform notification block only knows title and body — every Android
+  // specific setting (channel, icon, tag, sound) belongs to android.notification, and
+  // Firebase rejects unknown fields.
+  const notification = {
+    title: String(data.title || 'HolidayLink'),
+    body: String(data.body || '')
+  };
+
   const result = await admin.messaging().sendEachForMulticast({
     tokens,
     data,
-    android: { priority: 'high', ttl: ttlSeconds * 1000 },
+    notification,
+    android: {
+      priority: 'high',
+      ttl: ttlSeconds * 1000,
+      notification: {
+        channel_id: channelId,
+        icon: 'ic_stat_holidaylink',
+        color: '#0B5CFF',
+        tag,
+        sound: 'default',
+        default_vibrate_timings: true,
+        default_sound: true,
+        notification_priority: 'PRIORITY_HIGH'
+      }
+    },
     apns: { headers: { 'apns-priority': '10' } }
   });
 

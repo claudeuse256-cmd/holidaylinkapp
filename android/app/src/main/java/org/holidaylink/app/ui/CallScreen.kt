@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import org.holidaylink.app.net.CallManager
+import org.holidaylink.app.net.CallSounds
 import org.holidaylink.app.net.User
 import org.webrtc.EglBase
 import org.webrtc.SurfaceViewRenderer
@@ -50,6 +51,7 @@ fun CallScreen(
     onClose: () -> Unit
 ) {
     val egl = remember { EglBase.create() }
+    val context = LocalContext.current
     var state by remember { mutableStateOf(if (incoming) "ringing" else "calling") }
     var muted by remember { mutableStateOf(false) }
     var speaker by remember { mutableStateOf(kind == "video") }
@@ -114,19 +116,47 @@ fun CallScreen(
         }
     }
 
+    // The phone being called gets the phone's own ringtone; the caller gets a ringback
+    // tone so it is obvious the call is going out.
+    var soundMode by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(incoming, answered, state) {
+        val mode = when {
+            incoming && !answered -> "ringtone"
+            !incoming && (state == "calling" || state == "ringing") -> "ringback"
+            else -> null
+        }
+        if (mode != soundMode) {
+            soundMode = mode
+            when (mode) {
+                "ringtone" -> CallSounds.startIncoming(context)
+                "ringback" -> CallSounds.startRingback()
+                else -> CallSounds.stop()
+            }
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { CallSounds.stop() }
+    }
+
+    // While the other side has not picked up yet, the caller sees their own camera full
+    // screen, exactly like WhatsApp, instead of a black rectangle.
+    val selfViewFullScreen = kind == "video" && !incoming && remoteTrack == null
+
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (kind == "video") {
-            AndroidView(
-                factory = { ctx ->
-                    SurfaceViewRenderer(ctx).apply {
-                        init(egl.eglBaseContext, null)
-                        setEnableHardwareScaler(true)
-                        setMirror(false)
-                        remoteView = this
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
+            if (remoteTrack != null) {
+                AndroidView(
+                    factory = { ctx ->
+                        SurfaceViewRenderer(ctx).apply {
+                            init(egl.eglBaseContext, null)
+                            setEnableHardwareScaler(true)
+                            setMirror(false)
+                            remoteView = this
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
             AndroidView(
                 factory = { ctx ->
                     SurfaceViewRenderer(ctx).apply {
@@ -136,11 +166,15 @@ fun CallScreen(
                         localView = this
                     }
                 },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(16.dp)
-                    .size(width = 108.dp, height = 150.dp)
-                    .clip(RoundedCornerShape(12.dp))
+                modifier = if (selfViewFullScreen) {
+                    Modifier.fillMaxSize()
+                } else {
+                    Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(16.dp)
+                        .size(width = 108.dp, height = 150.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                }
             )
         }
 
@@ -149,7 +183,7 @@ fun CallScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Spacer(Modifier.height(36.dp))
-            if (kind != "video" || state == "ringing" || !answered) {
+            if (kind != "video" || state == "ringing" || !answered || (remoteTrack == null && incoming)) {
                 Avatar(name = user.displayName, photo = user.avatarUrl, size = 100.dp)
             }
             Spacer(Modifier.height(18.dp))
@@ -161,7 +195,7 @@ fun CallScreen(
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                statusLabel(state, answered, seconds),
+                statusLabel(state, incoming, answered, seconds, kind),
                 color = Color.LightGray,
                 style = MaterialTheme.typography.bodyMedium
             )
@@ -233,11 +267,24 @@ private fun CircleAction(color: Color, icon: ImageVector, label: String, onClick
     }
 }
 
-private fun statusLabel(state: String, answered: Boolean, seconds: Int): String = when (state) {
-    "ringing" -> if (answered) "Connecting…" else "Incoming call"
+private fun statusLabel(
+    state: String,
+    incoming: Boolean,
+    answered: Boolean,
+    seconds: Int,
+    kind: String
+): String = when (state) {
+    // "Ringing" is the caller's side (the other phone is ringing); on the callee's side
+    // it is the incoming call itself.
+    "ringing" -> if (incoming && !answered) {
+        if (kind == "video") "Incoming video call" else "Incoming audio call"
+    } else {
+        "Ringing…"
+    }
     "calling" -> "Calling…"
     "accepted", "connected" ->
         if (seconds > 0) "%d:%02d".format(seconds / 60, seconds % 60) else "Connecting…"
+    "connecting" -> "Connecting…"
     "declined" -> "Declined"
     "missed" -> "Missed"
     "ended" -> "Call ended"
