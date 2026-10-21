@@ -77,6 +77,10 @@ fun CallScreen(
             val v = localView
             if (t != null && v != null) t.addSink(v)
         }
+        // The caller's peer (and camera track) is created before this screen composes, so
+        // the callbacks above would miss it: pull the current tracks now that they are wired.
+        manager.currentLocalTrack?.let { localTrack = it }
+        manager.currentRemoteTrack?.let { remoteTrack = it }
         manager.setSpeaker(speaker)
         onDispose {
             remoteView?.let { v -> remoteTrack?.removeSink(v); v.release() }
@@ -183,7 +187,10 @@ fun CallScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Spacer(Modifier.height(36.dp))
-            if (kind != "video" || state == "ringing" || !answered || (remoteTrack == null && incoming)) {
+            // While the caller sees their own camera full-screen (WhatsApp-style self view),
+            // the avatar would just cover the video — so it is only drawn when there is no
+            // live self view to show (audio calls, and video calls before/without video).
+            if (!selfViewFullScreen && (kind != "video" || state == "ringing" || !answered || (remoteTrack == null && incoming))) {
                 Avatar(name = user.displayName, photo = user.avatarUrl, size = 100.dp)
             }
             Spacer(Modifier.height(18.dp))

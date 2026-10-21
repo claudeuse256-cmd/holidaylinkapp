@@ -27,6 +27,10 @@ object AnnouncementNotifier {
     private var registration: com.google.firebase.firestore.ListenerRegistration? = null
     private var lastShown: String = ""
 
+    private const val PREFS = "hl_announce"
+    private const val KEY_TITLE = "last_title"
+    private const val KEY_BODY = "last_body"
+
     fun ensureChannel(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
@@ -44,6 +48,19 @@ object AnnouncementNotifier {
     fun start(context: Context) {
         val app = context.applicationContext
         ensureChannel(app)
+        // An app update (or a reboot / "clear notifications") wipes the system tray, and
+        // the Firestore snapshot can take a beat to arrive — or fail while offline. Re-post
+        // the last announcement we showed straight away so the pinned card is never lost.
+        runCatching {
+            val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val title = prefs.getString(KEY_TITLE, null)
+            val body = prefs.getString(KEY_BODY, null)
+            if (!title.isNullOrBlank()) {
+                // Silent re-post: this announcement was already seen, so do not re-alert.
+                lastShown = "$title\u0000$body"
+                show(app, title, body.orEmpty())
+            }
+        }
         if (registration != null) return
         registration = runCatching {
             FirebaseBackend.db.collection("posters")
@@ -76,6 +93,15 @@ object AnnouncementNotifier {
         val firstTime = fingerprint != lastShown
         lastShown = fingerprint
 
+        // Remember it so a later launch (or an app update, which cancels every
+        // notification) can put the pinned card straight back without waiting on Firestore.
+        runCatching {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString(KEY_TITLE, title)
+                .putString(KEY_BODY, body)
+                .apply()
+        }
+
         ensureChannel(context)
         val nm = NotificationManagerCompat.from(context)
         if (!nm.areNotificationsEnabled()) return
@@ -92,6 +118,7 @@ object AnnouncementNotifier {
 
         val notification = NotificationCompat.Builder(context, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_holidaylink)
+            .setLargeIcon(Notifier.logo(context))
             .setColor(androidx.core.content.ContextCompat.getColor(context, R.color.notification_accent))
             .setContentTitle(title)
             .setContentText(body)

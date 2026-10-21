@@ -27,7 +27,32 @@ object Notifier {
     const val EXTRA_TARGET = "hl_target"
 
     /** chatId → notification ids posted for it, so "seen" can clear every variant. */
-    private val posted = ConcurrentHashMap<String, MutableSet<Int>>()
+    private val posted = ConcurrentHashMap<String, MutableSet<Int>()
+
+    /** The full-colour HolidayLink logo, shown large in the expanded notification. */
+    @Volatile
+    private var logoCache: android.graphics.Bitmap? = null
+
+    /**
+     * Decodes (once) and downscales the brand logo so the expanded panel shows the real
+     * mark. The tiny status-bar icon is only a silhouette; this is what makes the
+     * notification read as "HolidayLink" at a glance.
+     */
+    fun logo(context: Context): android.graphics.Bitmap? {
+        logoCache?.let { return it }
+        return runCatching {
+            val src = android.graphics.BitmapFactory.decodeResource(
+                context.resources, org.holidaylink.app.R.drawable.holidaylink_icon
+            ) ?: return null
+            val size = 160
+            val scaled = android.graphics.Bitmap.createScaledBitmap(
+                src, size, (src.height.toLong() * size / src.width).toInt().coerceAtLeast(1), true
+            )
+            if (scaled !== src) src.recycle()
+            logoCache = scaled
+            scaled
+        }.getOrNull()
+    }
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -152,6 +177,7 @@ object Notifier {
         val shownBody = if (preview) body else "New message"
         val notification = NotificationCompat.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_stat_holidaylink)
+            .setLargeIcon(logo(context))
             .setColor(androidx.core.content.ContextCompat.getColor(context, R.color.notification_accent))
             .setContentTitle(title)
             .setContentText(shownBody)

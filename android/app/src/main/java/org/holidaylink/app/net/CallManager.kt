@@ -25,6 +25,17 @@ class CallManager(private val context: Context, private val api: Api) {
     var onRemote: ((VideoTrack?) -> Unit)? = null
     var onLocal: ((VideoTrack?) -> Unit)? = null
 
+    /**
+     * The latest local/remote video tracks. The caller's peer (and with it the local camera
+     * track) is created *before* the call screen composes and registers its callbacks, so a
+     * screen that only listens would never receive the track and would show a black frame.
+     * Reading these right after wiring the callbacks closes that race.
+     */
+    @Volatile var currentLocalTrack: VideoTrack? = null
+        private set
+    @Volatile var currentRemoteTrack: VideoTrack? = null
+        private set
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val db get() = FirebaseBackend.db
     private var incomingReg: ListenerRegistration? = null
@@ -257,6 +268,8 @@ class CallManager(private val context: Context, private val api: Api) {
         videoCapturer = null
         runCatching { localVideo?.dispose() }; localVideo = null
         runCatching { localAudio?.dispose() }; localAudio = null
+        currentLocalTrack = null
+        currentRemoteTrack = null
         runCatching { videoSource?.dispose() }; videoSource = null
         runCatching { audioSource?.dispose() }; audioSource = null
         runCatching { surfaceTextureHelper?.dispose() }; surfaceTextureHelper = null
@@ -388,7 +401,10 @@ class CallManager(private val context: Context, private val api: Api) {
                 sendSignal("candidate", cand = c)
             }
             override fun onTrack(t: RtpTransceiver) {
-                (t.receiver.track() as? VideoTrack)?.let { onRemote?.invoke(it) }
+                (t.receiver.track() as? VideoTrack)?.let {
+                    currentRemoteTrack = it
+                    onRemote?.invoke(it)
+                }
             }
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState) {
                 onState?.invoke(s.name.lowercase())
@@ -425,6 +441,7 @@ class CallManager(private val context: Context, private val api: Api) {
                 capt.startCapture(640, 480, 24)
                 localVideo = f.createVideoTrack("video", src)
                 pc!!.addTrack(localVideo)
+                currentLocalTrack = localVideo
                 onLocal?.invoke(localVideo)
             }
         }

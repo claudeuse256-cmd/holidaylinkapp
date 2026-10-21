@@ -74,7 +74,11 @@ object CallSounds {
                 AudioTrack.Builder()
                     .setAudioAttributes(
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                            // Ringtone usage, not voice: VOICE_COMMUNICATION routes to the
+                            // earpiece (quiet, near the face), which made callers hear
+                            // nothing at all while ringing. Ringtone plays on the speaker
+                            // like the real network ringback.
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             .build()
                     )

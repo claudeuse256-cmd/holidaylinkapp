@@ -81,6 +81,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -110,6 +111,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -119,6 +122,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.fragment.app.FragmentActivity
 import com.google.firebase.Timestamp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -1430,6 +1434,8 @@ private fun FsMessageBubble(
     else MaterialTheme.colorScheme.surfaceContainerHigh
     val textColor = if (mine) MaterialTheme.colorScheme.onPrimaryContainer
     else MaterialTheme.colorScheme.onSurface
+    // The full-screen in-app video player, opened by tapping a video bubble.
+    var playingVideo by remember { mutableStateOf<java.io.File?>(null) }
 
     Column(
         Modifier.fillMaxWidth().padding(vertical = 1.dp),
@@ -1496,11 +1502,21 @@ private fun FsMessageBubble(
                         Spacer(Modifier.height(6.dp))
                     }
                     message.fileUrl?.let { url ->
-                        FsFileRow(
-                            name = message.fileName ?: "File",
-                            kind = message.type,
-                            url = url
-                        )
+                        if (message.type == "video") {
+                            // WhatsApp-style video: a thumbnail with a play button that
+                            // opens the in-app full-screen player (no other app needed).
+                            VideoBubble(
+                                url = url,
+                                name = message.fileName ?: "Video",
+                                onOpen = { file -> playingVideo = file }
+                            )
+                        } else {
+                            FsFileRow(
+                                name = message.fileName ?: "File",
+                                kind = message.type,
+                                url = url
+                            )
+                        }
                         Spacer(Modifier.height(6.dp))
                     }
                     if (message.text.isNotBlank()) {
@@ -1582,6 +1598,9 @@ private fun FsMessageBubble(
                 )
             }
         }
+    }
+    playingVideo?.let { file ->
+        VideoPlayerDialog(file = file, onDismiss = { playingVideo = null })
     }
 }
 
@@ -1669,6 +1688,194 @@ private fun mimeForFile(name: String): String = when (name.substringAfterLast('.
     else -> "*/*"
 }
 
+/**
+ * A video message, WhatsApp-style: the first frame as the thumbnail with a play button
+ * over it. Tapping opens the in-app full-screen player — the file is downloaded once and
+ * then replayed straight from the app cache, no other app involved.
+ */
+@Composable
+private fun VideoBubble(url: String, name: String, onOpen: (java.io.File) -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var busy by remember(url) { mutableStateOf(false) }
+    var thumb by remember(url) { mutableStateOf<android.graphics.Bitmap?>(null) }
+
+    LaunchedEffect(url) {
+        // A cached file gets its real first frame; otherwise the dark placeholder shows
+        // until the first tap downloads it (and the thumb then appears for replays).
+        val cached = MediaCache.cached(context, url, "mp4") ?: return@LaunchedEffect
+        thumb = withContext(Dispatchers.IO) {
+            runCatching {
+                val retriever = android.media.MediaMetadataRetriever()
+                retriever.setDataSource(cached.absolutePath)
+                val frame = retriever.getFrameAtTime(0)
+                retriever.release()
+                frame
+            }.getOrNull()
+        }
+    }
+
+    Box(
+        Modifier.width(220.dp).height(150.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.Black)
+            .clickable {
+                if (busy) return@clickable
+                val alreadyCached = MediaCache.cached(context, url, "mp4")
+                if (alreadyCached != null) {
+                    onOpen(alreadyCached)
+                } else {
+                    busy = true
+                    scope.launch {
+                        val file = MediaCache.fetch(context, url, "mp4")
+                        busy = false
+                        if (file != null) {
+                            // First frame for the bubble now that it lives on this phone.
+                            thumb = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    val retriever = android.media.MediaMetadataRetriever()
+                                    retriever.setDataSource(file.absolutePath)
+                                    val frame = retriever.getFrameAtTime(0)
+                                    retriever.release()
+                                    frame
+                                }.getOrNull()
+                            }
+                            onOpen(file)
+                        }
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        thumb?.let { bmp ->
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        Box(
+            Modifier.size(46.dp).clip(RoundedCornerShape(23.dp))
+                .background(Color.Black.copy(alpha = 0.45f)),
+            contentAlignment = Alignment.Center
+        ) {
+            if (busy) {
+                CircularProgressIndicator(Modifier.size(24.dp), color = Color.White, strokeWidth = 2.dp)
+            } else {
+                Icon(Icons.Default.PlayArrow, "Play video", tint = Color.White, modifier = Modifier.size(28.dp))
+            }
+        }
+    }
+}
+
+/**
+ * The in-app video viewer: full-screen playback with the platform's own controls
+ * (play/pause, seek, fullscreen) plus a close button — same feel as opening a video
+ * inside WhatsApp instead of bouncing out to another player app.
+ */
+@Composable
+private fun VideoPlayerDialog(file: java.io.File, onDismiss: () -> Unit) {
+    var videoView by remember { mutableStateOf<android.widget.VideoView?>(null) }
+    var playing by remember { mutableStateOf(false) }
+    var position by remember { mutableIntStateOf(0) }
+    var duration by remember { mutableIntStateOf(0) }
+    var controlsVisible by remember { mutableStateOf(true) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+    ) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            AndroidView(
+                factory = { ctx ->
+                    android.widget.VideoView(ctx).apply {
+                        setVideoPath(file.absolutePath)
+                        setOnPreparedListener { mp ->
+                            mp.isLooping = false
+                            duration = mp.duration
+                            start()
+                            playing = true
+                        }
+                        setOnCompletionListener { playing = false }
+                        videoView = this
+                    }
+                },
+                update = { view ->
+                    if (playing && !view.isPlaying) view.start()
+                    else if (!playing && view.isPlaying) view.pause()
+                },
+                modifier = Modifier.fillMaxSize().clickable { controlsVisible = !controlsVisible }
+            )
+            // Track playback progress for the scrubber.
+            LaunchedEffect(playing) {
+                while (playing) {
+                    delay(250)
+                    runCatching {
+                        val v = videoView ?: return@runCatching
+                        if (v.isPlaying) {
+                            position = v.currentPosition
+                            duration = v.duration
+                        }
+                    }
+                }
+            }
+            if (controlsVisible) {
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.align(Alignment.TopStart).padding(12.dp)
+                ) {
+                    Icon(Icons.Default.Close, "Close", tint = Color.White, modifier = Modifier.size(28.dp))
+                }
+                IconButton(
+                    onClick = {
+                        val v = videoView ?: return@IconButton
+                        if (v.isPlaying) { v.pause(); playing = false } else { v.start(); playing = true }
+                    },
+                    modifier = Modifier.align(Alignment.Center).size(64.dp)
+                        .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(32.dp))
+                ) {
+                    Icon(
+                        if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
+                        if (playing) "Pause" else "Play",
+                        tint = Color.White,
+                        modifier = Modifier.size(36.dp)
+                    )
+                }
+                Row(
+                    Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 20.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        formatDuration(position.toLong()),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White
+                    )
+                    val total = duration.coerceAtLeast(1)
+                    Slider(
+                        value = position.toFloat().coerceAtMost(total.toFloat()),
+                        onValueChange = { seekTo ->
+                            videoView?.seekTo(seekTo.toInt())
+                            position = seekTo.toInt()
+                        },
+                        valueRange = 0f..total.toFloat(),
+                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                    )
+                    Text(
+                        formatDuration(duration.toLong()),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White
+                    )
+                }
+            }
+        }
+    }
+    DisposableEffect(file) {
+        onDispose { runCatching { videoView?.stopPlayback() } }
+    }
+}
+
 @Composable
 private fun BlobVoicePlayer(messageId: String, blob: String, name: String) {
     val context = LocalContext.current
@@ -1730,7 +1937,8 @@ private fun VoicePlayer(filePath: String? = null, streamUrl: String? = null, nam
     Row(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
+            // No inner surface box: the note now blends into the message bubble itself
+            // instead of showing a box-inside-a-box "boundary".
             .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

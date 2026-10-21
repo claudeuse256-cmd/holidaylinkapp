@@ -1,5 +1,10 @@
 package org.holidaylink.app.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,6 +43,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
+import kotlin.math.cos
+import kotlin.math.sin
 
 /**
  * The chat backgrounds a user can pick from.
@@ -53,7 +60,9 @@ data class WallpaperPreset(
     val id: String,
     val label: String,
     val colors: List<Color>,
-    val style: WallpaperStyle = WallpaperStyle.GRADIENT
+    val style: WallpaperStyle = WallpaperStyle.GRADIENT,
+    /** Telegram-style living background: the gradient slowly drifts instead of sitting still. */
+    val animated: Boolean = false
 )
 
 /** The built-in gallery. The first entry is the plain app background. */
@@ -66,17 +75,20 @@ val WallpaperPresets: List<WallpaperPreset> = listOf(
     WallpaperPreset(
         "aurora", "Aurora",
         listOf(Color(0xFF1E3A8A), Color(0xFF0891B2), Color(0xFF7C3AED)),
-        WallpaperStyle.GRADIENT
+        WallpaperStyle.GRADIENT,
+        animated = true
     ),
     WallpaperPreset(
         "sunset", "Sunset",
         listOf(Color(0xFFF97316), Color(0xFFDB2777), Color(0xFF7C2D12)),
-        WallpaperStyle.GRADIENT
+        WallpaperStyle.GRADIENT,
+        animated = true
     ),
     WallpaperPreset(
         "ocean", "Ocean",
         listOf(Color(0xFF0369A1), Color(0xFF0EA5E9), Color(0xFF082F49)),
-        WallpaperStyle.WAVES
+        WallpaperStyle.WAVES,
+        animated = true
     ),
     WallpaperPreset(
         "forest", "Forest",
@@ -86,7 +98,8 @@ val WallpaperPresets: List<WallpaperPreset> = listOf(
     WallpaperPreset(
         "lavender", "Lavender",
         listOf(Color(0xFF6D28D9), Color(0xFFA78BFA), Color(0xFF4C1D95)),
-        WallpaperStyle.RINGS
+        WallpaperStyle.RINGS,
+        animated = true
     ),
     WallpaperPreset(
         "mono", "Mono",
@@ -111,12 +124,25 @@ val WallpaperPresets: List<WallpaperPreset> = listOf(
     WallpaperPreset(
         "sky", "Sky",
         listOf(Color(0xFF0C4A6E), Color(0xFF38BDF8), Color(0xFF075985)),
-        WallpaperStyle.WAVES
+        WallpaperStyle.WAVES,
+        animated = true
     ),
     WallpaperPreset(
         "paper", "Paper",
         listOf(Color(0xFFFAF7F0), Color(0xFFE7DFD0), Color(0xFFD6C9B4)),
         WallpaperStyle.GRID
+    ),
+    WallpaperPreset(
+        "midnight", "Midnight",
+        listOf(Color(0xFF0F172A), Color(0xFF1D4ED8), Color(0xFF312E81)),
+        WallpaperStyle.GRADIENT,
+        animated = true
+    ),
+    WallpaperPreset(
+        "coral", "Coral",
+        listOf(Color(0xFFEF4444), Color(0xFFF97316), Color(0xFFFDBA74)),
+        WallpaperStyle.DIAGONAL,
+        animated = true
     )
 )
 
@@ -130,16 +156,62 @@ fun wallpaperPreset(id: String?): WallpaperPreset =
 /**
  * Paints a preset: a soft gradient plus the pattern that gives it its character.
  * Kept as vector drawing so it costs nothing and never needs downloading.
+ *
+ * Telegram-style "living" presets ([WallpaperPreset.animated]) slowly drift: the gradient
+ * rotates through its hues while two soft glow blobs glide across the screen. Everything
+ * is a handful of cheap canvas draws per frame, and the picker swatches opt out via
+ * `animate = false` so a wall of thumbnails doesn't spin on its own.
  */
 @Composable
-fun WallpaperBackdrop(presetId: String, modifier: Modifier = Modifier) {
+fun WallpaperBackdrop(presetId: String, modifier: Modifier = Modifier, animate: Boolean = true) {
     val preset = wallpaperPreset(presetId)
+    val phase = if (animate && preset.animated) {
+        val transition = rememberInfiniteTransition(label = "wallpaper")
+        transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(durationMillis = 14_000, easing = LinearEasing)),
+            label = "wallpaper-phase"
+        ).value
+    } else {
+        0f
+    }
     Canvas(modifier) {
         val w = size.width
         val h = size.height
         val colors = preset.colors
-        val brush = Brush.linearGradient(colors, Offset(0f, 0f), Offset(w, h))
+        // The gradient's endpoints sweep a slow circle, so the colours keep moving.
+        val angle = phase * (2f * Math.PI).toFloat()
+        val cx = w / 2f
+        val cy = h / 2f
+        val reach = maxOf(w, h) * 0.9f
+        val start = Offset(cx + cos(angle) * reach, cy + sin(angle) * reach)
+        val end = Offset(cx - cos(angle) * reach, cy - sin(angle) * reach)
+        val brush = Brush.linearGradient(colors, start, end)
         drawRect(brush)
+        if (phase != 0f) {
+            // Two drifting glow blobs for depth (the "animated wallpapers" feel).
+            val glow = colors[1]
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(glow.copy(alpha = 0.35f), glow.copy(alpha = 0f)),
+                    center = Offset(cx + cos(angle) * w * 0.4f, cy + sin(angle * 1.3f) * h * 0.4f),
+                    radius = maxOf(w, h) * 0.5f
+                ),
+                radius = maxOf(w, h) * 0.5f,
+                center = Offset(cx + cos(angle) * w * 0.4f, cy + sin(angle * 1.3f) * h * 0.4f)
+            )
+            val glow2 = colors[colors.size - 1]
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(glow2.copy(alpha = 0.28f), glow2.copy(alpha = 0f)),
+                    center = Offset(cx - cos(angle * 0.7f) * w * 0.45f, cy - sin(angle) * h * 0.45f),
+                    radius = maxOf(w, h) * 0.45f
+                ),
+                radius = maxOf(w, h) * 0.45f,
+                center = Offset(cx - cos(angle * 0.7f) * w * 0.45f, cy - sin(angle) * h * 0.45f)
+            )
+        }
         val light = Color.White.copy(alpha = 0.12f)
         when (preset.style) {
             WallpaperStyle.DOTS -> {
@@ -247,7 +319,7 @@ fun WallpaperSwatch(
             )
             .clickable { onClick() }
     ) {
-        WallpaperBackdrop(preset.id, Modifier.fillMaxSize())
+        WallpaperBackdrop(preset.id, Modifier.fillMaxSize(), animate = false)
         if (selected) {
             Box(
                 Modifier

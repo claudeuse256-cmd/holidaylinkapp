@@ -100,6 +100,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
@@ -947,23 +948,26 @@ private fun TabShell(
     )
     var fabOpen by remember { mutableStateOf(false) }
 
-    // Collapsing header: the status row and the search bar slide out of the way while the
-    // user scrolls down the list and slide back in as soon as they scroll up, so the
-    // conversation rows get the whole screen without losing the header forever.
+    // Collapsing header: the status row and the search bar stay put while the first chat is
+    // still on screen, then slide away once the list has scrolled a full row past it, and
+    // slide back in as soon as the user scrolls up. Pure per-pixel toggling made the header
+    // twitch on the first touch; this only collapses after a deliberate scroll.
     val headerHidden = remember { mutableStateOf(false) }
+    val headerScrollPx = remember { mutableStateOf(0f) }
+    val hideAfterPx = with(LocalDensity.current) { 100.dp.toPx() }
     val headerScroller = object : NestedScrollConnection {
         override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
             if (source == NestedScrollSource.UserInput) {
-                // Fingers dragging up (list moving down the screen) hides the header,
-                // dragging down brings it back.
-                if (available.y < -1f) headerHidden.value = true
-                else if (available.y > 1f) headerHidden.value = false
+                // available.y < 0 means the fingers drag up (list moving down the screen).
+                val scrolled = (headerScrollPx.value - available.y).coerceAtLeast(0f)
+                headerScrollPx.value = scrolled
+                headerHidden.value = scrolled > hideAfterPx
             }
             return Offset.Zero
         }
     }
     // A new tab always starts with its header in place.
-    LaunchedEffect(tab) { headerHidden.value = false }
+    LaunchedEffect(tab) { headerHidden.value = false; headerScrollPx.value = 0f }
 
     Scaffold(
         containerColor = scheme.background,

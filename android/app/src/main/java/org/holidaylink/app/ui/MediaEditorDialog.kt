@@ -2,15 +2,20 @@ package org.holidaylink.app.ui
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -21,17 +26,17 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RotateLeft
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -46,13 +51,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.holidaylink.app.media.MediaEditor
 import java.io.File
@@ -144,7 +154,7 @@ fun MediaEditorDialog(
             ) {
                 when {
                     isImage -> EditorImagePreview(file, rotation)
-                    isVideo -> EditorVideoPreview(file, trimStart)
+                    isVideo -> EditorVideoPreview(file, trimStart, trimEnd)
                     else -> EditorDocumentPreview(file, fileName, mimeType)
                 }
             }
@@ -190,26 +200,18 @@ fun MediaEditorDialog(
                         style = MaterialTheme.typography.labelSmall,
                         color = scheme.onSurfaceVariant
                     )
-                    Slider(
-                        value = trimStart.toFloat().coerceIn(0f, duration.toFloat().coerceAtLeast(1f)),
-                        onValueChange = {
-                            val next = it.toLong().coerceIn(0L, (trimEnd - 500L).coerceAtLeast(0L))
-                            trimStart = next
-                        },
-                        valueRange = 0f..duration.toFloat().coerceAtLeast(1f),
-                        colors = SliderDefaults.colors(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Slider(
-                        value = trimEnd.toFloat().coerceIn(0f, duration.toFloat().coerceAtLeast(1f)),
-                        onValueChange = {
-                            val next = it.toLong().coerceIn((trimStart + 500L).coerceAtMost(duration), duration)
-                            trimEnd = next
-                        },
-                        valueRange = 0f..duration.toFloat().coerceAtLeast(1f),
-                        colors = SliderDefaults.colors(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    Spacer(Modifier.height(6.dp))
+                    // WhatsApp-style filmstrip: real frames from the clip with two drag
+                    // handles — not two abstract sliders.
+                    TrimFilmstrip(
+                        file = file,
+                        durationMs = duration,
+                        trimStartMs = trimStart,
+                        trimEndMs = trimEnd
+                    ) { start, end ->
+                        trimStart = start
+                        trimEnd = end
+                    }
                     Spacer(Modifier.height(8.dp))
                 }
                 // Caption
@@ -288,29 +290,69 @@ private fun EditorImagePreview(file: File, rotation: Int) {
 }
 
 @Composable
-private fun EditorVideoPreview(file: File, atMs: Long) {
+private fun EditorVideoPreview(file: File, trimStartMs: Long, trimEndMs: Long) {
     val scheme = MaterialTheme.colorScheme
-    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, file, atMs) {
-        value = withContext(Dispatchers.IO) { MediaEditor.videoThumbnail(file, atMs) }
+    var videoView by remember { mutableStateOf<android.widget.VideoView?>(null) }
+    var playing by remember { mutableStateOf(false) }
+
+    // The preview actually plays, WhatsApp-style: playback loops inside the selected
+    // [trimStart, trimEnd] range so you see exactly what the other side will get.
+    DisposableEffect(file) {
+        onDispose { runCatching { videoView?.stopPlayback() } }
     }
-    val image = bitmap
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        if (image != null) {
-            Image(
-                bitmap = image.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize()
-            )
+    LaunchedEffect(trimStartMs, trimEndMs, playing) {
+        while (playing) {
+            delay(120)
+            runCatching {
+                val v = videoView ?: return@runCatching
+                if (!v.isPlaying) return@runCatching
+                val pos = v.currentPosition.toLong()
+                when {
+                    pos >= trimEndMs -> v.seekTo(trimStartMs.toInt())
+                    pos < trimStartMs - 250L -> v.seekTo(trimStartMs.toInt())
+                }
+            }
         }
-        Box(
-            Modifier
+    }
+
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        AndroidView(
+            factory = { ctx ->
+                android.widget.VideoView(ctx).apply {
+                    setVideoPath(file.absolutePath)
+                    setOnPreparedListener { mp ->
+                        mp.isLooping = true
+                        seekTo(trimStartMs.toInt())
+                        start()
+                        playing = true
+                    }
+                    setOnCompletionListener { playing = false }
+                    videoView = this
+                }
+            },
+            update = { v ->
+                if (playing && !v.isPlaying) v.start()
+                else if (!playing && v.isPlaying) v.pause()
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+        // Tap the picture to pause/resume while editing.
+        IconButton(
+            onClick = {
+                val v = videoView ?: return@IconButton
+                if (v.isPlaying) { v.pause(); playing = false } else { v.start(); playing = true }
+            },
+            modifier = Modifier
                 .size(64.dp)
                 .clip(RoundedCornerShape(32.dp))
-                .background(Color.Black.copy(alpha = 0.45f)),
-            contentAlignment = Alignment.Center
+                .background(Color.Black.copy(alpha = 0.45f))
         ) {
-            Icon(Icons.Default.Movie, "Video", tint = Color.White, modifier = Modifier.size(30.dp))
+            Icon(
+                if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
+                if (playing) "Pause" else "Play",
+                tint = Color.White,
+                modifier = Modifier.size(30.dp)
+            )
         }
         Text(
             file.name,
@@ -318,6 +360,143 @@ private fun EditorVideoPreview(file: File, atMs: Long) {
             color = scheme.onSurfaceVariant,
             modifier = Modifier.align(Alignment.BottomStart).padding(12.dp)
         )
+    }
+}
+
+/**
+ * The WhatsApp-style trimmer: a strip of real frames pulled from the clip, with two drag
+ * handles selecting the part that gets sent (everything outside the handles is dimmed).
+ */
+@Composable
+private fun TrimFilmstrip(
+    file: File,
+    durationMs: Long,
+    trimStartMs: Long,
+    trimEndMs: Long,
+    onChange: (Long, Long) -> Unit
+) {
+    val scheme = MaterialTheme.colorScheme
+    val frameCount = 8
+    val frames by produceState(initialValue = emptyList<android.graphics.Bitmap?>(), file, durationMs) {
+        value = withContext(Dispatchers.IO) {
+            (0 until frameCount).map { i ->
+                runCatching {
+                    MediaEditor.videoThumbnail(file, durationMs * i / frameCount)
+                }.getOrNull()
+            }
+        }
+    }
+
+    BoxWithConstraints(
+        Modifier
+            .fillMaxWidth()
+            .height(48.dp)
+    ) {
+        val widthPx = constraints.maxWidth.toFloat()
+        val startFraction = if (durationMs > 0L) (trimStartMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+        val endFraction = if (durationMs > 0L) (trimEndMs.toFloat() / durationMs).coerceIn(0f, 1f) else 1f
+
+        Row(Modifier.fillMaxSize()) {
+            frames.forEachIndexed { i, bmp ->
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    if (bmp != null) {
+                        Image(
+                            bitmap = bmp.asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                .background(scheme.surfaceContainerHighest)
+                        )
+                    }
+                }
+            }
+        }
+        // Dim what falls outside the selection.
+        Box(
+            Modifier
+                .align(Alignment.CenterStart)
+                .fillMaxHeight()
+                .fillMaxWidth(startFraction)
+                .background(Color.Black.copy(alpha = 0.55f))
+        )
+        Box(
+            Modifier
+                .align(Alignment.CenterEnd)
+                .fillMaxHeight()
+                .fillMaxWidth(1f - endFraction)
+                .background(Color.Black.copy(alpha = 0.55f))
+        )
+        // The two drag handles.
+        TrimHandle(
+            fraction = startFraction,
+            widthPx = widthPx,
+            onDrag = { deltaPx ->
+                if (durationMs <= 0L) return@TrimHandle
+                val deltaMs = (deltaPx / widthPx * durationMs).toLong()
+                val next = (trimStartMs + deltaMs).coerceIn(0L, (trimEndMs - 500L).coerceAtLeast(0L))
+                onChange(next, trimEndMs)
+            }
+        )
+        TrimHandle(
+            fraction = endFraction,
+            widthPx = widthPx,
+            onDrag = { deltaPx ->
+                if (durationMs <= 0L) return@TrimHandle
+                val deltaMs = (deltaPx / widthPx * durationMs).toLong()
+                val next = (trimEndMs + deltaMs).coerceIn((trimStartMs + 500L).coerceAtMost(durationMs), durationMs)
+                onChange(trimStartMs, next)
+            }
+        )
+    }
+}
+
+/** One draggable trim handle (a slim grip bar at the edge of the selection). */
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.TrimHandle(
+    fraction: Float,
+    widthPx: Float,
+    onDrag: (Float) -> Unit
+) {
+    val density = LocalDensity.current
+    val handlePx = with(density) { 20.dp.toPx() }
+    Box(
+        Modifier
+            .align(Alignment.CenterStart)
+            .fillMaxHeight()
+            .width(20.dp)
+            // Keep the whole grip inside the strip no matter where the selection sits.
+            .offset { IntOffset((fraction * (widthPx - handlePx)).toInt(), 0) }
+            .pointerInput(widthPx) {
+                detectDragGestures { change, dragAmount ->
+                    change.consume()
+                    onDrag(dragAmount.x)
+                }
+            }
+            .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(6.dp))
+            .border(1.dp, Color.White.copy(alpha = 0.6f), RoundedCornerShape(6.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        // The little grip lines, so the handle reads as draggable.
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .width(2.dp)
+                    .height(14.dp)
+                    .background(Color.White.copy(alpha = 0.85f))
+            )
+            Spacer(Modifier.width(4.dp))
+            Box(
+                Modifier
+                    .width(2.dp)
+                    .height(14.dp)
+                    .background(Color.White.copy(alpha = 0.85f))
+            )
+        }
     }
 }
 
