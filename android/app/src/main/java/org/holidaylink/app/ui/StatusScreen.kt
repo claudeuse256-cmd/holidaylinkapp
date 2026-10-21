@@ -79,6 +79,7 @@ import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Imgbb
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.Cloudinary
 import org.holidaylink.app.net.Me
 import org.holidaylink.app.net.StatusUpdate
 
@@ -645,17 +646,27 @@ private suspend fun loadFirestoreStatuses(
     }
 }
 
-/** Post text/photo/video status with 24-hour expiry. Photos use imgbb; videos use Firebase Storage. */
+/** Post text/photo/video status with 24-hour expiry. Photos use imgbb; videos use Cloudinary. */
 private suspend fun postFirestoreStatus(context: android.content.Context, text: String, mediaDataUrl: String?, mediaUri: Uri?, mediaKind: String) {
     val uid = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
     var mediaUrl: String? = null
     if (mediaKind == "video" && mediaUri != null) {
         val file = MediaPicker.inspect(context, mediaUri)
         if (file.sizeBytes > 30L * 1024 * 1024) throw ApiException("Status videos must be 30 MB or smaller.")
-        val extension = if (file.mimeType == "video/3gpp") "3gp" else "mp4"
-        val ref = FirebaseStorage.getInstance().reference.child("statuses/$uid/${System.currentTimeMillis()}.$extension")
-        ref.putFile(mediaUri).await()
-        mediaUrl = ref.downloadUrl.await().toString()
+        val bytes = context.contentResolver.openInputStream(mediaUri)?.use { it.readBytes() }
+            ?: throw ApiException("That video couldn't be read.")
+        val name = file.name ?: "status.mp4"
+        val mime = file.mimeType.ifBlank { "video/mp4" }
+        // Cloudinary through our server; Firebase Storage stays as a fallback until the
+        // Cloudinary keys are configured so video statuses never regress.
+        mediaUrl = runCatching { Cloudinary.upload(context, bytes, name, mime) }
+            .getOrElse {
+                val extension = if (file.mimeType == "video/3gpp") "3gp" else "mp4"
+                val ref = FirebaseStorage.getInstance().reference
+                    .child("statuses/$uid/${System.currentTimeMillis()}.$extension")
+                ref.putFile(mediaUri).await()
+                ref.downloadUrl.await().toString()
+            }
     }
     if (!mediaDataUrl.isNullOrBlank() && mediaDataUrl.startsWith("data:")) {
         val base64 = mediaDataUrl.substringAfter(",", "")

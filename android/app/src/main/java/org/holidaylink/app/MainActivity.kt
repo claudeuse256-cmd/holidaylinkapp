@@ -2,11 +2,16 @@
 
 package org.holidaylink.app
 
+import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -95,6 +101,7 @@ import org.holidaylink.app.data.AccountStore
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.AccountSession
+import org.holidaylink.app.net.AnnouncementNotifier
 import org.holidaylink.app.net.safeTimestamp
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.FirebaseBackend
@@ -394,6 +401,63 @@ private fun SignedInApp(
         onDispose { callManager.close() }
     }
 
+    // The pinned announcement notification: refreshed on every app open and rewritten
+    // whenever a newer poster document lands.
+    LaunchedEffect(Unit) {
+        runCatching { AnnouncementNotifier.start(context) }
+    }
+    DisposableEffect(Unit) {
+        onDispose { runCatching { AnnouncementNotifier.stop() } }
+    }
+
+    // A call only starts once the microphone (and camera for video) is granted. Before
+    // this, a denied permission made CallManager.start throw and the tap did nothing.
+    var pendingCall by remember { mutableStateOf<Pair<User, String>?>(null) }
+    fun launchCall(user: User, kind: String) {
+        scope.launch {
+            runCatching { callManager.start(user.id, kind) }
+                .onSuccess { activeCall = Triple(it.id, kind, user); incomingCall = false }
+                .onFailure { e ->
+                    Toast.makeText(
+                        context,
+                        (e as? ApiException)?.message ?: e.message ?: "Couldn't start the call.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+        }
+    }
+    val callPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        val pending = pendingCall
+        pendingCall = null
+        if (pending == null) return@rememberLauncherForActivityResult
+        if (granted.values.all { it }) {
+            launchCall(pending.first, pending.second)
+        } else {
+            Toast.makeText(
+                context,
+                "Allow the microphone${if (pending.second == "video") " and camera" else ""} to make calls.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+    fun beginCall(user: User, kind: String) {
+        val needed = buildList {
+            add(Manifest.permission.RECORD_AUDIO)
+            if (kind == "video") add(Manifest.permission.CAMERA)
+        }
+        val missing = needed.filter {
+            androidx.core.content.ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            launchCall(user, kind)
+        } else {
+            pendingCall = user to kind
+            callPermission.launch(missing.toTypedArray())
+        }
+    }
+
     val push: (Destination) -> Unit = { stack.add(it) }
     val pop: () -> Unit = { if (stack.size > 1) stack.removeAt(stack.lastIndex) }
 
@@ -613,9 +677,7 @@ private fun SignedInApp(
             onBack = pop,
             onOpenProfile = { push(Destination.PersonProfile(it)) },
             onOpenGroupInfo = { push(Destination.GroupInfo(it)) },
-            onOpenCalls = {
-                stack.add(Destination.Calls)
-            }
+            onStartCall = { user, kind -> beginCall(user, kind) }
         )
 
         is Destination.GroupInfo -> GroupInfoScreen(
@@ -634,11 +696,7 @@ private fun SignedInApp(
                 while (stack.size > 1) stack.removeAt(stack.lastIndex)
                 openDirectChat(user)
             },
-            onStartCall = { user, kind ->
-                scope.launch {
-                    runCatching { callManager.start(user.id, kind) }.onSuccess { activeCall=Triple(it.id,kind,user); incomingCall=false }
-                }
-            }
+            onStartCall = { user, kind -> beginCall(user, kind) }
         )
 
         Destination.MyProfile -> MyProfileScreen(api = api, onBack = pop)
@@ -1078,7 +1136,8 @@ private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onMenu: () -> Unit, o
     val scheme = MaterialTheme.colorScheme
     val shape = RoundedCornerShape(32.dp)
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp).clip(shape)
+        Modifier.fillMaxWidth().navigationBarsPadding()
+            .padding(horizontal = 14.dp, vertical = 8.dp).clip(shape)
             .background(scheme.surfaceContainerHigh.copy(alpha = 0.95f))
             .border(1.dp, scheme.outlineVariant, shape).padding(horizontal = 4.dp, vertical = 5.dp),
         horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically

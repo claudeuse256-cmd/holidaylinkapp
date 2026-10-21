@@ -125,6 +125,7 @@ app.get('/health', (_req, res) => {
     smsProviderConfigured: smsConfigured(),
     firebaseConfigured: Boolean(serviceAccount),
     pushConfigured: Boolean(serviceAccount),
+    cloudinaryConfigured: cloudinaryConfigured(),
     defaultCountryCode: DEFAULT_COUNTRY_CODE,
     otpTtlMinutes: OTP_TTL_MINUTES
   });
@@ -598,6 +599,103 @@ app.get('/backup/cloud', async (req, res) => {
   const row = backup.data() || {};
   return res.json({ encrypted: row.encrypted, salt: row.salt, iv: row.iv, version: row.version || 1, updatedAt: row.updatedAt?.toDate?.()?.toISOString?.() || null });
 });
+
+// ---------------------------------------------------------------- media uploads (Cloudinary)
+
+/**
+ * Video and document storage.
+ *
+ * The APK never holds a Cloudinary secret. It sends the raw bytes here with its Firebase
+ * ID token; this service signs the Cloudinary request and returns the public HTTPS URL
+ * that is written to Firestore. Images keep using imgbb, exactly like the website.
+ *
+ * Configure either:
+ *   CLOUDINARY_CLOUD_NAME + CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET  (signed upload)
+ * or
+ *   CLOUDINARY_CLOUD_NAME + CLOUDINARY_UPLOAD_PRESET                    (unsigned preset)
+ */
+const CLOUDINARY_CLOUD_NAME = String(process.env.CLOUDINARY_CLOUD_NAME || '').trim();
+const CLOUDINARY_API_KEY = String(process.env.CLOUDINARY_API_KEY || '').trim();
+const CLOUDINARY_API_SECRET = String(process.env.CLOUDINARY_API_SECRET || '').trim();
+const CLOUDINARY_UPLOAD_PRESET = String(process.env.CLOUDINARY_UPLOAD_PRESET || '').trim();
+const CLOUDINARY_FOLDER = String(process.env.CLOUDINARY_FOLDER || 'holidaylink').trim();
+
+function cloudinaryConfigured() {
+  if (!CLOUDINARY_CLOUD_NAME) return false;
+  return Boolean(CLOUDINARY_UPLOAD_PRESET) || Boolean(CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
+}
+
+app.post(
+  '/media/upload',
+  express.raw({ type: '*/*', limit: '32mb' }),
+  async (req, res) => {
+    if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+    const user = await verifyBearer(req);
+    if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+    if (!cloudinaryConfigured()) {
+      return res.status(503).json({
+        error: 'CLOUDINARY_NOT_CONFIGURED',
+        message: 'Video and document uploads are not configured on the server yet.'
+      });
+    }
+
+    const bytes = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!bytes || bytes.length === 0) {
+      return res.status(400).json({ error: 'EMPTY_UPLOAD', message: 'The file was empty.' });
+    }
+    if (bytes.length > 31 * 1024 * 1024) {
+      return res.status(413).json({ error: 'TOO_LARGE', message: 'That file is too large to upload.' });
+    }
+
+    const rawName = String(req.header('X-Filename') || 'upload').replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'upload';
+    const mimeType = String(req.header('X-Content-Type') || 'application/octet-stream').slice(0, 120);
+
+    try {
+      const form = new FormData();
+      form.append('file', new Blob([bytes], { type: mimeType }), rawName);
+
+      if (CLOUDINARY_UPLOAD_PRESET) {
+        form.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+      } else {
+        const timestamp = Math.floor(Date.now() / 1000);
+        const folder = CLOUDINARY_FOLDER;
+        const toSign = `folder=${folder}&timestamp=${timestamp}`;
+        const signature = crypto.createHash('sha1').update(toSign + CLOUDINARY_API_SECRET).digest('hex');
+        form.append('api_key', CLOUDINARY_API_KEY);
+        form.append('timestamp', String(timestamp));
+        form.append('folder', folder);
+        form.append('signature', signature);
+      }
+
+      const upload = await fetch(
+        `https://api.cloudinary.com/v1_1/${encodeURIComponent(CLOUDINARY_CLOUD_NAME)}/auto/upload`,
+        { method: 'POST', body: form }
+      );
+      const payload = await upload.json().catch(() => ({}));
+      if (!upload.ok || !payload.secure_url) {
+        console.error('[cloudinary] upload failed', upload.status, payload?.error?.message || payload);
+        return res.status(502).json({
+          error: 'UPLOAD_FAILED',
+          message: 'The file could not be uploaded. Please try again.'
+        });
+      }
+      return res.json({
+        ok: true,
+        url: payload.secure_url,
+        secureUrl: payload.secure_url,
+        publicId: payload.public_id || null,
+        resourceType: payload.resource_type || null,
+        bytes: payload.bytes || bytes.length
+      });
+    } catch (err) {
+      console.error('[cloudinary] upload error', err?.message || err);
+      return res.status(502).json({
+        error: 'UPLOAD_FAILED',
+        message: 'The file could not be uploaded. Please try again.'
+      });
+    }
+  }
+);
 
 // ---------------------------------------------------------------- in-app account switching
 

@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
 import android.view.WindowManager
+import android.Manifest
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -20,12 +21,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -64,6 +65,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -120,15 +122,18 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.data.AppSettings
+import org.holidaylink.app.data.AutoDownload
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.AiBot
 import org.holidaylink.app.net.ChatItem
+import org.holidaylink.app.net.Cloudinary
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestoreBots
 import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.Imgbb
+import org.holidaylink.app.net.MediaCache
 import org.holidaylink.app.net.Message
 import org.holidaylink.app.net.StudyBuddy
 import org.holidaylink.app.net.User
@@ -150,7 +155,7 @@ fun ChatScreen(
     onBack: () -> Unit,
     onOpenProfile: (User) -> Unit,
     onOpenGroupInfo: (ChatItem) -> Unit,
-    onOpenCalls: (User) -> Unit
+    onStartCall: (User, String) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -212,6 +217,24 @@ fun ChatScreen(
     val messages = remember(rawMessages, hiddenMessages) {
         if (hiddenMessages.isEmpty()) rawMessages
         else rawMessages.filter { hiddenMessages["${chat.id}/${it.id}"] != true }
+    }
+
+    // Fetch every attachment once, the moment the conversation opens, and keep the file on
+    // disk. Scrolling back — or reopening the chat — reads the cache instead of downloading
+    // again; a replaced upload gets a new URL, so only real updates are fetched.
+    LaunchedEffect(chat.id, messages.size) {
+        val settings = AppSettings.state
+        val photos = downloadsAllowed(settings.autoDownloadPhotos, context)
+        val videos = downloadsAllowed(settings.autoDownloadVideos, context)
+        val documents = downloadsAllowed(settings.autoDownloadDocuments, context)
+        val urls = messages.mapNotNull { message ->
+            when {
+                message.imageUrl != null && photos -> message.imageUrl
+                message.fileUrl != null && (if (message.type == "video") videos else documents) -> message.fileUrl
+                else -> null
+            }
+        }
+        if (urls.isNotEmpty()) MediaCache.prefetch(context, urls)
     }
 
     LaunchedEffect(chat.id) {
@@ -343,15 +366,25 @@ fun ChatScreen(
                         val picked = MediaPicker.inspect(context, uri)
                         val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                             ?: throw ApiException("That file couldn't be read.")
-                        if (bytes.size > 20L * 1024 * 1024) throw ApiException("That file is too large (max 20 MB).")
-                        val ext = picked.name?.substringAfterLast('.', "")?.takeIf { it.isNotBlank() } ?: "bin"
-                        val path = "chat_media/${chat.id}/${UUID.randomUUID()}.$ext"
-                        val ref = com.google.firebase.storage.FirebaseStorage.getInstance().getReference(path)
-                        ref.putBytes(bytes).await()
-                        val url = ref.downloadUrl.await().toString()
+                        if (bytes.size > MediaPicker.maxAttachmentBytes) {
+                            throw ApiException("That file is too large (max 20 MB).")
+                        }
+                        val name = picked.name ?: if (kind == "video") "Video" else "File"
+                        val mime = picked.mimeType.ifBlank { Cloudinary.mimeOf(name) }
+                        // Videos and documents go to Cloudinary through our server. Until the
+                        // Cloudinary keys are set on the backend, keep working through Firebase
+                        // Storage instead of failing the send outright.
+                        val url = runCatching { Cloudinary.upload(context, bytes, name, mime) }
+                            .getOrElse {
+                                val ext = name.substringAfterLast('.', "").takeIf { it.isNotBlank() } ?: "bin"
+                                val path = "chat_media/${chat.id}/${UUID.randomUUID()}.$ext"
+                                val ref = com.google.firebase.storage.FirebaseStorage.getInstance().getReference(path)
+                                ref.putBytes(bytes).await()
+                                ref.downloadUrl.await().toString()
+                            }
                         FirestoreChat.send(
                             chat.id, "", fileUrl = url,
-                            fileName = picked.name ?: "File",
+                            fileName = name,
                             kind = if (kind == "video") "video" else "file",
                             viewOnce = once, ttlSeconds = ttl
                         )
@@ -374,6 +407,39 @@ fun ChatScreen(
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { sendAttachment(it, "document") }
     }
+
+    // In-app camera: writes the shot into cacheDir/camera and hands the FileProvider URI
+    // to the system camera activity, then sends it through the normal photo path.
+    var pendingCamera by remember { mutableStateOf(false) }
+    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        val uri = pendingCameraUri
+        pendingCameraUri = null
+        if (ok && uri != null) sendAttachment(uri, "image")
+    }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            pendingCamera = true
+        } else {
+            scope.launch { snackbar.showSnackbar("Allow camera access to take a photo.") }
+        }
+    }
+    LaunchedEffect(pendingCamera) {
+        if (!pendingCamera) return@LaunchedEffect
+        pendingCamera = false
+        runCatching {
+            val dir = java.io.File(context.cacheDir, "camera").apply { mkdirs() }
+            val file = java.io.File(dir, "cam-${System.currentTimeMillis()}.jpg")
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", file
+            )
+            pendingCameraUri = uri
+            cameraLauncher.launch(uri)
+        }.onFailure {
+            scope.launch { snackbar.showSnackbar("The camera could not be opened on this device.") }
+        }
+    }
+
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
             val instance = VoiceRecorder(context)
@@ -462,7 +528,6 @@ fun ChatScreen(
     val isBlocked = blockedPeerId != null && AppSettings.isUserBlocked(blockedPeerId)
 
     Scaffold(
-        modifier = Modifier.imePadding(),
         topBar = {
             if (searching) {
                 TopAppBar(
@@ -518,7 +583,12 @@ fun ChatScreen(
                 actions = {
                     IconButton(onClick = { searching = true }) { Icon(Icons.Default.Search, "Search") }
                     peerUser?.let { peer ->
-                        IconButton(onClick = { onOpenCalls(peer) }) { Icon(Icons.Default.Call, "Call") }
+                        IconButton(onClick = { onStartCall(peer, "audio") }) {
+                            Icon(Icons.Default.Call, "Voice call")
+                        }
+                        IconButton(onClick = { onStartCall(peer, "video") }) {
+                            Icon(Icons.Default.Videocam, "Video call")
+                        }
                     }
                 }
             )
@@ -527,7 +597,14 @@ fun ChatScreen(
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             val mention = remember(draft, aiBots) { parseMention(draft) }
-            Column {
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            // Keyboard and 3-button navigation never stack: use whichever is taller so the
+            // composer sits above both the keyboard and the system navigation bar.
+            val bottomInset = maxOf(
+                WindowInsets.ime.getBottom(density),
+                WindowInsets.navigationBars.getBottom(density)
+            )
+            Column(Modifier.padding(bottom = with(density) { bottomInset.toDp() })) {
                 if (isBlocked && blockedPeerId != null) {
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -908,7 +985,11 @@ fun ChatScreen(
                 },
                 onCamera = {
                     showAttach = false
-                    scope.launch { snackbar.showSnackbar("Use the photo picker for now — in-app camera is coming.") }
+                    if (hasCameraPermission(context)) {
+                        pendingCamera = true
+                    } else {
+                        cameraPermission.launch(Manifest.permission.CAMERA)
+                    }
                 }
             )
         }
@@ -1263,25 +1344,85 @@ private fun FsMessageBubble(
 @Composable
 private fun FsFileRow(name: String, kind: String, url: String) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val extension = if (kind == "video") "mp4" else "bin"
+    var busy by remember(url) { mutableStateOf(false) }
+    var cached by remember(url) { mutableStateOf(MediaCache.cached(context, url, extension) != null) }
     Row(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
             .clickable {
-                runCatching {
-                    val intent = android.content.Intent(
-                        android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)
-                    ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
+                if (busy) return@clickable
+                busy = true
+                scope.launch {
+                    // Downloaded once, then opened from the app cache every time after.
+                    val file = MediaCache.fetch(context, url, extension)
+                    busy = false
+                    cached = file != null && file.exists()
+                    if (file == null) {
+                        runCatching {
+                            context.startActivity(
+                                android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url))
+                                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                            )
+                        }
+                        return@launch
+                    }
+                    runCatching {
+                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                            context, "${context.packageName}.fileprovider", file
+                        )
+                        context.startActivity(
+                            android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, if (kind == "video") "video/*" else mimeForFile(name))
+                                addFlags(
+                                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                                )
+                            }
+                        )
+                    }
                 }
             }
             .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(Icons.Default.Description, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.primary)
+        if (busy) {
+            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+        } else {
+            Icon(
+                Icons.Default.Description,
+                null,
+                Modifier.size(22.dp),
+                tint = if (cached) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
         Spacer(Modifier.width(10.dp))
         Text(name, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
     }
+}
+
+/** MIME used when handing a cached document to another app. */
+private fun mimeForFile(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
+    "pdf" -> "application/pdf"
+    "doc" -> "application/msword"
+    "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    "xls" -> "application/vnd.ms-excel"
+    "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    "ppt" -> "application/vnd.ms-powerpoint"
+    "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    "txt" -> "text/plain"
+    "zip" -> "application/zip"
+    "mp4" -> "video/mp4"
+    "3gp" -> "video/3gpp"
+    "mkv" -> "video/x-matroska"
+    "mp3" -> "audio/mpeg"
+    "m4a" -> "audio/mp4"
+    "jpg", "jpeg" -> "image/jpeg"
+    "png" -> "image/png"
+    else -> "*/*"
 }
 
 @Composable
@@ -1822,14 +1963,12 @@ internal fun RemoteImage(
     contentScale: androidx.compose.ui.layout.ContentScale = androidx.compose.ui.layout.ContentScale.Fit,
     preserveAspect: Boolean = false
 ) {
-    var bitmap by remember(url) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    val context = LocalContext.current
+    // Instant first frame from memory; otherwise decode the disk copy; otherwise download
+    // the image once and keep it for every future open.
+    var bitmap by remember(url) { mutableStateOf(MediaCache.peek(url)) }
     LaunchedEffect(url) {
-        bitmap = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching {
-                val bytes = java.net.URL(url).openStream().use { it.readBytes() }
-                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            }.getOrNull()
-        }
+        if (bitmap == null) bitmap = MediaCache.bitmap(context, url)
     }
     val image = bitmap
     if (image == null) {
@@ -1876,6 +2015,26 @@ private fun hasMicPermission(context: Context): Boolean =
     androidx.core.content.ContextCompat.checkSelfPermission(
         context, android.Manifest.permission.RECORD_AUDIO
     ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+private fun hasCameraPermission(context: Context): Boolean =
+    androidx.core.content.ContextCompat.checkSelfPermission(
+        context, android.Manifest.permission.CAMERA
+    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+/** Used by "download on Wi-Fi only" so prefetching respects mobile-data limits. */
+private fun onWifi(context: Context): Boolean = runCatching {
+    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+        ?: return@runCatching false
+    val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return@runCatching false
+    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+}.getOrDefault(false)
+
+/** Whether the user's auto-download setting allows fetching this kind of attachment now. */
+private fun downloadsAllowed(mode: AutoDownload, context: Context): Boolean = when (mode) {
+    AutoDownload.ALWAYS -> true
+    AutoDownload.NEVER -> false
+    AutoDownload.WIFI_ONLY -> onWifi(context)
+}
 
 private fun copyToClipboard(context: Context, text: String) {
     val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
