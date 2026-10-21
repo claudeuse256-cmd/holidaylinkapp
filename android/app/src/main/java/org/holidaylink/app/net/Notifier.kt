@@ -27,7 +27,7 @@ object Notifier {
     const val EXTRA_TARGET = "hl_target"
 
     /** chatId → notification ids posted for it, so "seen" can clear every variant. */
-    private val posted = ConcurrentHashMap<String, MutableSet<Int>()
+    private val posted = ConcurrentHashMap<String, MutableSet<Int>>()
 
     /** The full-colour HolidayLink logo, shown large in the expanded notification. */
     @Volatile
