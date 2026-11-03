@@ -1,6 +1,7 @@
 package org.holidaylink.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -9,6 +10,7 @@ import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.material.icons.filled.VolumeOff
@@ -16,7 +18,9 @@ import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -26,6 +30,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
@@ -33,6 +38,7 @@ import org.holidaylink.app.net.CallManager
 import org.holidaylink.app.net.CallSounds
 import org.holidaylink.app.net.User
 import org.webrtc.EglBase
+import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
 
@@ -48,11 +54,22 @@ fun CallScreen(
     callId: String,
     kind: String,
     incoming: Boolean,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    onMinimize: () -> Unit = {}
 ) {
-    val egl = remember { EglBase.create() }
+    // Renderers sample the camera/decoder textures, so they have to live in the same EGL
+    // share group as the capturer and codecs — a private EglBase here rendered black frames.
+    // The fallback keeps audio-only and early-start cases safe.
+    val sharedEglContext = remember { manager.eglContext }
+    val ownEgl = remember { if (sharedEglContext == null) EglBase.create() else null }
+    val eglContext = sharedEglContext ?: ownEgl!!.eglBaseContext
     val context = LocalContext.current
-    var state by remember { mutableStateOf(if (incoming) "ringing" else "calling") }
+    // Two separate facts, deliberately not one variable. `signal` is what Firestore says about
+    // the call (ringing, accepted, ended); `link` is whether WebRTC has a working media path.
+    // The old code collapsed them and set "connected" the instant Answer was tapped, so a call
+    // with no audio and a black screen still read as a live call with a running timer.
+    var signal by remember { mutableStateOf(if (incoming) "ringing" else "calling") }
+    var link by remember { mutableStateOf(manager.linkState) }
     var muted by remember { mutableStateOf(false) }
     var speaker by remember { mutableStateOf(kind == "video") }
     var camera by remember { mutableStateOf(true) }
@@ -62,9 +79,39 @@ fun CallScreen(
     var localView by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
     var answered by remember { mutableStateOf(!incoming) }
     var seconds by remember { mutableIntStateOf(0) }
+    var permissionNote by remember { mutableStateOf("") }
+
+    val state = when {
+        signal == "declined" || signal == "ended" || signal == "missed" -> signal
+        link == "failed" || signal == "failed" -> "failed"
+        link == "connected" -> "connected"
+        signal == "accepted" -> "connecting"
+        else -> signal
+    }
+
+    val callPermissions = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        if (granted.values.all { it }) {
+            answered = true
+            manager.accept(callId, kind)
+        } else {
+            permissionNote = "Allow the microphone${if (kind == "video") " and camera" else ""} in Settings to answer calls."
+        }
+    }
 
     DisposableEffect(Unit) {
-        manager.onState = { state = it }
+        // Remember whatever handler the app had before this screen took over. When the user
+        // minimises the call, this screen leaves the composition but the call keeps running;
+        // restoring the app-level handler lets it clear the call when the other side hangs up
+        // instead of leaving a dead "Return to call" bar on screen.
+        val previousOnState = manager.onState
+        val previousOnLink = manager.onLink
+        val previousOnRemote = manager.onRemote
+        val previousOnLocal = manager.onLocal
+        manager.onState = { signal = it }
+        manager.onLink = { link = it }
+        link = manager.linkState
         manager.onRemote = { track ->
             remoteTrack = track
             val t = track
@@ -83,9 +130,13 @@ fun CallScreen(
         manager.currentRemoteTrack?.let { remoteTrack = it }
         manager.setSpeaker(speaker)
         onDispose {
+            manager.onState = previousOnState
+            manager.onLink = previousOnLink
+            manager.onRemote = previousOnRemote
+            manager.onLocal = previousOnLocal
             remoteView?.let { v -> remoteTrack?.removeSink(v); v.release() }
             localView?.let { v -> localTrack?.removeSink(v); v.release() }
-            egl.release()
+            runCatching { ownEgl?.release() }
         }
     }
 
@@ -102,9 +153,10 @@ fun CallScreen(
         if (t != null && v != null) t.addSink(v)
     }
 
-    // Call duration, ticking once the call is actually connected.
-    LaunchedEffect(state, answered) {
-        if (answered && (state == "connected" || state == "accepted")) {
+    // The duration counts real talk time: it starts when media actually flows, not the moment
+    // Answer is tapped, otherwise a call that never connected still shows a running clock.
+    LaunchedEffect(state) {
+        if (state == "connected") {
             while (true) {
                 delay(1000)
                 seconds++
@@ -152,10 +204,12 @@ fun CallScreen(
                 AndroidView(
                     factory = { ctx ->
                         SurfaceViewRenderer(ctx).apply {
-                            init(egl.eglBaseContext, null)
+                            init(eglContext, null)
+                            setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
                             setEnableHardwareScaler(true)
                             setMirror(false)
                             remoteView = this
+                            remoteTrack?.addSink(this)
                         }
                     },
                     modifier = Modifier.fillMaxSize()
@@ -164,9 +218,13 @@ fun CallScreen(
             AndroidView(
                 factory = { ctx ->
                     SurfaceViewRenderer(ctx).apply {
-                        init(egl.eglBaseContext, null)
+                        init(eglContext, null)
                         setMirror(true)
+                        setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
                         setEnableHardwareScaler(true)
+                        // Attach straight away: waiting for the LaunchedEffect below left the
+                        // caller staring at a black screen while the other phone was ringing.
+                        localTrack?.addSink(this)
                         localView = this
                     }
                 },
@@ -206,6 +264,16 @@ fun CallScreen(
                 color = Color.LightGray,
                 style = MaterialTheme.typography.bodyMedium
             )
+            if (permissionNote.isNotBlank()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    permissionNote,
+                    color = Color(0xFFFFB4AB),
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 28.dp)
+                )
+            }
             Spacer(Modifier.weight(1f))
 
             if (incoming && !answered) {
@@ -218,9 +286,21 @@ fun CallScreen(
                         onClose()
                     }
                     CircleAction(Color(0xFF16A34A), Icons.Default.Call, "Answer") {
-                        answered = true
-                        state = "connected"
-                        manager.accept(callId, kind)
+                        // Answering must ask for the microphone (and camera) too: without it
+                        // the callee joins silently and hears nothing.
+                        val needed = buildList {
+                            add(android.Manifest.permission.RECORD_AUDIO)
+                            if (kind == "video") add(android.Manifest.permission.CAMERA)
+                        }.filter {
+                            androidx.core.content.ContextCompat.checkSelfPermission(context, it) !=
+                                android.content.pm.PackageManager.PERMISSION_GRANTED
+                        }
+                        if (needed.isEmpty()) {
+                            answered = true
+                            manager.accept(callId, kind)
+                        } else {
+                            callPermissions.launch(needed.toTypedArray())
+                        }
                     }
                 }
             } else {
@@ -259,6 +339,19 @@ fun CallScreen(
             }
             Spacer(Modifier.height(28.dp))
         }
+
+        // Minimising keeps the call and its audio alive while the user reads a chat or checks
+        // something else — the same "shrink, don't hang up" behaviour as WhatsApp.
+        if (answered && state != "ended" && state != "declined" &&
+            state != "missed" && state != "failed"
+        ) {
+            FilledIconButton(
+                onClick = onMinimize,
+                modifier = Modifier.align(Alignment.TopStart).padding(16.dp)
+            ) {
+                Icon(Icons.Default.PictureInPictureAlt, "Minimise call", tint = Color.White)
+            }
+        }
     }
 }
 
@@ -290,11 +383,69 @@ private fun statusLabel(
     }
     "calling" -> "Calling…"
     "accepted", "connected" ->
-        if (seconds > 0) "%d:%02d".format(seconds / 60, seconds % 60) else "Connecting…"
+        if (seconds > 0) "%d:%02d".format(seconds / 60, seconds % 60) else "Connected"
     "connecting" -> "Connecting…"
     "declined" -> "Declined"
     "missed" -> "Missed"
     "ended" -> "Call ended"
-    "failed" -> "Call failed"
+    // Reached when ICE never found a path between the two phones. Saying "Call failed" without
+    // a reason left people assuming the app was broken rather than the network blocking it.
+    "failed" -> if (answered) "Couldn't connect — check your network" else "Call failed"
     else -> state.replaceFirstChar { it.uppercase() }
+}
+
+/**
+ * The floating bar shown after minimising a call. It stays above the normal app UI and
+ * brings the call back with one tap; the end button hangs up without reopening the screen.
+ */
+@Composable
+fun MinimizedCallBar(user: User, onOpen: () -> Unit, onEnd: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 6.dp,
+        shadowElevation = 8.dp
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpen)
+                .padding(start = 14.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier.size(36.dp).clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.Call,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimary,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    user.displayName,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "Call in progress · tap to return",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            IconButton(onClick = onEnd) {
+                Icon(Icons.Default.CallEnd, "End call", tint = Color(0xFFD32F2F))
+            }
+        }
+    }
 }

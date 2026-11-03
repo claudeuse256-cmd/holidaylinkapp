@@ -61,6 +61,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
+import org.holidaylink.app.config.AppConfig
+import org.holidaylink.app.data.ProfileCache
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.FirebaseBackend
@@ -81,24 +84,29 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    val prefs = remember(context) {
+        context.getSharedPreferences(AppConfig.PREFS, android.content.Context.MODE_PRIVATE)
+    }
 
-    var me by remember { mutableStateOf<Me?>(null) }
-    var loading by remember { mutableStateOf(true) }
+    // Painted from the phone's copy first, so opening your profile without internet shows
+    // your name and photo instead of a spinner that never finishes.
+    var me by remember { mutableStateOf<Me?>(ProfileCache.load(prefs, FirebaseBackend.uid.orEmpty())) }
+    var loading by remember { mutableStateOf(me == null) }
     var error by remember { mutableStateOf("") }
     var editing by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     var confirmRemovePhoto by remember { mutableStateOf(false) }
 
-    var displayName by remember { mutableStateOf("") }
-    var username by remember { mutableStateOf("") }
-    var about by remember { mutableStateOf("") }
+    var displayName by remember { mutableStateOf(me?.displayName.orEmpty()) }
+    var username by remember { mutableStateOf(me?.username.orEmpty()) }
+    var about by remember { mutableStateOf(me?.about.orEmpty()) }
     var showQr by remember { mutableStateOf(false) }
 
     suspend fun reload() {
         loading = me == null
         try {
             val uid = FirebaseBackend.uid ?: throw org.holidaylink.app.net.ApiException("Sign in again first.")
-            val p = FirebaseBackend.loadProfile(uid)
+            val p = withTimeoutOrNull(8_000) { FirebaseBackend.loadProfile(uid) }
                 ?: throw org.holidaylink.app.net.ApiException("We couldn't load your profile.")
             val fresh = Me(
                 id = uid,
@@ -110,12 +118,14 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                 about = p.bio.takeIf { it.isNotBlank() }
             )
             me = fresh
+            ProfileCache.save(prefs, fresh)
             displayName = fresh.displayName
             username = fresh.username
             about = fresh.about.orEmpty()
             error = ""
         } catch (e: Exception) {
-            error = "We couldn't load your profile. Check your internet."
+            // A cached profile is still a usable screen; only complain if there is nothing.
+            if (me == null) error = "We couldn't load your profile. Check your internet."
         } finally {
             loading = false
         }
@@ -161,6 +171,7 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
     }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(
                 colors = TopAppBarDefaults.topAppBarColors(

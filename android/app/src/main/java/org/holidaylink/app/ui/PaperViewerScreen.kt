@@ -76,6 +76,7 @@ fun PaperViewerScreen(
         lower.endsWith(".png") || lower.endsWith(".webp") || lower.endsWith(".gif")
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(
                 title = {
@@ -171,13 +172,13 @@ private fun WebFallback(url: String) {
     )
 }
 
-/** Downloads the file to a cache copy and rasterises up to 60 pages. Null means "cannot render". */
+/** Downloads the file to a persistent copy and rasterises up to 60 pages. Null means "cannot render". */
 private fun renderPdf(context: Context, url: String): List<Bitmap>? = runCatching {
-    val file = File(context.cacheDir, "hl_paper_${url.hashCode()}.pdf")
-    if (!file.exists() || file.length() == 0L) {
-        val bytes = java.net.URL(url).openStream().use { it.readBytes() }
-        file.writeBytes(bytes)
-    }
+    // Kept in the persistent media folder, not cacheDir: the system may wipe the cache, which
+    // turned already-read past papers into "not available offline" after a few days.
+    val file = kotlinx.coroutines.runBlocking {
+        org.holidaylink.app.net.MediaCache.fetch(context, url, "pdf")
+    } ?: return@runCatching null
     val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
     val renderer = PdfRenderer(pfd)
     val total = renderer.pageCount.coerceAtMost(60)

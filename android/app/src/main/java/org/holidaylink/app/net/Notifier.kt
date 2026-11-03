@@ -129,14 +129,6 @@ object Notifier {
         subText: String?
     ) {
         ensureChannels(context)
-        val nm = NotificationManagerCompat.from(context)
-        if (!nm.areNotificationsEnabled()) return
-        // Never buzz for the conversation that is already open on screen. A call always
-        // alerts, even when the conversation it belongs to happens to be on display.
-        if (channel == CHANNEL_MESSAGES && AppPresence.isReading(targetId)) {
-            clearChat(context, targetId!!)
-            return
-        }
         // Respect the per-type switches in Settings ▸ Notifications.
         runCatching {
             val allowed = if (channel == CHANNEL_CALLS) {
@@ -152,6 +144,30 @@ object Notifier {
                 .getOrDefault(false)
             if (muted) return
         }
+        // Never buzz for the conversation that is already open on screen. A call always
+        // alerts, even when the conversation it belongs to happens to be on display.
+        if (channel == CHANNEL_MESSAGES && AppPresence.isReading(targetId)) {
+            clearChat(context, targetId!!)
+            return
+        }
+        val preview = runCatching { org.holidaylink.app.data.AppSettings.state.notifyPreview }
+            .getOrDefault(true)
+        val shownBody = if (preview) body else "New message"
+        // The app is on screen, so the shade is the wrong surface: a heads-up alert would
+        // cover what the user is reading and play a sound they never asked for. Messages
+        // become a quiet in-app banner instead, and calls need nothing at all because the
+        // call page is already full screen.
+        if (AppPresence.foreground) {
+            if (channel == CHANNEL_MESSAGES && !targetId.isNullOrBlank()) {
+                org.holidaylink.app.ui.InAppAlerts.show(
+                    org.holidaylink.app.ui.InAppAlert(title, shownBody, targetId)
+                )
+                clearChat(context, targetId)
+            }
+            return
+        }
+        val nm = NotificationManagerCompat.from(context)
+        if (!nm.areNotificationsEnabled()) return
         val intent = Intent(context, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             if (targetId != null) putExtra(EXTRA_TARGET, targetId)
@@ -162,11 +178,9 @@ object Notifier {
         // straight by FCM (activity never ran) the settings aren't loaded yet, so default on.
         var sound = true
         var vibrate = true
-        var preview = true
         runCatching {
             sound = org.holidaylink.app.data.AppSettings.state.notifySound
             vibrate = org.holidaylink.app.data.AppSettings.state.notifyVibration
-            preview = org.holidaylink.app.data.AppSettings.state.notifyPreview
         }
         val defaults = when {
             sound && vibrate -> NotificationCompat.DEFAULT_ALL
@@ -174,7 +188,6 @@ object Notifier {
             vibrate -> NotificationCompat.DEFAULT_VIBRATE
             else -> 0
         }
-        val shownBody = if (preview) body else "New message"
         val notification = NotificationCompat.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_stat_holidaylink)
             .setLargeIcon(logo(context))

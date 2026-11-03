@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -90,8 +91,8 @@ private data class ContactRow(
  * Contacts tab.
  *
  * Reads the real device address book and splits it into "On HolidayLink" (matched accounts, shown
- * first) and "Invite to HolidayLink" (device contacts with no account). Names, photos and raw
- * numbers never leave the device: only SHA-256 hashes of canonical numbers are sent for matching.
+ * first) and "Invite to HolidayLink" (device contacts with no account). Names and photos never
+ * leave the device; only the contacts' phone numbers are looked up against registered accounts.
  */
 @Composable
 fun ContactsScreen(
@@ -152,7 +153,7 @@ fun ContactsScreen(
                             displayName = name,
                             username = d.getString("username").orEmpty(),
                             avatarUrl = d.getString("profilePic"),
-                            online = d.getBoolean("online") == true
+                            online = FirebaseBackend.snapshotOnline(d)
                         )
                     }
                 }
@@ -212,43 +213,58 @@ fun ContactsScreen(
         unregistered.map { it.contact.firstLetter() }.distinct().sorted()
     }
     // LazyColumn item offset of the first "Invite" row, used by the alphabet rail.
-    val inviteOffset = (if (registered.isNotEmpty()) 1 else 0) + registered.size + 1
+    // The header is item 0, so every section below it shifts by one.
+    val inviteOffset = 1 +
+        (if (registered.isNotEmpty()) 1 + registered.size else if (unregistered.isNotEmpty()) 1 else 0) +
+        1
 
-    Column(Modifier.fillMaxSize()) {
-        ContactsHeader(
-            query = query,
-            onQueryChange = { query = it },
-            onRefresh = { refreshToken++ },
-            registeredCount = registered.size,
-            inviteCount = unregistered.size,
-            matching = matching
-        )
-
-        when {
-            !granted -> PermissionRequired(asked = asked, onRequest = { showRationale = true })
-
-            loading && rows.isEmpty() -> LoadingState(label = "Reading your contacts...")
-
-            error.isNotBlank() && rows.isEmpty() ->
-                ErrorState(error) { refreshToken++ }
-
-            rows.isEmpty() && !loading -> EmptyState(
-                icon = Icons.Default.Contacts,
-                title = "No contacts on this device",
-                subtitle = "Add someone to this phone's address book, then pull down to refresh."
-            )
-
-            else -> PullToRefreshContainer(
-                refreshing = loading || matching,
-                onRefresh = { refreshToken++ },
-                modifier = Modifier.fillMaxSize()
+    PullToRefreshContainer(
+        refreshing = loading || matching,
+        onRefresh = { refreshToken++ },
+        modifier = Modifier.fillMaxSize()
+    ) {
+        Box(Modifier.fillMaxSize()) {
+            // The search field is the list's first item, so it scrolls away with the
+            // contacts instead of staying pinned above them.
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = floatingNavBottomPadding()
             ) {
-                Box(Modifier.fillMaxSize()) {
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(bottom = 28.dp)
-                    ) {
+                item(key = "contacts-header") {
+                    ContactsHeader(
+                        query = query,
+                        onQueryChange = { query = it },
+                        onRefresh = { refreshToken++ },
+                        registeredCount = registered.size,
+                        inviteCount = unregistered.size,
+                        matching = matching
+                    )
+                }
+
+                when {
+                    !granted -> item(key = "contacts-permission") {
+                        PermissionRequired(asked = asked, onRequest = { showRationale = true })
+                    }
+
+                    loading && rows.isEmpty() -> item(key = "contacts-loading") {
+                        LoadingState(Modifier.heightIn(min = 400.dp), label = "Reading your contacts...")
+                    }
+
+                    error.isNotBlank() && rows.isEmpty() -> item(key = "contacts-error") {
+                        ErrorState(error, Modifier.heightIn(min = 400.dp)) { refreshToken++ }
+                    }
+
+                    rows.isEmpty() && !loading -> item(key = "contacts-empty") {
+                        EmptyState(
+                            icon = Icons.Default.Contacts,
+                            title = "No contacts on this device",
+                            subtitle = "Add someone to this phone's address book, then pull down to refresh.",
+                            modifier = Modifier.heightIn(min = 400.dp)
+                        )
+                    }
+
+                    else -> {
                         if (query.isNotBlank() && filtered.isEmpty()) {
                             item(key = "no-results") { SearchNoResults(query) }
                         }
@@ -293,24 +309,24 @@ fun ContactsScreen(
                             item(key = "invite-footer") { InviteFooter() }
                         }
                     }
-
-                    if (railLetters.size > 1) {
-                        AlphabetRail(
-                            letters = railLetters,
-                            onPick = { letter ->
-                                val target = unregistered.indexOfFirst {
-                                    it.contact.firstLetter() == letter
-                                }
-                                if (target >= 0) {
-                                    scope.launch {
-                                        listState.animateScrollToItem(inviteOffset + target)
-                                    }
-                                }
-                            },
-                            modifier = Modifier.align(Alignment.CenterEnd)
-                        )
-                    }
                 }
+            }
+
+            if (railLetters.size > 1) {
+                AlphabetRail(
+                    letters = railLetters,
+                    onPick = { letter ->
+                        val target = unregistered.indexOfFirst {
+                            it.contact.firstLetter() == letter
+                        }
+                        if (target >= 0) {
+                            scope.launch {
+                                listState.animateScrollToItem(inviteOffset + target)
+                            }
+                        }
+                    },
+                    modifier = Modifier.align(Alignment.CenterEnd)
+                )
             }
         }
     }
@@ -324,8 +340,8 @@ fun ContactsScreen(
                 Text(
                     "HolidayLink will read this phone's address book so it can show which of " +
                         "your contacts already use HolidayLink.\n\n" +
-                        "Only a one-way SHA-256 hash of each number is sent for matching. " +
-                        "Names, photos and numbers stay on this device. You can skip this and " +
+                        "Only their phone numbers are looked up against registered accounts. " +
+                        "Names and photos stay on this device. You can skip this and " +
                         "use the rest of the app normally."
                 )
             },
@@ -353,7 +369,7 @@ private fun ContactsHeader(
     inviteCount: Int,
     matching: Boolean
 ) {
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
+    Column(Modifier.fillMaxWidth()) {
         Row(
             Modifier
                 .fillMaxWidth()
@@ -393,7 +409,7 @@ private fun ContactsHeader(
                 color = MaterialTheme.colorScheme.primary
             )
             Text(
-                "Matching hashed numbers…",
+                "Matching numbers…",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 3.dp)
@@ -547,7 +563,8 @@ private fun PermissionRequired(asked: Boolean, onRequest: () -> Unit) {
             Spacer(Modifier.height(10.dp))
             Text(
                 "Allow HolidayLink to read your contacts so you can see who already uses it. " +
-                    "Only one-way hashes of phone numbers are sent — never names or numbers.",
+                    "Only their phone numbers are looked up against registered accounts — names " +
+                    "and photos stay on this device.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

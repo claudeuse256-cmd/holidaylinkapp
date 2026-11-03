@@ -39,7 +39,12 @@ object MediaCache {
         return digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    fun dir(context: Context): File = File(context.cacheDir, "media").apply { mkdirs() }
+    /**
+     * Avatars, status images and wallpapers live in `filesDir`, not `cacheDir`: the system
+     * may wipe the cache at any time, which is exactly why photos turned back into initials
+     * while offline. Chat attachments keep using the cache directory.
+     */
+    fun dir(context: Context): File = File(context.filesDir, "media").apply { mkdirs() }
 
     /** Local file for [url]; [fallbackExt] is used when the URL carries no extension. */
     fun file(context: Context, url: String, fallbackExt: String = "bin"): File {
@@ -91,10 +96,25 @@ object MediaCache {
                         temp.copyTo(target, overwrite = true)
                         temp.delete()
                     }
+                    trim(context)
                     target
                 }
             }.getOrNull()
         }
+
+    /** Keeps the persistent media folder bounded by dropping the oldest files first. */
+    private fun trim(context: Context, maxBytes: Long = 256L * 1024 * 1024) {
+        runCatching {
+            val files = dir(context).listFiles()?.filter { it.isFile } ?: return@runCatching
+            var total = files.sumOf { it.length() }
+            if (total <= maxBytes) return@runCatching
+            files.sortedBy { it.lastModified() }.forEach { f ->
+                if (total <= maxBytes) return@forEach
+                total -= f.length()
+                f.delete()
+            }
+        }
+    }
 
     /** Fire-and-forget download used when a conversation is opened. */
     fun prefetch(context: Context, urls: Collection<String>, fallbackExt: String = "bin") {

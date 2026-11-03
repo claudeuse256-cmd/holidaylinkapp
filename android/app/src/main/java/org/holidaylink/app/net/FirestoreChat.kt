@@ -2,9 +2,11 @@ package org.holidaylink.app.net
 
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
 /**
@@ -37,8 +39,73 @@ object FirestoreChat {
         val peerId: String?,
         val lastBody: String?,
         val lastAt: Timestamp?,
-        val unread: Int
+        val unread: Int,
+        val peerTyping: Boolean = false
     )
+
+    /**
+     * How long a typing marker counts as live. The marker is a timestamp, not a flag, so a
+     * phone that was closed mid-sentence simply goes stale instead of leaving "typing…"
+     * stuck on somebody else's screen forever.
+     */
+    private const val TYPING_WINDOW_MS = 6_000L
+
+    private fun freshMillis(value: Any?): Long? = when (value) {
+        is Timestamp -> value.seconds * 1000L
+        is Number -> value.toLong()
+        else -> null
+    }
+
+    /** True when somebody other than [uid] wrote a typing marker inside the window. */
+    private fun someoneTyping(data: Map<String, Any?>, uid: String): Boolean {
+        val now = System.currentTimeMillis()
+        return data.entries.any { (key, value) ->
+            key.startsWith("typing_") && key != "typing_$uid" &&
+                (freshMillis(value)?.let { now - it in 0..TYPING_WINDOW_MS } ?: false)
+        }
+    }
+
+    /**
+     * Says "I am typing" in this conversation, or stops saying it.
+     *
+     * A marker is written at most every few seconds by the caller — one Firestore write per
+     * keystroke would be both slow and expensive — and it expires on its own, so a crash or a
+     * killed app cannot leave the other person staring at a permanent "typing…".
+     */
+    suspend fun setTyping(chatId: String, typing: Boolean) {
+        val uid = myUid()
+        if (uid.isBlank()) return
+        val field = "typing_$uid"
+        runCatching {
+            if (typing) {
+                db.collection("chats").document(chatId)
+                    .update(field, Timestamp.now()).await()
+            } else {
+                db.collection("chats").document(chatId)
+                    .update(field, FieldValue.delete()).await()
+            }
+        }
+    }
+
+    /** Live "is the other person typing right now" for one open conversation. */
+    fun typingFlow(chatId: String): Flow<Boolean> = callbackFlow {
+        val uid = myUid()
+        val data = java.util.concurrent.atomic.AtomicReference<Map<String, Any?>>(emptyMap())
+        val reg = db.collection("chats").document(chatId)
+            .addSnapshotListener { snap, _ ->
+                data.set(snap?.data.orEmpty())
+                trySend(someoneTyping(data.get(), uid))
+            }
+        // A marker expires by age, not by an event: a phone that died mid-sentence never
+        // writes again, so keep re-evaluating while a stale one could still be on screen.
+        val ticker = launch {
+            while (true) {
+                kotlinx.coroutines.delay(2_000)
+                trySend(someoneTyping(data.get(), uid))
+            }
+        }
+        awaitClose { ticker.cancel(); reg.remove() }
+    }
 
     fun chatsFlow(uid: String): Flow<List<ChatRow>> = callbackFlow {
         val reg = db.collection("chats").whereArrayContains("users", uid)
@@ -51,6 +118,7 @@ object FirestoreChat {
                         if (!users.contains(uid)) return@mapNotNull null
                         val isGroup = d.getBoolean("isGroup") == true
                         val others = users.filter { it != uid }
+                        val rowData = d.data.orEmpty()
                         ChatRow(
                             id = d.id,
                             isGroup = isGroup,
@@ -60,7 +128,8 @@ object FirestoreChat {
                             peerId = if (!isGroup) others.firstOrNull() else null,
                             lastBody = d.getString("lastText"),
                             lastAt = d.safeTimestamp("lastAt") ?: d.safeTimestamp("updatedAt"),
-                            unread = (d.getLong("unread_$uid") ?: 0).toInt()
+                            unread = (d.getLong("unread_$uid") ?: 0).toInt(),
+                            peerTyping = someoneTyping(rowData, uid)
                         )
                     }?.sortedWith(
                         // Two chats can share a whole second; the nanoseconds decide the tie
@@ -78,35 +147,69 @@ object FirestoreChat {
 
     suspend fun resolvePeer(peerId: String): User {
         val doc = db.collection("users").document(peerId).get().await()
-        val data = doc.data.orEmpty()
-        val username = doc.getString("username").orEmpty()
-        val name = (doc.getString("name") ?: doc.getString("displayName")).orEmpty()
+        return userFrom(peerId, doc.data.orEmpty())
+    }
+
+    /**
+     * Several peers in a handful of reads instead of one document each. `whereIn` on the
+     * document id has a cap, so the ids go out in chunks. The chat list uses this to refresh
+     * every visible name, photo and presence dot at once, rather than holding the copy it
+     * fetched at launch for the rest of the session.
+     */
+    suspend fun resolvePeers(ids: List<String>): Map<String, User> {
+        val wanted = ids.filter { it.isNotBlank() }.distinct()
+        if (wanted.isEmpty()) return emptyMap()
+        val out = HashMap<String, User>()
+        wanted.chunked(10).forEach { chunk ->
+            runCatching {
+                db.collection("users")
+                    .whereIn(com.google.firebase.firestore.FieldPath.documentId(), chunk)
+                    .get().await()
+            }.getOrNull()?.documents?.forEach { d ->
+                out[d.id] = userFrom(d.id, d.data.orEmpty())
+            }
+        }
+        return out
+    }
+
+    /**
+     * The one place a users/{uid} document becomes a [User], so presence and the privacy
+     * switches are read the same way everywhere.
+     */
+    private fun userFrom(peerId: String, data: Map<String, Any?>): User {
+        val username = (data["username"] as? String).orEmpty()
+        val name = ((data["name"] as? String) ?: (data["displayName"] as? String)).orEmpty()
             .takeIf { it.isNotBlank() }
             // A profile with no name must never render an empty row: fall back to the
             // handle, then to the neutral placeholder.
             ?: username.takeIf { it.isNotBlank() }?.let { "@$it" }
             ?: "HolidayLink user"
-        val avatar = (doc.getString("profilePic") ?: doc.getString("avatarUrl"))?.takeIf { it.isNotBlank() }
-        val online = doc.getBoolean("online") == true
-        val seen = FirebaseBackend.docLastSeenMillis(data)?.let { java.time.Instant.ofEpochMilli(it).toString() }
+        val avatar = ((data["profilePic"] as? String) ?: (data["avatarUrl"] as? String))
+            ?.takeIf { it.isNotBlank() }
+        val seenMillis = FirebaseBackend.docLastSeenMillis(data)
         return User(
             id = peerId,
             displayName = name,
             username = username,
             avatarUrl = avatar,
-            online = online,
-            lastSeen = seen
+            online = FirebaseBackend.isTrulyOnline(data["online"] == true, seenMillis),
+            lastSeen = seenMillis?.let { java.time.Instant.ofEpochMilli(it).toString() },
+            readReceipts = data["privacy_readReceipts"] as? Boolean ?: true,
+            typingIndicators = data["privacy_typing"] as? Boolean ?: true
         )
     }
 
     suspend fun startDirect(peerId: String): String {
         val uid = myUid()
-        val chatId = listOf(uid, peerId).sorted().joinToString("_")
+        val chatId = directId(uid, peerId)
         db.collection("chats").document(chatId).set(
             mapOf("users" to listOf(uid, peerId), "isGroup" to false)
         ).await()
         return chatId
     }
+
+    /** The one-to-one conversation id is derived from both uids, so it needs no lookup. */
+    fun directId(a: String, b: String): String = listOf(a, b).sorted().joinToString("_")
 
     suspend fun createGroup(title: String, memberIds: List<String>, broadcast: Boolean = false, community: Boolean = false): String {
         val uid = myUid()
@@ -151,7 +254,13 @@ object FirestoreChat {
         /** Set by the recipient's device when the message reaches it (double grey tick). */
         val delivered: Boolean = false,
         /** emoji -> uids who reacted. Empty map means no reactions. */
-        val reactions: Map<String, List<String>> = emptyMap()
+        val reactions: Map<String, List<String>> = emptyMap(),
+        /** True once the sender deleted it for everyone: the bubble becomes a placeholder. */
+        val deleted: Boolean = false,
+        /** Only set on `type = "call"` rows, which are the in-chat call log. */
+        val callKind: String? = null,
+        val callStatus: String? = null,
+        val callSeconds: Long? = null
     )
 
     fun messagesFlow(chatId: String): Flow<List<ChatMessage>> = callbackFlow {
@@ -179,7 +288,11 @@ object FirestoreChat {
                             audioBlob = d.getString("audioBlob"),
                             edited = d.getBoolean("edited") == true,
                             delivered = d.getBoolean("delivered") == true,
-                            reactions = parseReactions(d.get("reactions"))
+                            reactions = parseReactions(d.get("reactions")),
+                            deleted = d.getBoolean("deleted") == true,
+                            callKind = d.getString("callKind"),
+                            callStatus = d.getString("callStatus"),
+                            callSeconds = d.getLong("callSeconds")
                         )
                     } ?: emptyList()
                     trySend(rows)
@@ -257,13 +370,19 @@ object FirestoreChat {
         return msgRef.id
     }
 
-    suspend fun markRead(chatId: String) {
+    suspend fun markRead(chatId: String, sendReceipts: Boolean = true) {
         val uid = myUid()
         val unread = db.collection("chats").document(chatId).collection("messages")
             .whereEqualTo("read", false).get().await()
         val batch = db.batch()
-        unread.documents.filter { it.getString("senderId") != uid }.forEach {
-            batch.update(it.reference, "read", true)
+        // Clearing the local unread badge is always safe. Telling the sender that the
+        // message was read is a receipt, and receipts are a privacy choice: with them off
+        // the other side must keep seeing the single tick even though this phone opened
+        // the conversation.
+        if (sendReceipts) {
+            unread.documents.filter { it.getString("senderId") != uid }.forEach {
+                batch.update(it.reference, "read", true)
+            }
         }
         batch.update(db.collection("chats").document(chatId), "unread_$uid", 0)
         batch.commit().await()
@@ -324,6 +443,59 @@ object FirestoreChat {
 
     suspend fun deleteMessage(chatId: String, messageId: String) {
         db.collection("chats").document(chatId).collection("messages").document(messageId).delete().await()
+    }
+
+    /**
+     * "Delete for everyone": the row survives with its content stripped so both phones can
+     * render "This message was deleted" instead of silently losing the place in the thread.
+     */
+    suspend fun markDeleted(chatId: String, messageId: String) {
+        db.collection("chats").document(chatId).collection("messages").document(messageId)
+            .update(
+                mapOf(
+                    "deleted" to true,
+                    "text" to "",
+                    "imageUrl" to null,
+                    "fileUrl" to null,
+                    "audioBlob" to null,
+                    "reactions" to null
+                )
+            ).await()
+    }
+
+    /**
+     * Writes the call into the conversation itself, so a finished, missed or declined call
+     * shows up in the chat the same way it does in WhatsApp. Only the caller logs it: both
+     * phones would otherwise write a duplicate row.
+     */
+    suspend fun logCall(peerId: String, kind: String, status: String, seconds: Long) {
+        val uid = myUid()
+        if (uid.isBlank() || peerId.isBlank() || peerId == uid) return
+        val chatId = directId(uid, peerId)
+        val chatRef = db.collection("chats").document(chatId)
+        val now = Timestamp.now()
+        val preview = when (status) {
+            "missed" -> if (kind == "video") "Missed video call" else "Missed voice call"
+            "declined" -> if (kind == "video") "Declined video call" else "Declined voice call"
+            else -> if (kind == "video") "Video call" else "Voice call"
+        }
+        runCatching {
+            chatRef.set(mapOf("users" to listOf(uid, peerId), "isGroup" to false), SetOptions.merge()).await()
+            chatRef.collection("messages").document().set(
+                mapOf(
+                    "senderId" to uid,
+                    "text" to preview,
+                    "type" to "call",
+                    "timestamp" to now,
+                    "read" to true,
+                    "delivered" to true,
+                    "callKind" to kind,
+                    "callStatus" to status,
+                    "callSeconds" to seconds.coerceAtLeast(0)
+                )
+            ).await()
+            chatRef.update(mapOf("lastText" to preview, "lastAt" to now, "updatedAt" to now)).await()
+        }
     }
 
     suspend fun editMessage(chatId: String, messageId: String, text: String) {

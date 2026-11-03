@@ -6,11 +6,13 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
+import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.data.AccountStore
 import org.holidaylink.app.net.AppPresence
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Notifier
+import org.holidaylink.app.net.PushNotify
 
 /**
  * Receives Firebase Cloud Messaging pushes. This is the piece that lets notifications
@@ -72,6 +74,11 @@ class HolidayMessagingService : FirebaseMessagingService() {
 
 /** Stores this device's FCM token on the user's row so the server can target it. */
 object PushTokens {
+
+    /** Last token seen this session, so sign-out can revoke it without waiting on the SDK. */
+    @Volatile
+    private var lastToken: String? = null
+
     fun register() {
         val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return
         com.google.firebase.messaging.FirebaseMessaging.getInstance().token
@@ -80,6 +87,11 @@ object PushTokens {
 
     fun save(token: String, uid: String? = FirebaseAuth.getInstance().currentUser?.uid) {
         if (uid.isNullOrBlank() || token.isBlank()) return
+        lastToken = token
+        // Two routes on purpose. The Firestore field is what the website and older server
+        // builds read; the server route survives Firestore rules that do not yet allow the
+        // owner to write fcmTokens (the usual reason background pushes silently stop).
+        PushNotify.registerToken(token)
         runCatching {
             FirebaseBackend.db.collection("users").document(uid)
                 .set(
@@ -89,6 +101,31 @@ object PushTokens {
                     ),
                     SetOptions.merge()
                 )
+                .addOnFailureListener { error ->
+                    android.util.Log.w(
+                        "HolidayLinkPush",
+                        "Firestore refused users/$uid fcmTokens (check the deployed rules)",
+                        error
+                    )
+                }
         }
+    }
+
+    /**
+     * Drops this device from [uid]'s push list. Called while signing out, before the
+     * session is cleared, because Firestore rejects owner writes once auth is gone.
+     * Without this the phone kept buzzing for an account that had been signed out.
+     */
+    suspend fun unregisterFrom(uid: String) {
+        val token = lastToken
+            ?: runCatching { com.google.firebase.messaging.FirebaseMessaging.getInstance().token.await() }
+                .getOrNull()
+        if (token.isNullOrBlank()) return
+        runCatching {
+            FirebaseBackend.db.collection("users").document(uid)
+                .update("fcmTokens", FieldValue.arrayRemove(token))
+                .await()
+        }
+        lastToken = null
     }
 }

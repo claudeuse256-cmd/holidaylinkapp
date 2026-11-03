@@ -74,10 +74,35 @@ import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
+import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.safeTimestamp
+import org.holidaylink.app.net.safeTimestampSeconds
+import org.holidaylink.app.net.awaitOrNull
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.Imgbb
 // ==================================================================== feed
+
+/** Documents of one library collection, already ordered newest-first. */
+private data class StudyDocs(val ids: List<String>, val rows: List<Map<String, Any?>>)
+
+/**
+ * Reads a collection from the requested source. [com.google.firebase.firestore.Source.CACHE]
+ * is what makes the feed and the paper library readable with no connection: Firestore keeps
+ * the documents this phone has already seen on disk.
+ */
+private suspend fun loadDocs(
+    collection: String,
+    source: com.google.firebase.firestore.Source
+): StudyDocs {
+    // No `orderBy`: posters without a `timestamp` field would silently disappear, and an
+    // unreachable Firestore would retry past the point of a useful spinner.
+    val snap = FirebaseBackend.db.collection(collection).limit(100)
+        .get(source).awaitOrNull()
+        ?: throw IllegalStateException("$collection timeout")
+    val docs = snap.documents.sortedByDescending { it.safeTimestampSeconds("timestamp") }
+    @Suppress("UNCHECKED_CAST")
+    return StudyDocs(docs.map { it.id }, docs.map { it.data.orEmpty() as Map<String, Any?> })
+}
 
 /** Daily Feed / Home Feed: website posters collection with likes + comments. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -94,19 +119,19 @@ fun FeedScreen(api: Api, onBack: () -> Unit) {
 
     LaunchedEffect(reload) {
         loading = posts.isEmpty()
-        try {
-            val snap = FirebaseBackend.db.collection("posters")
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(100).get().await()
-            ids = snap.documents.map { it.id }
-            @Suppress("UNCHECKED_CAST")
-            posts = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
+        // Cache first, server second: the announcements keep reading with no connection.
+        val fresh = DeviceCache.load("feed.posters", { source -> loadDocs("posters", source) }) { data ->
+            if (data.rows.isNotEmpty() || posts.isEmpty()) {
+                ids = data.ids
+                posts = data.rows
+            }
             error = ""
-        } catch (e: Exception) {
-            error = "Couldn't load the feed. Check your internet."
-        } finally {
             loading = false
         }
+        if (fresh == null && posts.isEmpty()) {
+            error = "Couldn't load the feed. Check your internet."
+        }
+        loading = false
     }
 
     fun like(postId: String, liked: Boolean) {
@@ -121,6 +146,7 @@ fun FeedScreen(api: Api, onBack: () -> Unit) {
     }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(title = { Text("Feed") }, navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
@@ -327,13 +353,14 @@ fun QuizzesScreen(api: Api, onBack: () -> Unit) {
 
     LaunchedEffect(Unit) {
         try {
-            val snap = FirebaseBackend.db.collection("quizzes")
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(50).get().await()
-            ids = snap.documents.map { it.id }
+            val snap = FirebaseBackend.db.collection("quizzes").limit(50).get().awaitOrNull()
+                ?: throw IllegalStateException("quizzes timeout")
+            val docs = snap.documents
+                .sortedByDescending { it.safeTimestampSeconds("timestamp") }
+                .filter { it.get("active") != false }
+            ids = docs.map { it.id }
             @Suppress("UNCHECKED_CAST")
-            quizzes = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
-                .filter { it["active"] != false }
+            quizzes = docs.map { it.data.orEmpty() as Map<String, Any?> }
         } catch (e: Exception) {
             error = "Couldn't load quizzes. Check your internet."
         } finally {
@@ -342,6 +369,7 @@ fun QuizzesScreen(api: Api, onBack: () -> Unit) {
     }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(title = { Text("Quizzes") }, navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
@@ -636,19 +664,19 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
 
     LaunchedEffect(tab) {
         loading = papers.isEmpty()
-        try {
-            val snap = FirebaseBackend.db.collection(if (tab == "papers") "papers" else "guides")
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(100).get().await()
-            ids = snap.documents.map { it.id }
-            @Suppress("UNCHECKED_CAST")
-            papers = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
+        val collection = if (tab == "papers") "papers" else "guides"
+        val fresh = DeviceCache.load("study.$collection", { source -> loadDocs(collection, source) }) { data ->
+            if (data.rows.isNotEmpty() || papers.isEmpty()) {
+                ids = data.ids
+                papers = data.rows
+            }
             error = ""
-        } catch (e: Exception) {
-            error = "Couldn't load. Check your internet."
-        } finally {
             loading = false
         }
+        if (fresh == null && papers.isEmpty()) {
+            error = "Couldn't load. Check your internet."
+        }
+        loading = false
     }
 
     fun shareDoc(id: String, title: String) {
@@ -676,6 +704,7 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
     }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(title = { Text(if (tab == "papers") "Past Papers" else "Guides") }, navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
@@ -848,13 +877,14 @@ fun EventsScreen(api: Api, onBack: () -> Unit) {
     suspend fun load() {
         loading = events.isEmpty()
         try {
-            val snap = FirebaseBackend.db.collection("events")
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(100).get().await()
-            ids = snap.documents.map { it.id }
+            val snap = FirebaseBackend.db.collection("events").limit(100).get().awaitOrNull()
+                ?: throw IllegalStateException("events timeout")
+            val docs = snap.documents
+                .sortedByDescending { it.safeTimestampSeconds("timestamp") }
+                .filter { it.get("active") != false }
+            ids = docs.map { it.id }
             @Suppress("UNCHECKED_CAST")
-            events = snap.documents.map { it.data.orEmpty() as Map<String, Any?> }
-                .filter { it["active"] != false }
+            events = docs.map { it.data.orEmpty() as Map<String, Any?> }
             error = ""
         } catch (e: Exception) {
             error = "Couldn't load events. Check your internet."
@@ -866,6 +896,7 @@ fun EventsScreen(api: Api, onBack: () -> Unit) {
     LaunchedEffect(reload) { load() }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(title = { Text("Events") }, navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
@@ -1111,6 +1142,7 @@ fun WalletScreen(api: Api, onBack: () -> Unit) {
     LaunchedEffect(Unit) { load() }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(title = { Text("Wallet") }, navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
@@ -1235,6 +1267,7 @@ fun InviteScreen(api: Api, onBack: () -> Unit) {
     val activated = invites.count { (it["status"] as? String) == "activated" }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(title = { Text("Invite Friends") }, navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
@@ -1341,6 +1374,7 @@ fun RankingsScreen(api: Api, onBack: () -> Unit) {
     }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(title = { Text("Rankings") }, navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }

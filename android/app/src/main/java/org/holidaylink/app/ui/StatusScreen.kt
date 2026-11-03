@@ -28,6 +28,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Close
@@ -59,6 +60,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -72,11 +74,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.tasks.await
 import com.google.firebase.storage.FirebaseStorage
+import org.holidaylink.app.data.StatusSeen
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
+import org.holidaylink.app.net.MediaCache
 import org.holidaylink.app.net.Imgbb
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Cloudinary
@@ -93,7 +97,8 @@ import org.holidaylink.app.net.StatusUpdate
 fun StatusScreen(
     api: Api,
     me: Me?,
-    startWithComposer: Boolean = false
+    startWithComposer: Boolean = false,
+    onBack: () -> Unit = {}
 ) {
     var statuses by remember { mutableStateOf(DeviceCache.memory<List<StatusUpdate>>("statuses") ?: emptyList()) }
     var loading by remember { mutableStateOf(statuses.isEmpty()) }
@@ -111,6 +116,9 @@ fun StatusScreen(
     var viewerStart by remember { mutableIntStateOf(0) }
     var viewerMine by remember { mutableStateOf(false) }
     var viewerOpen by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    // Watched ids live on the phone, so the reel keeps its "seen" look while offline.
+    var seenIds by remember { mutableStateOf(StatusSeen.ids(context)) }
     val scope = rememberCoroutineScope()
 
     suspend fun refreshViews(ids: List<String>) {
@@ -180,10 +188,13 @@ fun StatusScreen(
         Row(
             Modifier
                 .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surface)
-                .padding(start = 18.dp, end = 4.dp, top = 10.dp, bottom = 6.dp),
+                .padding(start = 6.dp, end = 4.dp, top = 4.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // This page is always pushed on top of the chats, so it always gets a way back.
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+            }
             Text(
                 "Status",
                 style = MaterialTheme.typography.headlineSmall,
@@ -209,6 +220,7 @@ fun StatusScreen(
                     statuses = statuses,
                     currentUserId = me?.id,
                     selectedId = selected,
+                    seenIds = seenIds,
                     onPick = { picked ->
                         // WhatsApp behaviour: tapping a person opens their reel full-screen.
                         openViewer(picked)
@@ -382,6 +394,12 @@ fun StatusScreen(
             startIndex = viewerStart,
             mine = viewerMine,
             viewCounts = viewCounts,
+            onSeen = { id ->
+                if (id !in seenIds) {
+                    StatusSeen.markAll(context, listOf(id))
+                    seenIds = seenIds + id
+                }
+            },
             onDelete = { confirmDelete = it },
             onViewers = { viewersFor = it },
             onDismiss = { viewerOpen = false }
@@ -693,6 +711,7 @@ private fun StatusReel(
     statuses: List<StatusUpdate>,
     currentUserId: String?,
     selectedId: String?,
+    seenIds: Set<String>,
     onPick: (StatusUpdate) -> Unit
 ) {
     val grouped = remember(statuses, currentUserId) {
@@ -702,6 +721,11 @@ private fun StatusReel(
                     .thenByDescending { it.createdAt }
             )
             .distinctBy { it.userId }
+    }
+    // A person counts as "unseen" while any of their updates has not been watched yet.
+    val unseenUsers = remember(statuses, seenIds, currentUserId) {
+        statuses.filter { it.id !in seenIds && it.userId != currentUserId }
+            .mapTo(HashSet()) { it.userId }
     }
     if (grouped.isEmpty()) return
 
@@ -724,21 +748,30 @@ private fun StatusReel(
                         .size(60.dp)
                         .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.surfaceContainerHigh, CircleShape)
-                        // A bright ring marks the person currently being viewed.
+                        // Bright ring = something not watched yet, faded ring = already seen,
+                        // thicker ring = the person currently being viewed.
                         .then(
-                            if (selectedId == latest.userId) {
-                                Modifier.border(
+                            when {
+                                selectedId == latest.userId -> Modifier.border(
+                                    2.5.dp,
+                                    MaterialTheme.colorScheme.primary,
+                                    CircleShape
+                                )
+                                latest.userId in unseenUsers -> Modifier.border(
                                     2.dp,
                                     MaterialTheme.colorScheme.primary,
                                     CircleShape
                                 )
-                            } else {
-                                Modifier
+                                else -> Modifier.border(
+                                    2.dp,
+                                    MaterialTheme.colorScheme.outlineVariant,
+                                    CircleShape
+                                )
                             }
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Avatar(name = latest.userName, photo = latest.avatarUrl, size = 56.dp)
+                    Avatar(name = latest.userName, photo = latest.avatarUrl, size = 54.dp)
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
@@ -766,6 +799,7 @@ private fun StatusViewer(
     startIndex: Int,
     mine: Boolean,
     viewCounts: Map<String, Int>,
+    onSeen: (String) -> Unit,
     onDelete: (StatusUpdate) -> Unit,
     onViewers: (StatusUpdate) -> Unit,
     onDismiss: () -> Unit
@@ -775,6 +809,27 @@ private fun StatusViewer(
     var paused by remember { mutableStateOf(false) }
     var videoPlayer by remember { mutableStateOf<VideoView?>(null) }
     val current = updates[index.coerceIn(0, updates.lastIndex)]
+    val context = LocalContext.current
+    // Status videos are kept on the phone once watched, so replaying one offline still works.
+    var videoFile by remember(current.id) {
+        mutableStateOf(
+            current.mediaUrl
+                ?.takeIf { current.kind == "video" && it.isNotBlank() }
+                ?.let { MediaCache.cached(context, it, "mp4") }
+        )
+    }
+    var videoFailed by remember(current.id) { mutableStateOf(false) }
+
+    LaunchedEffect(current.id) {
+        onSeen(current.id)
+    }
+
+    LaunchedEffect(current.id) {
+        val url = current.mediaUrl
+        if (current.kind != "video" || url.isNullOrBlank() || videoFile != null) return@LaunchedEffect
+        // Playback streams from the URL; this copy is what makes it available offline later.
+        MediaCache.fetch(context, url, "mp4")?.let { videoFile = it }
+    }
 
     fun stepForward() {
         if (index < updates.lastIndex) {
@@ -785,7 +840,7 @@ private fun StatusViewer(
         }
     }
 
-    LaunchedEffect(index, paused, current.kind) {
+    LaunchedEffect(index, paused, current.kind, videoFailed) {
         if (paused) {
             videoPlayer?.pause()
             return@LaunchedEffect
@@ -793,6 +848,7 @@ private fun StatusViewer(
         if (current.kind == "video") {
             // Video status progress follows actual playback; do not skip a video after the
             // five-second image timer. VideoView's completion callback advances the reel.
+            if (videoFailed) return@LaunchedEffect
             while (true) {
                 kotlinx.coroutines.delay(80)
                 val player = videoPlayer ?: continue
@@ -815,12 +871,26 @@ private fun StatusViewer(
                     AndroidView(
                         factory = { ctx -> VideoView(ctx).apply {
                             videoPlayer = this
-                            setVideoURI(Uri.parse(current.mediaUrl))
+                            val local = videoFile
+                            if (local != null) setVideoPath(local.absolutePath)
+                            else setVideoURI(Uri.parse(current.mediaUrl))
                             setOnPreparedListener { if (paused) pause() else start() }
                             setOnCompletionListener { stepForward() }
+                            // Streaming can fail with no connection; keep the reel usable.
+                            setOnErrorListener { _, _, _ -> videoFailed = true; true }
                         } },
                         modifier = Modifier.fillMaxSize()
                     )
+                    if (videoFailed) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                "This video isn't available offline yet.",
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(32.dp)
+                            )
+                        }
+                    }
                 }
             } else if (!current.mediaUrl.isNullOrBlank()) {
                 RemoteImage(url = current.mediaUrl, modifier = Modifier.fillMaxSize())
@@ -901,9 +971,16 @@ private fun StatusViewer(
                 }
 
                 Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+                    Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    IconButton(onClick = onDismiss) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            "Back",
+                            tint = Color.White
+                        )
+                    }
                     Avatar(name = current.userName, photo = current.avatarUrl, size = 36.dp)
                     Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
@@ -924,9 +1001,6 @@ private fun StatusViewer(
                         IconButton(onClick = { onDelete(current) }) {
                             Icon(Icons.Default.Delete, "Delete", tint = Color.White)
                         }
-                    }
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, "Close", tint = Color.White)
                     }
                 }
 

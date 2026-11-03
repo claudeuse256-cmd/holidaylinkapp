@@ -57,37 +57,51 @@ object PushNotify {
             .put("type", "message")
             .put("body", preview.take(240))
         if (!messageId.isNullOrBlank()) payload.put("id", messageId)
-        scope.launch { post(payload) }
+        scope.launch { post("/push/send", payload) }
     }
 
     /** "Somebody is calling you" — this one has to reach a killed app to be useful. */
     fun call(callId: String) {
         if (callId.isBlank()) return
-        scope.launch { post(JSONObject().put("callId", callId).put("type", "call")) }
+        scope.launch { post("/push/send", JSONObject().put("callId", callId).put("type", "call")) }
     }
 
-    private suspend fun post(payload: JSONObject) {
+    /**
+     * Stores this device's token through the server (Admin SDK) as well as in Firestore.
+     *
+     * The Firestore write needs the deployed rules to allow the owner to update
+     * `users/{uid}.fcmTokens`. When they do not, the write fails silently and the server has
+     * no token to push to — which looks exactly like "notifications only arrive while the app
+     * is open". The server route bypasses the rules, so background delivery keeps working
+     * even if the rules are still the website's older set.
+     */
+    fun registerToken(token: String) {
+        if (token.isBlank()) return
+        scope.launch { post("/push/register", JSONObject().put("token", token)) }
+    }
+
+    private suspend fun post(path: String, payload: JSONObject) {
         val context = app ?: return
         runCatching {
             val token = FirebaseAuth.getInstance().currentUser?.getIdToken(false)?.await()?.token
                 ?: return@runCatching
             val request = Request.Builder()
-                .url(AppConfig.resolve(context) + "/push/send")
+                .url(AppConfig.resolve(context) + path)
                 .addHeader("Authorization", "Bearer $token")
                 .post(payload.toString().toRequestBody(jsonType))
                 .build()
             client.newCall(request).execute().use { response ->
                 val responseBody = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
-                    Log.w("HolidayLinkPush", "Push relay returned HTTP ${response.code}: ${responseBody.take(300)}")
+                    Log.w("HolidayLinkPush", "$path returned HTTP ${response.code}: ${responseBody.take(300)}")
                 } else {
-                    Log.d("HolidayLinkPush", "Push relay accepted request: ${responseBody.take(200)}")
+                    Log.d("HolidayLinkPush", "$path accepted: ${responseBody.take(200)}")
                 }
             }
             Unit
         }.onFailure { error ->
             // Never swallow a push failure silently: search Logcat for HolidayLinkPush.
-            Log.w("HolidayLinkPush", "Could not contact push relay", error)
+            Log.w("HolidayLinkPush", "Could not contact $path", error)
         }
     }
 }

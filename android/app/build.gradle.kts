@@ -3,6 +3,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.gms.google-services")
+    id("app.cash.paparazzi") version "1.3.5"
 }
 
 // Single source of truth for the backend address used by the Android app.
@@ -10,6 +11,14 @@ plugins {
 //   ./gradlew assembleDebug -PHL_API_BASE_URL=http://192.168.1.20:8080
 // or edit HL_API_BASE_URL in android/gradle.properties (also set at runtime in Settings).
 val apiBaseUrl: String = (project.findProperty("HL_API_BASE_URL") as String?) ?: "http://127.0.0.1:8080"
+
+// TURN relay for calls. STUN alone cannot cross carrier-grade NAT, which is why a call
+// could say "accepted" on both phones and still carry no audio or video. Fill these in
+// from a TURN provider (Metered's free tier is enough) in android/gradle.properties —
+// no Kotlin change needed. Blank = STUN-only, which only works on the same Wi-Fi.
+val turnHost: String = (project.findProperty("HL_TURN_HOST") as String?) ?: ""
+val turnUsername: String = (project.findProperty("HL_TURN_USERNAME") as String?) ?: ""
+val turnPassword: String = (project.findProperty("HL_TURN_PASSWORD") as String?) ?: ""
 
 android {
     compileOptions {
@@ -24,10 +33,40 @@ android {
         applicationId = "org.holidaylink.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "2.3.7"
+        versionCode = 16
+        versionName = "2.4.3"
 
         buildConfigField("String", "API_BASE_URL", "\"$apiBaseUrl\"")
+        buildConfigField("String", "TURN_HOST", "\"$turnHost\"")
+        buildConfigField("String", "TURN_USERNAME", "\"$turnUsername\"")
+        buildConfigField("String", "TURN_PASSWORD", "\"$turnPassword\"")
+    }
+
+    // The keystore is intentionally git-ignored. Local builds use it so updates install
+    // over the previous HolidayLink APK; CI builds fall back to the standard debug key.
+    val holidaylinkKeystore = rootProject.file("holidaylink.jks")
+    signingConfigs {
+        if (holidaylinkKeystore.exists()) {
+            create("holidaylink") {
+                storeFile = holidaylinkKeystore
+                storePassword = "holidaylink"
+                keyAlias = "holidaylink"
+                keyPassword = "holidaylink"
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (holidaylinkKeystore.exists()) {
+                signingConfig = signingConfigs.getByName("holidaylink")
+            }
+        }
+        release {
+            if (holidaylinkKeystore.exists()) {
+                signingConfig = signingConfigs.getByName("holidaylink")
+            }
+        }
     }
 
     buildFeatures {
@@ -66,6 +105,8 @@ dependencies {
     implementation("com.google.firebase:firebase-storage")
     implementation("com.google.firebase:firebase-messaging")
     implementation("io.github.webrtc-sdk:android:150.7871.01")
+
+    testImplementation("junit:junit:4.13.2")
 }
 
 

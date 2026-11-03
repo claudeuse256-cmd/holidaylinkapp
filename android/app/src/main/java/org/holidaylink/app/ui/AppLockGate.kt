@@ -13,8 +13,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -45,9 +48,10 @@ import org.holidaylink.app.data.AppSettings
 /**
  * App lock.
  *
- * Nothing sensitive is rendered until the user proves who they are. If a PIN is set, it is
- * always available as a fallback so a device without a working biometric sensor can never lock
- * the owner out of their own account. The gate re-arms whenever the app leaves the foreground.
+ * Nothing sensitive is rendered until the user proves who they are. Fingerprint or face is the
+ * only thing on screen; the PIN stays hidden behind "Use PIN instead" so it is the last resort,
+ * but it is still there — a device with a dirty sensor must never lock the owner out of their
+ * own account. The gate re-arms whenever the app leaves the foreground.
  */
 @Composable
 fun AppLockGate(content: @Composable () -> Unit) {
@@ -61,6 +65,8 @@ fun AppLockGate(content: @Composable () -> Unit) {
     var pin by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }
     var prompted by remember { mutableStateOf(false) }
+    // The PIN stays hidden until biometrics is unavailable or the user asks for it.
+    var showPin by remember { mutableStateOf(false) }
 
     val hasPin = settings.appLockPin != null
 
@@ -90,6 +96,7 @@ fun AppLockGate(content: @Composable () -> Unit) {
                 unlocked = false
                 prompted = false
                 pin = ""
+                showPin = false
             }
         }
         lifecycle.addObserver(observer)
@@ -160,9 +167,36 @@ fun AppLockGate(content: @Composable () -> Unit) {
         )
         Spacer(Modifier.height(16.dp))
         Text("HolidayLink is locked", style = MaterialTheme.typography.titleLarge)
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(6.dp))
+        Text(
+            if (biometricUsable) "Use your fingerprint or face to open the app."
+            else "This phone has no biometric unlock set up, so use your PIN.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(24.dp))
 
-        if (settings.appLockPin != null) {
+        if (biometricUsable) {
+            Button(
+                onClick = { prompted = false; error = "" },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Fingerprint, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Unlock with fingerprint or face")
+            }
+            if (hasPin) {
+                Spacer(Modifier.height(6.dp))
+                // The PIN is deliberately the last option: biometrics first, always.
+                TextButton(onClick = { showPin = !showPin }) {
+                    Text(if (showPin) "Hide the PIN" else "Use PIN instead")
+                }
+            }
+        }
+
+        if (hasPin && (showPin || !biometricUsable)) {
+            Spacer(Modifier.height(14.dp))
             OutlinedTextField(
                 value = pin,
                 onValueChange = { pin = it.filter { c -> c.isDigit() }.take(8) },
@@ -187,7 +221,7 @@ fun AppLockGate(content: @Composable () -> Unit) {
                 enabled = pin.isNotEmpty(),
                 modifier = Modifier.fillMaxWidth()
             ) { Text("Unlock") }
-        } else {
+        } else if (!biometricUsable && !hasPin) {
             TextButton(onClick = { prompted = false }) { Text("Try again") }
         }
 

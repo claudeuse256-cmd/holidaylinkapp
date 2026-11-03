@@ -21,11 +21,14 @@ import org.holidaylink.app.R
  */
 object AnnouncementNotifier {
 
-    const val CHANNEL = "hl_announcements"
+    // A new id (v2): the old channel was created at LOW importance, which parks the card in
+    // the phone's collapsed "silent" section — where it looked like it was missing. Channel
+    // importance can't be raised after creation, so this one starts at DEFAULT.
+    const val CHANNEL = "hl_announcements_v2"
+    private const val LEGACY_CHANNEL = "hl_announcements"
     const val NOTIFICATION_ID = 4701
 
     private var registration: com.google.firebase.firestore.ListenerRegistration? = null
-    private var lastShown: String = ""
 
     private const val PREFS = "hl_announce"
     private const val KEY_TITLE = "last_title"
@@ -36,12 +39,14 @@ object AnnouncementNotifier {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         if (nm.getNotificationChannel(CHANNEL) == null) {
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "Announcements", NotificationManager.IMPORTANCE_LOW).apply {
+                NotificationChannel(CHANNEL, "Announcements", NotificationManager.IMPORTANCE_DEFAULT).apply {
                     description = "The latest HolidayLink announcement, kept in the shade"
                     setShowBadge(false)
                 }
             )
         }
+        // Nothing was ever posted on the old id; remove it so the list of channels stays clean.
+        runCatching { nm.deleteNotificationChannel(LEGACY_CHANNEL) }
     }
 
     /** Starts (or refreshes) the listener that feeds the pinned announcement card. */
@@ -51,28 +56,23 @@ object AnnouncementNotifier {
         // An app update (or a reboot / "clear notifications") wipes the system tray, and
         // the Firestore snapshot can take a beat to arrive — or fail while offline. Re-post
         // the last announcement we showed straight away so the pinned card is never lost.
-        runCatching {
-            val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val title = prefs.getString(KEY_TITLE, null)
-            val body = prefs.getString(KEY_BODY, null)
-            if (!title.isNullOrBlank()) {
-                // Silent re-post: this announcement was already seen, so do not re-alert.
-                lastShown = "$title\u0000$body"
-                show(app, title, body.orEmpty())
-            }
-        }
+        repost(app)
         if (registration != null) return
+        // No `orderBy`: sorting server-side silently drops every poster that lacks that
+        // exact field (and needs an index), which left the pinned card empty. Fetch a page
+        // and pick the newest client-side instead.
         registration = runCatching {
             FirebaseBackend.db.collection("posters")
-                .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
-                .limit(1)
+                .limit(60)
                 .addSnapshotListener { snapshot, _ ->
                     // Snapshot callbacks run on the main thread: never let a bad
                     // document take the app down.
                     runCatching {
-                        val doc = snapshot?.documents?.firstOrNull() ?: return@addSnapshotListener
+                        val docs = snapshot?.documents ?: return@addSnapshotListener
+                        val doc = docs.maxByOrNull { postedAtMillis(it) } ?: return@addSnapshotListener
                         val title = (doc.getString("title") ?: "").trim()
-                        val body = (doc.getString("message") ?: doc.getString("content") ?: "").trim()
+                        val body = firstText(doc, "message", "content", "body", "text")
+                        if (title.isBlank() && body.isBlank()) return@addSnapshotListener
                         show(
                             app,
                             title.ifBlank { "HolidayLink announcement" },
@@ -83,20 +83,44 @@ object AnnouncementNotifier {
         }.getOrNull()
     }
 
+    /** Re-posts the cached card without touching Firestore (used when the app resumes). */
+    fun repost(context: Context) {
+        val app = context.applicationContext
+        ensureChannel(app)
+        runCatching {
+            val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val title = prefs.getString(KEY_TITLE, null) ?: return
+            if (title.isBlank()) return
+            show(app, title, prefs.getString(KEY_BODY, null).orEmpty())
+        }
+    }
+
+    private fun firstText(doc: com.google.firebase.firestore.DocumentSnapshot, vararg keys: String): String {
+        keys.forEach { key -> (doc.getString(key) ?: "").trim().let { if (it.isNotBlank()) return it } }
+        return ""
+    }
+
+    /** Posters use different date fields depending on how they were created. */
+    private fun postedAtMillis(doc: com.google.firebase.firestore.DocumentSnapshot): Long =
+        listOf("timestamp", "createdAt", "created_at", "postedAt", "date")
+            .mapNotNull { doc.safeTimestamp(it)?.seconds }
+            .maxOrNull() ?: 0L
+
     fun stop() {
         runCatching { registration?.remove() }
         registration = null
     }
 
     private fun show(context: Context, title: String, body: String) {
-        val fingerprint = "$title\u0000$body"
-        val firstTime = fingerprint != lastShown
-        lastShown = fingerprint
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // Compare against what we already showed, not an in-memory flag: after the process is
+        // killed the flag resets, and a resume would otherwise buzz again for old news.
+        val firstTime = title != prefs.getString(KEY_TITLE, null) || body != prefs.getString(KEY_BODY, null)
 
         // Remember it so a later launch (or an app update, which cancels every
         // notification) can put the pinned card straight back without waiting on Firestore.
         runCatching {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            prefs.edit()
                 .putString(KEY_TITLE, title)
                 .putString(KEY_BODY, body)
                 .apply()
@@ -128,6 +152,7 @@ object AnnouncementNotifier {
             .setOnlyAlertOnce(!firstTime)
             .setShowWhen(false)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
             .setContentIntent(pi)
             .build()

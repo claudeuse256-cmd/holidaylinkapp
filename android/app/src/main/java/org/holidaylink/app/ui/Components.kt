@@ -1,8 +1,15 @@
 package org.holidaylink.app.ui
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -21,11 +28,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -35,6 +46,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Refresh
@@ -136,8 +148,17 @@ fun Avatar(
         // Network + decode must stay off the main thread or every remote
         // photo silently fails and falls back to initials.
         value = withContext(kotlinx.coroutines.Dispatchers.IO) {
-            photo?.takeIf { it.isNotBlank() }?.let {
-                avatarMemoryCache.get(it) ?: decodeAvatar(context, it)?.also { bmp -> avatarMemoryCache.put(it, bmp) }
+            photo?.takeIf { it.isNotBlank() }?.let { src ->
+                avatarMemoryCache.get(src) ?: run {
+                    // Remote photos go through MediaCache so the file stays on the phone and
+                    // the avatar survives with no internet instead of reverting to initials.
+                    val loaded = if (src.startsWith("http")) {
+                        org.holidaylink.app.net.MediaCache.bitmap(context, src)
+                    } else {
+                        decodeAvatar(context, src)
+                    }
+                    loaded?.also { bmp -> avatarMemoryCache.put(src, bmp) }
+                }
             }
         }
     }
@@ -219,15 +240,85 @@ private fun decodeAvatar(context: Context, source: String): android.graphics.Bit
     }
 }.getOrNull()
 
+// ---------------------------------------------------------------- saving media
+
+/**
+ * Permission-aware "Save to gallery" action shared by the photo and video viewers.
+ *
+ * Pass either a decoded image or a downloaded file. Android 10+ writes straight into
+ * MediaStore; on Android 9 and older the legacy storage permission is asked for first and
+ * the save retried once it is granted, so the user only has to tap Save once.
+ */
+@Composable
+fun rememberSaveToGallery(): (bitmap: Bitmap?, file: java.io.File?) -> Unit {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var pendingBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var pendingFile by remember { mutableStateOf<java.io.File?>(null) }
+
+    fun write(bitmap: Bitmap?, file: java.io.File?) {
+        if (bitmap == null && file == null) {
+            Toast.makeText(context, "Nothing to save yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+        scope.launch {
+            val ok = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    if (bitmap != null) org.holidaylink.app.media.GallerySave.bitmap(context, bitmap)
+                    else org.holidaylink.app.media.GallerySave.video(context, file!!)
+                }.getOrDefault(false)
+            }
+            Toast.makeText(
+                context,
+                if (ok) "Saved to your gallery" else "Saving failed. Try again.",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) write(pendingBitmap, pendingFile)
+        else {
+            Toast.makeText(
+                context,
+                "Storage access is needed to save on this Android version",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        pendingBitmap = null
+        pendingFile = null
+    }
+
+    return { bitmap, file ->
+        val needsPermission = org.holidaylink.app.media.GallerySave.needsLegacyPermission() &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) != PackageManager.PERMISSION_GRANTED
+        if (needsPermission) {
+            pendingBitmap = bitmap
+            pendingFile = file
+            launcher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            write(bitmap, file)
+        }
+    }
+}
+
 // ---------------------------------------------------------------- photo viewer
 
 /** Larger cache for full-screen previews, separate from the tiny avatar cache. */
 private val photoViewerCache = android.util.LruCache<String, android.graphics.Bitmap>(16)
 
 /** Loads an image at (near) full resolution from a URL or a content/file URI. */
-private fun loadFullBitmap(context: Context, source: String): android.graphics.Bitmap? = runCatching {
+private suspend fun loadFullBitmap(context: Context, source: String): android.graphics.Bitmap? = runCatching {
     if (source.startsWith("http")) {
-        java.net.URL(source).openStream().use { BitmapFactory.decodeStream(it) }
+        // Kept on disk after the first view, so a saved wallpaper or photo still shows
+        // when the phone has no internet.
+        org.holidaylink.app.net.MediaCache.fetch(context, source)
+            ?.let { BitmapFactory.decodeFile(it.absolutePath) }
     } else {
         context.contentResolver.openInputStream(Uri.parse(source))?.use { BitmapFactory.decodeStream(it) }
     }
@@ -241,6 +332,7 @@ private fun loadFullBitmap(context: Context, source: String): android.graphics.B
 fun PhotoViewer(url: String?, title: String = "", onDismiss: () -> Unit) {
     val source = url?.takeIf { it.isNotBlank() } ?: return
     val context = LocalContext.current
+    val saveToGallery = rememberSaveToGallery()
     val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, source) {
         value = withContext(kotlinx.coroutines.Dispatchers.IO) {
             photoViewerCache.get(source)
@@ -292,6 +384,50 @@ fun PhotoViewer(url: String?, title: String = "", onDismiss: () -> Unit) {
                 onClick = onDismiss,
                 modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
             ) { Icon(Icons.Default.Close, "Close", tint = Color.White) }
+            IconButton(
+                onClick = { saveToGallery(image, null) },
+                enabled = image != null,
+                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
+            ) { Icon(Icons.Default.Download, "Save to gallery", tint = Color.White) }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- typing indicator
+
+/**
+ * The three pulsing dots shown while somebody else is writing.
+ *
+ * Each dot runs the same loop a third of a cycle behind the one before it, so the row reads
+ * as movement travelling left to right instead of all three flashing at once.
+ */
+@Composable
+fun TypingDots(
+    modifier: Modifier = Modifier,
+    color: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    dotSize: Dp = 6.dp
+) {
+    val transition = rememberInfiniteTransition(label = "typing")
+    val phase by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1100, easing = LinearEasing)),
+        label = "typingPhase"
+    )
+    Row(
+        modifier,
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        repeat(3) { index ->
+            val lift = kotlin.math.sin(((phase + index / 3f) % 1f) * Math.PI).toFloat()
+            Box(
+                Modifier
+                    .size(dotSize)
+                    .offset(y = (-3f * lift).dp)
+                    .clip(CircleShape)
+                    .background(color.copy(alpha = 0.3f + 0.7f * lift))
+            )
         }
     }
 }
@@ -301,27 +437,45 @@ fun PhotoViewer(url: String?, title: String = "", onDismiss: () -> Unit) {
 /**
  * Draws the user's chat wallpaper (or a themed base) behind the message list.
  *
- * A built-in preset wins over a personal photo, so a chat can be given one of the
- * Telegram-style backgrounds while the account default stays a photo if the user
- * picked one.
+ * A personal photo and a built-in design are alternatives rather than layers: picking a photo
+ * clears the preset (see `AppSettings.setChatWallpaper`), so whichever one the user chose last
+ * is the one drawn. [brightness] darkens the artwork without touching it: a bright photo
+ * otherwise makes white text unreadable.
  */
 @Composable
 fun ChatWallpaper(
     uri: String?,
     solid: Boolean,
     modifier: Modifier = Modifier,
-    preset: String? = null
+    preset: String? = null,
+    brightness: Float = org.holidaylink.app.data.AppSettings.state.wallpaperBrightness
 ) {
+    Box(modifier) {
+        WallpaperArt(uri = uri, solid = solid, preset = preset, modifier = Modifier.fillMaxSize())
+        val dim = (1f - brightness).coerceIn(0f, 0.65f)
+        if (dim > 0.01f) {
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = dim)))
+        }
+    }
+}
+
+@Composable
+private fun WallpaperArt(uri: String?, solid: Boolean, preset: String?, modifier: Modifier) {
     val context = LocalContext.current
     val scheme = MaterialTheme.colorScheme
     val source = uri?.takeIf { it.isNotBlank() }
-    val chosen = preset?.takeIf { it.isNotBlank() }?.takeIf { it != "default" }
-    if (chosen != null) {
+    val chosen = preset?.takeIf { it.isNotBlank() }
+    if (chosen != null && chosen != WALLPAPER_DEFAULT) {
         WallpaperBackdrop(chosen, modifier)
         return
     }
-    if (source == null || solid) {
+    if (solid) {
         Box(modifier.background(scheme.surfaceContainerLowest))
+        return
+    }
+    if (source == null) {
+        // Nothing personal picked: show the built-in design rather than a blank canvas.
+        WallpaperBackdrop(chosen ?: WALLPAPER_DEFAULT, modifier)
         return
     }
     val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, source) {
@@ -338,36 +492,92 @@ fun ChatWallpaper(
             modifier = modifier
         )
     } else {
-        Box(modifier.background(scheme.surfaceContainerLowest))
+        WallpaperBackdrop(WALLPAPER_DEFAULT, modifier)
     }
 }
 
 // ---------------------------------------------------------------- states
 
+// ---------------------------------------------------------------- skeleton states
+
+/**
+ * Moving highlight used by every skeleton block: a soft band sweeping left to right.
+ * A pulsing alpha (the old approach) reads as a broken screen; a sweep reads as loading.
+ */
+@Composable
+fun shimmerBrush(): Brush {
+    val transition = androidx.compose.animation.core.rememberInfiniteTransition(label = "shimmer")
+    val phase by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(1150, easing = androidx.compose.animation.core.LinearEasing)
+        ),
+        label = "shimmerPhase"
+    )
+    val base = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+    val highlight = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.13f)
+    val span = 900f
+    val x = phase * (span * 2f) - span
+    return Brush.linearGradient(
+        colors = listOf(base, highlight, base),
+        start = Offset(x, 0f),
+        end = Offset(x + span, span * 0.6f)
+    )
+}
+
+/**
+ * Bottom space a scrolling list needs so its last row can clear the floating nav pill.
+ * The pill sits above the system navigation bar, and lists now run all the way to the
+ * bottom edge of the screen — rows scroll *behind* the pill instead of stopping above it.
+ */
+@Composable
+fun floatingNavBottomPadding(): PaddingValues {
+    val navBars = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    return PaddingValues(bottom = navBars + 96.dp)
+}
+
 @Composable
 fun LoadingState(modifier: Modifier = Modifier, label: String = "Loading...") {
-    // Skeleton shimmer list instead of a bare spinner, WhatsApp-style.
-    Column(modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        repeat(5) { SkeletonCard() }
-        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Column(modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 10.dp)) {
+        repeat(7) { SkeletonRow() }
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 8.dp, start = 4.dp)
+        )
+    }
+}
+
+/** One chat-list placeholder row: avatar, name line, preview line, timestamp. */
+@Composable
+fun SkeletonRow(modifier: Modifier = Modifier) {
+    val brush = shimmerBrush()
+    Row(
+        modifier.fillMaxWidth().padding(vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(48.dp).clip(CircleShape).background(brush))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Box(Modifier.fillMaxWidth(0.45f).height(13.dp).clip(RoundedCornerShape(7.dp)).background(brush))
+            Box(Modifier.fillMaxWidth(0.75f).height(11.dp).clip(RoundedCornerShape(6.dp)).background(brush))
+        }
+        Spacer(Modifier.width(10.dp))
+        Box(Modifier.width(34.dp).height(10.dp).clip(RoundedCornerShape(5.dp)).background(brush))
     }
 }
 
 @Composable
 fun SkeletonCard(modifier: Modifier = Modifier) {
-    val alpha by androidx.compose.animation.core.rememberInfiniteTransition(label = "sk").animateFloat(
-        initialValue = 0.35f, targetValue = 0.85f,
-        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
-            animation = androidx.compose.animation.core.tween(900),
-            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
-        ), label = "skA"
-    )
-    Row(modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = alpha)).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(46.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = alpha)))
+    val brush = shimmerBrush()
+    Row(modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(46.dp).clip(CircleShape).background(brush))
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Box(Modifier.fillMaxWidth(0.6f).height(14.dp).clip(RoundedCornerShape(7.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = alpha)))
-            Box(Modifier.fillMaxWidth(0.9f).height(12.dp).clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = alpha)))
+            Box(Modifier.fillMaxWidth(0.6f).height(14.dp).clip(RoundedCornerShape(7.dp)).background(brush))
+            Box(Modifier.fillMaxWidth(0.9f).height(12.dp).clip(RoundedCornerShape(6.dp)).background(brush))
         }
     }
 }

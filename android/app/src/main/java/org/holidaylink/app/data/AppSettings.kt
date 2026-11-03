@@ -14,6 +14,20 @@ import org.json.JSONObject
 /** Media auto-download policy, mirroring the three states users expect. */
 enum class AutoDownload { ALWAYS, WIFI_ONLY, NEVER }
 
+/**
+ * A message waiting to go out at a chosen time.
+ *
+ * Stored on the device and sent by the app's own scheduler, so it needs no server job — the
+ * trade-off is that it only fires while HolidayLink is running.
+ */
+data class ScheduledMessage(
+    val id: String,
+    val chatId: String,
+    val chatLabel: String,
+    val text: String,
+    val atMs: Long
+)
+
 /** Default timer applied to new messages. */
 enum class DisappearingDuration(val seconds: Long, val label: String) {
     OFF(0L, "Off"),
@@ -39,6 +53,13 @@ data class SettingsSnapshot(
     val chatWallpaperPreset: String = "default",
     /** Per-chat background override: chatId -> preset id ("" clears the override). */
     val chatWallpaperPresets: Map<String, String> = emptyMap(),
+    /** 1f is untouched; lower values darken the wallpaper so text stays readable. */
+    val wallpaperBrightness: Float = 1f,
+    /** Id of the screen transition the user picked (see org.holidaylink.app.ui.NavTransition). */
+    val transitionStyle: String = "none",
+    /** Chats that must be unlocked (biometric/PIN) every time they are opened. */
+    val lockedChats: Map<String, Boolean> = emptyMap(),
+    val scheduledMessages: List<ScheduledMessage> = emptyList(),
     val autoDownloadPhotos: AutoDownload = AutoDownload.WIFI_ONLY,
     val autoDownloadVideos: AutoDownload = AutoDownload.WIFI_ONLY,
     val autoDownloadDocuments: AutoDownload = AutoDownload.NEVER,
@@ -114,6 +135,10 @@ object AppSettings {
         const val WALLPAPER_SOLID = "set.wallpaperSolid"
         const val WALLPAPER_PRESET = "set.wallpaperPreset"
         const val WALLPAPER_PRESETS = "set.wallpaperPresets"
+        const val WALLPAPER_BRIGHTNESS = "set.wallpaperBrightness"
+        const val TRANSITION = "set.transition"
+        const val LOCKED_CHATS = "set.lockedChats"
+        const val SCHEDULED = "set.scheduled"
         const val DL_PHOTOS = "set.dlPhotos"
         const val DL_VIDEOS = "set.dlVideos"
         const val DL_DOCS = "set.dlDocs"
@@ -156,6 +181,10 @@ object AppSettings {
             chatWallpaperSolid = p.getBoolean(K.WALLPAPER_SOLID, false),
             chatWallpaperPreset = p.getString(K.WALLPAPER_PRESET, "default") ?: "default",
             chatWallpaperPresets = decodeStringMap(p.getString(K.WALLPAPER_PRESETS, "").orEmpty()),
+            wallpaperBrightness = p.getFloat(K.WALLPAPER_BRIGHTNESS, 1f).coerceIn(0.35f, 1f),
+            transitionStyle = p.getString(K.TRANSITION, "none") ?: "none",
+            lockedChats = decodeMuted(p.getString(K.LOCKED_CHATS, "").orEmpty()),
+            scheduledMessages = decodeScheduled(p.getString(K.SCHEDULED, "").orEmpty()),
             autoDownloadPhotos = enumOrDefault(p.getString(K.DL_PHOTOS, null), AutoDownload.WIFI_ONLY),
             autoDownloadVideos = enumOrDefault(p.getString(K.DL_VIDEOS, null), AutoDownload.WIFI_ONLY),
             autoDownloadDocuments = enumOrDefault(p.getString(K.DL_DOCS, null), AutoDownload.NEVER),
@@ -222,6 +251,42 @@ object AppSettings {
 
     private fun encodeMuted(map: Map<String, Boolean>): String =
         map.entries.joinToString(";") { "${it.key}=${if (it.value) 1 else 0}" }
+
+    /** Scheduled messages hold free text, so they are stored as JSON rather than `key=value`. */
+    private fun decodeScheduled(raw: String): List<ScheduledMessage> {
+        if (raw.isBlank()) return emptyList()
+        return runCatching {
+            val array = org.json.JSONArray(raw)
+            (0 until array.length()).mapNotNull { i ->
+                val o = array.optJSONObject(i) ?: return@mapNotNull null
+                val chatId = o.optString("chatId")
+                val at = o.optLong("atMs")
+                if (chatId.isBlank() || at <= 0L) return@mapNotNull null
+                ScheduledMessage(
+                    id = o.optString("id").ifBlank { "$chatId-$at" },
+                    chatId = chatId,
+                    chatLabel = o.optString("chatLabel"),
+                    text = o.optString("text"),
+                    atMs = at
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun encodeScheduled(list: List<ScheduledMessage>): String {
+        val array = org.json.JSONArray()
+        list.sortedBy { it.atMs }.forEach { m ->
+            array.put(
+                JSONObject()
+                    .put("id", m.id)
+                    .put("chatId", m.chatId)
+                    .put("chatLabel", m.chatLabel)
+                    .put("text", m.text)
+                    .put("atMs", m.atMs)
+            )
+        }
+        return array.toString()
+    }
 
     private fun commit(): SettingsSnapshot {
         state = read()
@@ -314,9 +379,24 @@ object AppSettings {
         commit()
     }
 
+    /**
+     * A personal photo and a built-in design are alternatives, not layers. Picking a photo
+     * clears the preset and the solid flag, otherwise a preset chosen earlier keeps winning
+     * the precedence rule in ChatWallpaper and the photo never appears anywhere.
+     */
     fun setChatWallpaper(uri: String?) {
         prefs.edit().apply {
-            if (uri == null) remove(K.WALLPAPER) else putString(K.WALLPAPER, uri)
+            if (uri == null) {
+                remove(K.WALLPAPER)
+            } else {
+                putString(K.WALLPAPER, uri)
+                putString(K.WALLPAPER_PRESET, "default")
+                putBoolean(K.WALLPAPER_SOLID, false)
+                // A wallpaper picked from the device is a "set it everywhere" action: drop
+                // per-chat presets, otherwise those chats keep their old design and the new
+                // photo looks like it was never applied.
+                remove(K.WALLPAPER_PRESETS)
+            }
         }.apply()
         commit()
     }
@@ -343,6 +423,16 @@ object AppSettings {
     /** The background actually used by a chat: its own choice, else the global default. */
     fun wallpaperPresetFor(chatId: String): String =
         state.chatWallpaperPresets[chatId] ?: state.chatWallpaperPreset
+
+    fun setWallpaperBrightness(value: Float) {
+        prefs.edit().putFloat(K.WALLPAPER_BRIGHTNESS, value.coerceIn(0.35f, 1f)).apply()
+        commit()
+    }
+
+    fun setTransitionStyle(value: String) {
+        prefs.edit().putString(K.TRANSITION, value).apply()
+        commit()
+    }
 
     fun setAutoDownloadPhotos(value: AutoDownload) = putEnum(K.DL_PHOTOS, value)
     fun setAutoDownloadVideos(value: AutoDownload) = putEnum(K.DL_VIDEOS, value)
@@ -468,6 +558,60 @@ object AppSettings {
         val next = LinkedHashMap(state.blockedUsers)
         if (blocked) next[userId] = true else next.remove(userId)
         prefs.edit().putString(K.BLOCKED, encodeMuted(next)).apply()
+        commit()
+    }
+
+    // ------------------------------------------------------------------ chat lock
+
+    /**
+     * Chats unlocked during this session; cleared whenever the app leaves the foreground.
+     * Snapshot-backed so the lock screen disappears the moment the user authenticates.
+     */
+    private val unlockedNow = androidx.compose.runtime.mutableStateListOf<String>()
+
+    fun isChatLocked(chatId: String): Boolean = state.lockedChats[chatId] == true
+
+    fun setChatLocked(chatId: String, locked: Boolean) {
+        val next = LinkedHashMap(state.lockedChats)
+        if (locked) next[chatId] = true else next.remove(chatId)
+        if (!locked) unlockedNow.remove(chatId)
+        prefs.edit().putString(K.LOCKED_CHATS, encodeMuted(next)).apply()
+        commit()
+    }
+
+    fun isChatUnlockedNow(chatId: String): Boolean = unlockedNow.contains(chatId)
+
+    fun markChatUnlocked(chatId: String) { unlockedNow.add(chatId) }
+
+    fun clearUnlockedChats() { unlockedNow.clear() }
+
+    // ------------------------------------------------------------------ scheduled messages
+
+    fun scheduledFor(chatId: String): List<ScheduledMessage> =
+        state.scheduledMessages.filter { it.chatId == chatId }.sortedBy { it.atMs }
+
+    /** Every scheduled message whose time has come; the caller sends then drops them. */
+    fun dueScheduled(nowMs: Long = System.currentTimeMillis()): List<ScheduledMessage> =
+        state.scheduledMessages.filter { it.atMs <= nowMs }.sortedBy { it.atMs }
+
+    fun addScheduled(chatId: String, chatLabel: String, text: String, atMs: Long): ScheduledMessage {
+        val item = ScheduledMessage(
+            id = java.util.UUID.randomUUID().toString(),
+            chatId = chatId,
+            chatLabel = chatLabel,
+            text = text,
+            atMs = atMs
+        )
+        writeScheduled(state.scheduledMessages + item)
+        return item
+    }
+
+    fun removeScheduled(id: String) {
+        writeScheduled(state.scheduledMessages.filter { it.id != id })
+    }
+
+    private fun writeScheduled(list: List<ScheduledMessage>) {
+        prefs.edit().putString(K.SCHEDULED, encodeScheduled(list)).apply()
         commit()
     }
 

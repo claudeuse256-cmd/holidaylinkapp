@@ -2,6 +2,7 @@
 
 package org.holidaylink.app.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -17,11 +18,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.PersonSearch
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -46,6 +49,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -55,6 +60,9 @@ import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.User
+import org.holidaylink.app.net.awaitOrNull
+import org.holidaylink.app.phone.ContactMatcher
+import org.holidaylink.app.phone.PhoneNumbers
 
 enum class NewChatMode { DIRECT, GROUP, CHANNEL, COMMUNITY }
 
@@ -74,6 +82,7 @@ fun NewChatScreen(
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
 
+    val context = androidx.compose.ui.platform.LocalContext.current
     var mode by remember(initialMode) { mutableStateOf(initialMode) }
     var query by remember { mutableStateOf("") }
     var users by remember { mutableStateOf<List<User>>(emptyList()) }
@@ -82,6 +91,74 @@ fun NewChatScreen(
     var loading by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
+
+    // Number lookup: typed straight into the field, answered while they are still typing.
+    var phone by remember { mutableStateOf("") }
+    var phoneUser by remember { mutableStateOf<User?>(null) }
+    var phoneChecking by remember { mutableStateOf(false) }
+    /** The exact field value the current answer belongs to, so a stale reply is never shown. */
+    var phoneAnswered by remember { mutableStateOf("") }
+    /** True when the last lookup could not reach Firestore at all. */
+    var phoneOffline by remember { mutableStateOf(false) }
+    val dialCodes = remember(context) { ContactMatcher.defaultDialCodes(context) }
+
+    fun openDirect(user: User) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            runCatching { FirestoreChat.startDirect(user.id) }
+                .onSuccess { id -> onOpenChat(ChatItem(id, "direct", null, user, null, null)) }
+                .onFailure {
+                    busy = false
+                    snackbar.showSnackbar("We couldn't open that chat.")
+                }
+        }
+    }
+
+    LaunchedEffect(phone, mode) {
+        if (mode != NewChatMode.DIRECT) return@LaunchedEffect
+        val digits = phone.filter { it.isDigit() }
+        // Below nine digits there is nothing to look up yet; wait for a real number.
+        if (digits.length < 9) {
+            phoneUser = null
+            phoneChecking = false
+            phoneAnswered = ""
+            phoneOffline = false
+            return@LaunchedEffect
+        }
+        phoneChecking = true
+        kotlinx.coroutines.delay(450)
+        val candidates = PhoneNumbers.candidatesFor(phone, dialCodes)
+        if (candidates.isEmpty()) {
+            phoneChecking = false
+            return@LaunchedEffect
+        }
+        val snap = runCatching {
+            FirebaseBackend.db.collection("users").whereIn("phone", candidates)
+                .get().awaitOrNull(8_000)
+        }.getOrNull()
+        phoneChecking = false
+        if (snap == null) {
+            // Offline, or the lookup timed out: better to say nothing than to claim the
+            // number is unregistered when we simply could not ask.
+            phoneAnswered = ""
+            phoneUser = null
+            phoneOffline = true
+            return@LaunchedEffect
+        }
+        phoneOffline = false
+        phoneAnswered = phone
+        val found = snap.documents.firstOrNull { it.getString("name").orEmpty().isNotBlank() }
+        phoneUser = found?.let { d ->
+            User(
+                id = d.id,
+                displayName = d.getString("name").orEmpty(),
+                username = d.getString("username").orEmpty(),
+                avatarUrl = d.getString("profilePic"),
+                online = FirebaseBackend.snapshotOnline(d)
+            )
+        }
+    }
 
     LaunchedEffect(query) {
         try {
@@ -96,7 +173,7 @@ fun NewChatScreen(
                     displayName = name,
                     username = d.getString("username").orEmpty(),
                     avatarUrl = d.getString("profilePic"),
-                    online = d.getBoolean("online") == true
+                    online = FirebaseBackend.snapshotOnline(d)
                 )
             }.filter {
                 needle.isBlank() || it.displayName.lowercase().contains(needle) ||
@@ -111,6 +188,7 @@ fun NewChatScreen(
     }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(
                 title = {
@@ -182,6 +260,79 @@ fun NewChatScreen(
                     .padding(horizontal = 16.dp, vertical = 6.dp)
             )
 
+            if (mode == NewChatMode.DIRECT) {
+                OutlinedTextField(
+                    value = phone,
+                    onValueChange = { phone = it.filter { c -> c.isDigit() || c == '+' }.take(16) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(26.dp),
+                    label = { Text("Or add a phone number") },
+                    supportingText = { Text("Checked live against registered accounts") },
+                    leadingIcon = { Icon(Icons.Default.Phone, null) },
+                    trailingIcon = {
+                        if (phoneChecking) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        }
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                )
+
+                val answered = phoneAnswered == phone && phone.filter { it.isDigit() }.length >= 9
+                val hit = phoneUser
+                when {
+                    answered && hit != null -> Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.8f))
+                            .clickable(enabled = !busy) { openDirect(hit) }
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Avatar(name = hit.displayName, photo = hit.avatarUrl, online = hit.online, size = 44.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                hit.displayName,
+                                style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                if (hit.username.isNotBlank()) "@${hit.username} • on HolidayLink"
+                                else "On HolidayLink",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1
+                            )
+                        }
+                        Text(
+                            "Open",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+
+                    answered -> Text(
+                        "That number isn't on HolidayLink yet.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                    )
+
+                    phoneOffline && !phoneChecking -> Text(
+                        "Couldn't check that number. Reconnect and it will look again.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
             if (mode != NewChatMode.DIRECT) {
                 Text(
                     "Step 1: name it. Step 2: tap people below to add them, then press Create.",
@@ -241,20 +392,7 @@ fun NewChatScreen(
                                 .fillMaxWidth()
                                 .clickable(enabled = !busy) {
                                     when (mode) {
-                                        NewChatMode.DIRECT -> {
-                                            if (busy) return@clickable
-                                            busy = true
-                                            scope.launch {
-                                                runCatching { FirestoreChat.startDirect(user.id) }
-                                                    .onSuccess { id ->
-                                                        onOpenChat(ChatItem(id, "direct", null, user, null, null))
-                                                    }
-                                                    .onFailure { e ->
-                                                        busy = false
-                                                        snackbar.showSnackbar("We couldn't open that chat.")
-                                                    }
-                                            }
-                                        }
+                                        NewChatMode.DIRECT -> openDirect(user)
 
                                         NewChatMode.GROUP, NewChatMode.CHANNEL, NewChatMode.COMMUNITY -> {
                                             selected = if (checked) selected - user.id

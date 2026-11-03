@@ -59,7 +59,14 @@ data class User(
     val avatarUrl: String? = null,
     val online: Boolean = false,
     val lastSeen: String? = null,
-    val about: String? = null
+    val about: String? = null,
+    /**
+     * The other person's own privacy switches, read from their profile. Both sides of a
+     * conversation have to agree before a blue tick or a "typing…" label is shown, which is
+     * what makes turning either of them off actually mean something.
+     */
+    val readReceipts: Boolean = true,
+    val typingIndicators: Boolean = true
 )
 
 /** The signed-in user. */

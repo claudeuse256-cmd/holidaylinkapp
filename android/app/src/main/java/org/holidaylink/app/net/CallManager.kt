@@ -13,6 +13,56 @@ import kotlinx.coroutines.tasks.await
 import org.webrtc.*
 
 /**
+ * The TURN relay every call depends on.
+ *
+ * STUN on its own cannot cross the carrier-grade NAT that most phones sit behind, so without a
+ * working relay the two phones never find a path: the call rings, Firestore says "accepted", the
+ * timer runs — and there is no audio and no video in either direction. That is exactly what the
+ * previous configuration did, because `openrelay.metered.ca` was shut down and now resolves to
+ * `100::1` / `192.0.2.1`, which are discard-only sinkhole addresses.
+ *
+ * Fill these three in from the Metered dashboard (the free tier is enough to test with). While
+ * they are blank the app runs STUN-only: calls connect when both phones share one Wi-Fi network
+ * and fail honestly everywhere else.
+ */
+private val TURN_HOST = org.holidaylink.app.BuildConfig.TURN_HOST
+private val TURN_USERNAME = org.holidaylink.app.BuildConfig.TURN_USERNAME
+private val TURN_PASSWORD = org.holidaylink.app.BuildConfig.TURN_PASSWORD
+
+/** How long a picked-up call waits for media before it is declared dead. */
+private const val LINK_TIMEOUT_MS = 25_000L
+
+private fun iceServers(): List<PeerConnection.IceServer> {
+    val servers = mutableListOf(
+        PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+        PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
+    )
+    if (TURN_HOST.isNotBlank() && TURN_USERNAME.isNotBlank()) {
+        val host = TURN_HOST.removePrefix("turns:").removePrefix("turn:").trimEnd('/')
+        // The TCP and TLS variants are not optional extras: plenty of carrier, campus and
+        // hotel networks block UDP outright, so a UDP-only relay silently fails there.
+        // This is exactly the URL set Metered hands out for its free TURN service.
+        servers.add(
+            PeerConnection.IceServer.builder("stun:stun.relay.metered.ca:80").createIceServer()
+        )
+        listOf(
+            "turn:$host:80",
+            "turn:$host:80?transport=tcp",
+            "turn:$host:443",
+            "turns:$host:443?transport=tcp"
+        ).forEach { url ->
+            servers.add(
+                PeerConnection.IceServer.builder(url)
+                    .setUsername(TURN_USERNAME)
+                    .setPassword(TURN_PASSWORD)
+                    .createIceServer()
+            )
+        }
+    }
+    return servers
+}
+
+/**
  * Calls over Firestore signaling (same docs as the website room):
  * calls/{id} {callerId, calleeId, kind, status, offer, answer},
  * calls/{id}/callerCandidates + calleeCandidates {sdpMid, sdpMLineIndex, candidate}.
@@ -22,6 +72,18 @@ class CallManager(private val context: Context, private val api: Api) {
     data class Incoming(val callId: String, val kind: String, val caller: User, val status: String)
     var onIncoming: ((Incoming) -> Unit)? = null
     var onState: ((String) -> Unit)? = null
+    /**
+     * The WebRTC link state (`connecting`, `connected`, `failed`…), kept apart from [onState].
+     *
+     * [onState] carries what Firestore says about the call — ringing, accepted, ended — and
+     * "accepted" only means the other phone tapped Answer. Whether media is actually moving is
+     * a separate fact, and blending the two is what let a call read as connected while it stayed
+     * silent and black.
+     */
+    var onLink: ((String) -> Unit)? = null
+    /** Last value passed to [onLink]; a screen that composes late reads the state from here. */
+    @Volatile var linkState = "new"
+        private set
     var onRemote: ((VideoTrack?) -> Unit)? = null
     var onLocal: ((VideoTrack?) -> Unit)? = null
 
@@ -36,6 +98,16 @@ class CallManager(private val context: Context, private val api: Api) {
     @Volatile var currentRemoteTrack: VideoTrack? = null
         private set
 
+    /**
+     * The EGL share group used by the codecs, the camera capturer and the screen renderers.
+     *
+     * They *must* share one root context: the capturer produces OpenGL textures, and a
+     * renderer (or encoder) created from a different EglBase cannot sample them, which shows
+     * up as a black self-preview and black remote video. Null while WebRTC is unavailable.
+     */
+    @Volatile var eglContext: EglBase.Context? = null
+        private set
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val db get() = FirebaseBackend.db
     private var incomingReg: ListenerRegistration? = null
@@ -43,24 +115,35 @@ class CallManager(private val context: Context, private val api: Api) {
     private var candReg: ListenerRegistration? = null
     private var pc: PeerConnection? = null
     private var factory: PeerConnectionFactory? = null
+    /** Shared GL context for the video codecs; must live as long as [factory]. */
+    private var factoryEgl: EglBase? = null
     private var localVideo: VideoTrack? = null
     private var localAudio: AudioTrack? = null
     private var audioSource: AudioSource? = null
     private var videoSource: VideoSource? = null
     private var videoCapturer: VideoCapturer? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
-    private var cameraEgl: EglBase? = null
     private var currentCallId: String? = null
     private var currentKind = "audio"
     private var isCaller = false
-    private var answerApplied = false
-    private var accepted = false
+    // Written from Firestore listener threads and read from the UI and the call watchdog, so
+    // without @Volatile a stale value keeps a finished call alive or answers twice.
+    @Volatile private var answerApplied = false
+    @Volatile private var accepted = false
+    /** The other person in the current call, so it can be written into the chat log. */
+    private var peerId: String? = null
+    /** Wall-clock moment the call was actually picked up; 0 while it is still ringing. */
+    private var acceptedAtMs = 0L
+    /** One log row per call: both the local hang-up and the remote one can fire. */
+    private var callLogged = false
+    /** Call id whose media watchdog is running, so it is never armed twice for one call. */
+    @Volatile private var linkWatchdogCall: String? = null
     private val seenCandidates = mutableSetOf<String>()
     /** Call ids already rung, so a re-snapshot never rings the same call twice. */
     private val ringingCalls = mutableSetOf<String>()
     /** ICE that arrived before the remote description was set; applied once it is. */
     private val pendingCandidates = mutableListOf<IceCandidate>()
-    private var remoteSet = false
+    @Volatile private var remoteSet = false
 
     fun connect() {
         if (factory != null) return
@@ -68,7 +151,19 @@ class CallManager(private val context: Context, private val api: Api) {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions()
             )
-            PeerConnectionFactory.builder().createPeerConnectionFactory()
+            // Without explicit codec factories no video codec is registered, and a video
+            // offer then fails negotiation and takes the audio call down with it.
+            val egl = EglBase.create()
+            factoryEgl = egl
+            eglContext = egl.eglBaseContext
+            PeerConnectionFactory.builder()
+                .setVideoEncoderFactory(
+                    DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)
+                )
+                .setVideoDecoderFactory(
+                    DefaultVideoDecoderFactory(egl.eglBaseContext)
+                )
+                .createPeerConnectionFactory()
         } catch (_: Throwable) {
             // A device with no usable WebRTC native library must not take the whole app
             // down with it; calls simply stay unavailable until the next launch.
@@ -94,6 +189,9 @@ class CallManager(private val context: Context, private val api: Api) {
                     scope.launch {
                         val caller = runCatching { FirestoreChat.resolvePeer(callerId) }.getOrNull()
                             ?: User(callerId, "HolidayLink user", "")
+                        // Watch the call while it rings too, so cancelling on the caller's
+                        // side closes the ring screen instead of ringing forever.
+                        watchCall(d.id, caller = false)
                         onIncoming?.invoke(
                             Incoming(d.id, d.getString("kind") ?: "audio", caller, "ringing")
                         )
@@ -109,6 +207,8 @@ class CallManager(private val context: Context, private val api: Api) {
         pc?.close(); pc = null
         cleanupCall()
         factory?.dispose(); factory = null
+        runCatching { factoryEgl?.release() }; factoryEgl = null
+        eglContext = null
         currentCallId = null
     }
 
@@ -119,11 +219,19 @@ class CallManager(private val context: Context, private val api: Api) {
             throw ApiException("Allow microphone${if (kind == "video") " and camera" else ""} permission, then try the call again.")
         }
         connect()
+        // When the WebRTC native library could not start there is no point dialling: the
+        // other phone would ring and hear nothing. Fail loudly instead.
+        if (factory == null) throw ApiException("Calls couldn't start on this phone. Close the app, reopen it and try again.")
         currentKind = kind
+        enterCallAudioMode()
         isCaller = true
         accepted = false
+        peerId = calleeId
+        acceptedAtMs = 0
+        callLogged = false
         answerApplied = false
         remoteSet = false
+        linkState = "new"
         pendingCandidates.clear()
         seenCandidates.clear()
         val uid = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
@@ -149,6 +257,7 @@ class CallManager(private val context: Context, private val api: Api) {
                     db.collection("calls").document(ref.id)
                         .update(mapOf("status" to "missed", "endedAt" to Timestamp.now())).await()
                 }
+                logCallToChat("missed")
                 onState?.invoke("missed")
             }
         }
@@ -161,11 +270,26 @@ class CallManager(private val context: Context, private val api: Api) {
         currentKind = kind
         isCaller = false
         accepted = true
+        acceptedAtMs = System.currentTimeMillis()
+        callLogged = false
+        answerApplied = false
+        remoteSet = false
+        linkState = "new"
+        // Answering used to skip the permission prompt entirely, so a callee who had never
+        // placed a call sent silence (mic denied) or died on the camera (SecurityException).
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
+            (kind == "video" && ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
+        ) {
+            onState?.invoke("failed")
+            return
+        }
+        enterCallAudioMode()
         scope.launch {
             var sdp = ""
-            // The caller writes the SDP a beat after the ring doc appears, so retry briefly:
-            // answering fast used to hang because the offer was not there yet.
-            for (attempt in 0 until 12) {
+            // The caller writes the SDP a beat after the ring doc appears, so retry: answering
+            // fast used to hang because the offer was not there yet. Ten seconds, because on a
+            // slow network three was often not enough and the call then failed silently.
+            for (attempt in 0 until 40) {
                 val snap = runCatching { db.collection("calls").document(callId).get().await() }.getOrNull()
                 @Suppress("UNCHECKED_CAST")
                 val offer = snap?.get("offer") as? Map<String, String>
@@ -201,7 +325,12 @@ class CallManager(private val context: Context, private val api: Api) {
                     SessionDescription(SessionDescription.Type.OFFER, sdp)
                 )
             } else {
-                runCatching { db.collection("calls").document(callId).update("status", "accepted").await() }
+                // The offer never arrived, so there is nothing to answer. Writing "accepted"
+                // here is what produced a call that looked connected on both phones and carried
+                // no media at all: without an answer SDP the caller never starts sending.
+                runCatching { db.collection("calls").document(callId).update("status", "failed").await() }
+                onState?.invoke("failed")
+                cleanupCall()
             }
         }
         watchCall(callId, caller = false)
@@ -218,6 +347,7 @@ class CallManager(private val context: Context, private val api: Api) {
     fun end() {
         val id = currentCallId
         val missed = !accepted && isCaller
+        logCallToChat(if (missed) "missed" else "ended")
         if (id != null) {
             scope.launch {
                 runCatching {
@@ -249,8 +379,55 @@ class CallManager(private val context: Context, private val api: Api) {
     fun setSpeaker(on: Boolean) {
         runCatching {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            // isSpeakerphoneOn is ignored unless the call audio mode is active, which is why
+            // the speaker button appeared to do nothing.
+            am?.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
             am?.isSpeakerphoneOn = on
         }
+    }
+
+    /**
+     * Puts the phone into call audio routing. Without this the microphone captures at
+     * "media" volume and the voice comes out of the wrong speaker on most devices.
+     */
+    private fun enterCallAudioMode() {
+        runCatching {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager ?: return
+            am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+            am.isSpeakerphoneOn = currentKind == "video"
+            // WebRTC plays into the voice-call stream, not the media one. A phone whose
+            // voice-call volume happens to be at zero is silent even with a perfect
+            // connection, so lift it to a level that can actually be heard.
+            val stream = android.media.AudioManager.STREAM_VOICE_CALL
+            val max = am.getStreamMaxVolume(stream)
+            if (max > 0 && am.getStreamVolume(stream) * 2 < max) {
+                am.setStreamVolume(stream, (max * 0.75f).toInt(), 0)
+            }
+        }
+    }
+
+    private fun leaveCallAudioMode() {
+        runCatching {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager ?: return
+            am.isSpeakerphoneOn = false
+            am.mode = android.media.AudioManager.MODE_NORMAL
+        }
+    }
+
+    /**
+     * Writes the finished call into the conversation so it shows up in the chat like WhatsApp.
+     * Only the caller writes it, and only once, because the callee's phone sees the same
+     * status change and would otherwise add a second row.
+     */
+    private fun logCallToChat(status: String) {
+        if (!isCaller || callLogged) return
+        val peer = peerId ?: return
+        callLogged = true
+        val seconds = if (acceptedAtMs > 0) {
+            ((System.currentTimeMillis() - acceptedAtMs) / 1000).coerceAtLeast(0)
+        } else 0
+        val kind = currentKind
+        scope.launch { runCatching { FirestoreChat.logCall(peer, kind, status, seconds) } }
     }
 
     private fun cleanupCall() {
@@ -259,8 +436,10 @@ class CallManager(private val context: Context, private val api: Api) {
         currentCallId = null
         answerApplied = false
         remoteSet = false
+        linkWatchdogCall = null
         pendingCandidates.clear()
         seenCandidates.clear()
+        leaveCallAudioMode()
         // Release camera/microphone resources on hang-up so the next call does not inherit
         // a busy camera or keep the microphone active in the background.
         runCatching { videoCapturer?.stopCapture() }
@@ -273,7 +452,6 @@ class CallManager(private val context: Context, private val api: Api) {
         runCatching { videoSource?.dispose() }; videoSource = null
         runCatching { audioSource?.dispose() }; audioSource = null
         runCatching { surfaceTextureHelper?.dispose() }; surfaceTextureHelper = null
-        runCatching { cameraEgl?.release() }; cameraEgl = null
     }
 
     /** Remote description is in place: apply any ICE that arrived early. */
@@ -289,7 +467,13 @@ class CallManager(private val context: Context, private val api: Api) {
         callReg = db.collection("calls").document(callId)
             .addSnapshotListener { snap, _ ->
                 val status = snap?.getString("status") ?: return@addSnapshotListener
-                if (status == "accepted" || status == "connected") accepted = true
+                if (status == "accepted" || status == "connected") {
+                    accepted = true
+                    if (acceptedAtMs == 0L) acceptedAtMs = System.currentTimeMillis()
+                    // Both phones have answered, so from here the only question is whether
+                    // media actually flows. Start the clock on that.
+                    armLinkWatchdog(callId)
+                }
                 onState?.invoke(status)
                 // Caller picks up the callee's answer from the call doc.
                 if (caller && !answerApplied) {
@@ -306,13 +490,17 @@ class CallManager(private val context: Context, private val api: Api) {
                         )
                     }
                 }
-                if (status == "declined" || status == "ended" || status == "missed") {
+                if (status == "declined" || status == "ended" || status == "missed" || status == "failed") {
+                    logCallToChat(status)
                     pc?.close(); pc = null
                     cleanupCall()
                 }
             }
         // Remote description + ICE from the other side.
         candReg?.remove()
+        // Re-read every candidate document: the peer may have been recreated (accept) and
+        // the ones gathered during ringing are still the only path to the other phone.
+        seenCandidates.clear()
         val remoteCol = if (caller) "calleeCandidates" else "callerCandidates"
         candReg = db.collection("calls").document(callId).collection(remoteCol)
             .addSnapshotListener { snap, _ ->
@@ -326,9 +514,9 @@ class CallManager(private val context: Context, private val api: Api) {
 
     @Suppress("UNCHECKED_CAST")
     private fun applyRemoteSignal(data: Map<String, Any?>) {
-        val p = pc ?: return
         when (data["kind"] as? String) {
             "answer" -> {
+                val p = pc ?: return
                 val sdp = data["sdp"] as? String ?: return
                 p.setRemoteDescription(
                     object : SdpObserverBase() {
@@ -340,11 +528,13 @@ class CallManager(private val context: Context, private val api: Api) {
             "candidate" -> {
                 val cand = IceCandidate(
                     data["sdpMid"] as? String,
-                    (data["sdpMLineIndex"] as? Long)?.toInt() ?: 0,
+                    (data["sdpMLineIndex"] as? Long)?.toInt() ?: (data["sdpMLineIndex"] as? Int ?: 0),
                     data["candidate"] as? String ?: return
                 )
-                // Buffer until the offer/answer is set; adding early silently fails otherwise.
-                if (remoteSet) runCatching { p.addIceCandidate(cand) } else pendingCandidates.add(cand)
+                // Buffer until the peer exists and the offer/answer is set: adding early
+                // silently fails, and dropping the candidate loses the connection entirely.
+                val p = pc
+                if (p != null && remoteSet) runCatching { p.addIceCandidate(cand) } else pendingCandidates.add(cand)
             }
         }
     }
@@ -380,37 +570,51 @@ class CallManager(private val context: Context, private val api: Api) {
     private fun createPeer(offer: Boolean) {
         val f = factory ?: return
         remoteSet = false
-        pendingCandidates.clear()
+        // pendingCandidates is deliberately kept: ICE that arrived while the incoming call
+        // was ringing is applied as soon as the answer's remote description lands.
         // STUN alone fails on many carrier NATs, which looked like "calls never connect".
         // A public TURN relay is added so audio/video can get through.
-        val rtc = PeerConnection.RTCConfiguration(
-            listOf(
-                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("turn:openrelay.metered.ca:80")
-                    .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer(),
-                PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443")
-                    .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer()
-            )
-        ).apply {
+        val rtc = PeerConnection.RTCConfiguration(iceServers()).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             iceCandidatePoolSize = 2
+            iceTransportsType = PeerConnection.IceTransportsType.ALL
+            // Keep gathering after the first candidates: on mobile data the first few often
+            // fail and a later pair is what actually connects.
+            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+            rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
         }
         pc = f.createPeerConnection(rtc, object : PeerConnection.Observer {
             override fun onIceCandidate(c: IceCandidate) {
                 sendSignal("candidate", cand = c)
             }
             override fun onTrack(t: RtpTransceiver) {
-                (t.receiver.track() as? VideoTrack)?.let {
-                    currentRemoteTrack = it
-                    onRemote?.invoke(it)
+                val track = t.receiver.track()
+                when (track) {
+                    is VideoTrack -> {
+                        currentRemoteTrack = track
+                        onRemote?.invoke(track)
+                    }
+                    // The remote audio track is never drawn anywhere, but it still has to be
+                    // enabled: an inbound receiver that starts disabled plays nothing at all,
+                    // which is the "call is connected but completely silent" case.
+                    is AudioTrack -> {
+                        runCatching { track.setEnabled(true) }
+                    }
                 }
             }
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState) {
-                onState?.invoke(s.name.lowercase())
+                setLink(s.name.lowercase())
             }
             override fun onSignalingChange(p: PeerConnection.SignalingState) {}
-            override fun onIceConnectionChange(p: PeerConnection.IceConnectionState) {}
+            override fun onIceConnectionChange(p: PeerConnection.IceConnectionState) {
+                // IceConnectionState goes `failed` earlier and more reliably than
+                // PeerConnectionState on a lot of devices, so it feeds the same channel.
+                val s = p.name.lowercase()
+                if (s == "failed" || s == "disconnected" || s == "connected" || s == "completed") {
+                    setLink(if (s == "completed") "connected" else s)
+                }
+            }
             override fun onIceConnectionReceivingChange(b: Boolean) {}
             override fun onIceGatheringChange(p: PeerConnection.IceGatheringState) {}
             override fun onIceCandidatesRemoved(c: Array<IceCandidate>) {}
@@ -425,24 +629,27 @@ class CallManager(private val context: Context, private val api: Api) {
         localAudio = f.createAudioTrack("audio", audio)
         pc!!.addTrack(localAudio)
         if (currentKind == "video") {
-            val egl = EglBase.create()
-            cameraEgl = egl
-            val enumerator = Camera2Enumerator(context)
-            val cameraName = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
-                ?: enumerator.deviceNames.firstOrNull()
-            val capt = cameraName?.let { name -> enumerator.createCapturer(name, null) }
-            if (capt != null) {
-                videoCapturer = capt
-                val helper = SurfaceTextureHelper.create("HL-Cam", egl.eglBaseContext)
-                surfaceTextureHelper = helper
-                val src = f.createVideoSource(false)
-                videoSource = src
-                capt.initialize(helper, context, src.capturerObserver)
-                capt.startCapture(640, 480, 24)
-                localVideo = f.createVideoTrack("video", src)
-                pc!!.addTrack(localVideo)
-                currentLocalTrack = localVideo
-                onLocal?.invoke(localVideo)
+            // A camera that refuses to start (another app holding it, permission revoked
+            // mid-call) must not take the whole call down: fall back to audio only.
+            runCatching {
+                val shared = eglContext ?: throw IllegalStateException("no shared EGL context")
+                val enumerator = Camera2Enumerator(context)
+                val cameraName = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
+                    ?: enumerator.deviceNames.firstOrNull()
+                val capt = cameraName?.let { name -> enumerator.createCapturer(name, null) }
+                if (capt != null) {
+                    videoCapturer = capt
+                    val helper = SurfaceTextureHelper.create("HL-Cam", shared)
+                    surfaceTextureHelper = helper
+                    val src = f.createVideoSource(false)
+                    videoSource = src
+                    capt.initialize(helper, context, src.capturerObserver)
+                    capt.startCapture(640, 480, 24)
+                    localVideo = f.createVideoTrack("video", src)
+                    pc!!.addTrack(localVideo)
+                    currentLocalTrack = localVideo
+                    onLocal?.invoke(localVideo)
+                }
             }
         }
         if (offer) {
@@ -460,5 +667,35 @@ class CallManager(private val context: Context, private val api: Api) {
         override fun onSetSuccess() {}
         override fun onCreateFailure(s: String) {}
         override fun onSetFailure(s: String) {}
+    }
+
+    private fun setLink(state: String) {
+        if (linkState == state) return
+        linkState = state
+        if (state == "connected" || state == "failed") linkWatchdogCall = null
+        onLink?.invoke(state)
+    }
+
+    /**
+     * A picked-up call whose media never arrives must not sit on "Connecting…" forever.
+     * Once the answer is in, ICE gets [LINK_TIMEOUT_MS] to find a working path; after that the
+     * call is ended and logged as one that did not connect, which is the truth.
+     */
+    private fun armLinkWatchdog(callId: String) {
+        if (linkWatchdogCall == callId) return
+        linkWatchdogCall = callId
+        scope.launch {
+            kotlinx.coroutines.delay(LINK_TIMEOUT_MS)
+            if (currentCallId != callId || linkWatchdogCall != callId) return@launch
+            linkWatchdogCall = null
+            runCatching {
+                db.collection("calls").document(callId)
+                    .update(mapOf("status" to "failed", "endedAt" to Timestamp.now())).await()
+            }
+            logCallToChat("failed")
+            setLink("failed")
+            pc?.close(); pc = null
+            cleanupCall()
+        }
     }
 }

@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Status-bar icon for notifications: the SAME chain-link mark as the launcher icon
-  (see ic_launcher_foreground.xml), drawn as a white silhouette so Android can tint
-  it for light/dark status bars. Keeping the two icons identical is what makes the
-  notification read as "HolidayLink" at a glance in the status bar.
+  Status-bar icon for notifications: the HolidayLink "H" mark from the brand logo
+  (res/drawable/holidaylink_icon.png), drawn as a white silhouette so Android can
+  tint it for light and dark status bars.
+
+  A monochrome H is used instead of the full logo because the system only keeps the
+  alpha channel of this drawable: a greyed-down copy of the artwork would collapse
+  into a solid blob at 24dp. The full-colour logo is still shown as the large icon
+  (see Notifier.logo) and as the app icon next to the notification.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
@@ -11,38 +15,18 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Slight upscale so the mark fills more of the tiny status-bar canvas. -->
-    <group
-        android:pivotX="54"
-        android:pivotY="54"
-        android:scaleX="1.25"
-        android:scaleY="1.25">
+    <!-- Left stroke of the H. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M24,30a10,10 0 0 1 10,-10a10,10 0 0 1 10,10v48a10,10 0 0 1 -10,10a10,10 0 0 1 -10,-10z" />
 
-        <group
-            android:pivotX="54"
-            android:pivotY="54"
-            android:rotation="-45">
-            <path
-                android:fillColor="#FFFFFFFF"
-                android:pathData="M41,32h26a9,9 0 0 1 9,9v8a9,9 0 0 1 -9,9h-26a9,9 0 0 1 -9,-9v-8a9,9 0 0 1 9,-9z" />
-        </group>
+    <!-- Right stroke of the H. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M64,30a10,10 0 0 1 10,-10a10,10 0 0 1 10,10v48a10,10 0 0 1 -10,10a10,10 0 0 1 -10,-10z" />
 
-        <group
-            android:pivotX="54"
-            android:pivotY="54"
-            android:rotation="135">
-            <path
-                android:fillColor="#FFFFFFFF"
-                android:pathData="M41,32h26a9,9 0 0 1 9,9v8a9,9 0 0 1 -9,9h-26a9,9 0 0 1 -9,-9v-8a9,9 0 0 1 9,-9z" />
-        </group>
-
-        <group
-            android:pivotX="54"
-            android:pivotY="54"
-            android:rotation="-45">
-            <path
-                android:fillColor="#FFFFFFFF"
-                android:pathData="M47,48h14a4,4 0 0 1 4,4v4a4,4 0 0 1 -4,4h-14a4,4 0 0 1 -4,-4v-4a4,4 0 0 1 4,-4z" />
-        </group>
-    </group>
+    <!-- Crossbar, rounded like the logo's speech-bubble band. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M44,47h20a8,8 0 0 1 0,16h-20a8,8 0 0 1 0,-16z" />
 </vector>

@@ -13,6 +13,10 @@
     <!-- Voice messages: requested when the user taps the microphone, never at launch. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Call audio routing (earpiece vs loudspeaker) and keeping the screen awake in a call. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <!-- App lock with fingerprint / face. -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
@@ -20,6 +24,11 @@
 
     <!-- In-app self-update: lets the downloaded APK reach the system installer. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Saving photos/videos to the gallery on Android 9 and older only. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 

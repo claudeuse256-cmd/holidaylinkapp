@@ -28,6 +28,7 @@ object FirestoreGroups {
         val isCommunity: Boolean,
         val sendMessagesAdminsOnly: Boolean,
         val editInfoAdminsOnly: Boolean,
+        val addMembersAdminsOnly: Boolean,
         val approveNewMembers: Boolean
     ) {
         fun isAdmin(uid: String): Boolean = admins.contains(uid) || createdBy == uid
@@ -78,6 +79,7 @@ object FirestoreGroups {
             isCommunity = d["isCommunity"] == true,
             sendMessagesAdminsOnly = settings["sendMessagesAdminsOnly"] == true,
             editInfoAdminsOnly = settings["editInfoAdminsOnly"] == true,
+            addMembersAdminsOnly = settings["addMembersAdminsOnly"] == true,
             approveNewMembers = settings["approveNewMembers"] == true
         )
     }

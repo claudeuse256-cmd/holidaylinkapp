@@ -107,7 +107,7 @@ fun SearchScreen(
                 if (!name.lowercase().contains(needle) && !username.lowercase().contains(needle)) return@mapNotNull null
                 User(
                     id = d.id, displayName = name, username = username,
-                    avatarUrl = d.getString("profilePic"), online = d.getBoolean("online") == true
+                    avatarUrl = d.getString("profilePic"), online = FirebaseBackend.snapshotOnline(d)
                 )
             }.take(20)
             val chatDocs = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().await()

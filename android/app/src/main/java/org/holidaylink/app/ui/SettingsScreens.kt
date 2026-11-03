@@ -2,9 +2,11 @@
 
 package org.holidaylink.app.ui
 
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -31,9 +33,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.AlternateEmail
+import androidx.compose.material.icons.filled.Animation
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Brightness6
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DarkMode
@@ -90,6 +94,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.messaging.FirebaseMessaging
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -101,6 +110,7 @@ import org.holidaylink.app.data.DisappearingDuration
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.CloudSettingsBackup
 import org.holidaylink.app.net.safeTimestamp
+import org.holidaylink.app.net.awaitOrNull
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Audience
 import org.holidaylink.app.net.DeviceSession
@@ -108,9 +118,11 @@ import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestorePrefs
 import org.holidaylink.app.net.Me
 import org.holidaylink.app.net.NotificationSettings
+import org.holidaylink.app.net.Notifier
 import org.holidaylink.app.net.PrivacySettings
 import org.holidaylink.app.net.StatusAudience
 import org.holidaylink.app.net.StudyBuddy
+import org.holidaylink.app.push.PushTokens
 import org.holidaylink.app.ui.theme.ChatDensity
 import org.holidaylink.app.ui.theme.ThemeMode
 
@@ -125,6 +137,7 @@ fun SettingsScaffold(
     content: @Composable () -> Unit
 ) {
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(
                 title = { Text(title) },
@@ -255,6 +268,7 @@ fun SettingsHub(
         SettingsSection("Preferences") {
             SettingsNavRow("Notifications", Icons.Default.Notifications, "Messages, calls, status, AI", onClick = { onOpen(SettingsRoute.Notifications) })
             SettingsNavRow("Appearance", Icons.Default.Palette, "Theme, text size, wallpaper", onClick = { onOpen(SettingsRoute.Appearance) })
+            SettingsNavRow("Animations", Icons.Default.Animation, "Pick a screen transition and preview it", onClick = { onOpen(SettingsRoute.Animations) })
             SettingsNavRow("Data and storage", Icons.Default.Storage, "Storage, cache, downloads", onClick = { onOpen(SettingsRoute.DataStorage) })
             SettingsNavRow("Language", Icons.Default.Language, "App language", onClick = { onOpen(SettingsRoute.Language) })
             SettingsNavRow("Chats", Icons.Default.Groups, "Chat wallpaper and defaults", onClick = { onOpen(SettingsRoute.ChatSettings) })
@@ -471,14 +485,14 @@ fun PrivacyScreen(api: Api, onBack: () -> Unit) {
                     SettingsSwitchRow(
                         title = "Read receipts",
                         icon = Icons.Default.DoneAll,
-                        subtitle = "Let others see when you've read their messages",
+                        subtitle = "Blue ticks both ways. Off means you send none and see none.",
                         checked = current.readReceipts,
                         onCheckedChange = { push(current.copy(readReceipts = it)) }
                     )
                     SettingsSwitchRow(
                         title = "Typing indicators",
                         icon = Icons.Default.TextFields,
-                        subtitle = "Show others when you're typing",
+                        subtitle = "\"typing…\" both ways. Off means you send none and see none.",
                         checked = current.typingIndicators,
                         onCheckedChange = { push(current.copy(typingIndicators = it)) }
                     )
@@ -969,6 +983,47 @@ fun BlockedScreen(api: Api, onBack: () -> Unit) {
 
 // ==================================================================== notifications
 
+/** Whether this phone's token is on the account, i.e. whether pushes can reach it at all. */
+private data class PushStatus(val registered: Boolean, val devices: Int)
+
+private fun isAlertChannelHigh(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
+    val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return true
+    val channel = nm.getNotificationChannel(Notifier.CHANNEL_MESSAGES) ?: return true
+    return channel.importance >= NotificationManager.IMPORTANCE_HIGH
+}
+
+private fun openAlertChannelSettings(context: Context) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+        openAppSettings(context)
+        return
+    }
+    val opened = runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                .putExtra(Settings.EXTRA_CHANNEL_ID, Notifier.CHANNEL_MESSAGES)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }.isSuccess
+    if (!opened) openAppSettings(context)
+}
+
+/** Compares this device's current FCM token with the tokens saved on the signed-in account. */
+private suspend fun readPushStatus(): PushStatus? {
+    val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return null
+    val token = runCatching { FirebaseMessaging.getInstance().token.awaitOrNull(8_000) }.getOrNull()
+        ?: return PushStatus(registered = false, devices = 0)
+    val doc = runCatching {
+        FirebaseBackend.db.collection("users").document(uid).get().awaitOrNull()
+    }.getOrNull() ?: return null
+    val tokens = (doc.get("fcmTokens") as? List<*>)
+        ?.mapNotNull { it as? String }
+        ?.filter { it.isNotBlank() }
+        .orEmpty()
+    return PushStatus(registered = token in tokens, devices = tokens.size)
+}
+
 @Composable
 fun NotificationsSettingsScreen(api: Api, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -977,10 +1032,27 @@ fun NotificationsSettingsScreen(api: Api, onBack: () -> Unit) {
     var settings by remember { mutableStateOf<NotificationSettings?>(null) }
     var loading by remember { mutableStateOf(true) }
     var osAllowed by remember { mutableStateOf(hasNotificationPermission(context)) }
+    var channelHigh by remember { mutableStateOf(isAlertChannelHigh(context)) }
+    var pushStatus by remember { mutableStateOf<PushStatus?>(null) }
+    var checking by remember { mutableStateOf(false) }
+
+    suspend fun refreshDeviceChecks() {
+        checking = true
+        osAllowed = hasNotificationPermission(context)
+        channelHigh = isAlertChannelHigh(context)
+        pushStatus = readPushStatus()
+        checking = false
+    }
 
     LaunchedEffect(Unit) {
         settings = runCatching { FirestorePrefs.loadNotif() }.getOrNull()
         loading = false
+    }
+
+    // The permission and the channel importance both live in Android settings, so the
+    // checks have to be re-read every time the user comes back from that screen.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        scope.launch { refreshDeviceChecks() }
     }
 
     fun push(next: NotificationSettings) {
@@ -998,6 +1070,7 @@ fun NotificationsSettingsScreen(api: Api, onBack: () -> Unit) {
 
     SettingsScaffold("Notifications", onBack, snackbar) {
         val current = settings ?: NotificationSettings()
+        val deviceStatus = pushStatus
         Column(Modifier.padding(bottom = 30.dp)) {
             if (!osAllowed) {
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
@@ -1010,6 +1083,54 @@ fun NotificationsSettingsScreen(api: Api, onBack: () -> Unit) {
                     OutlinedButton(onClick = { openAppSettings(context) }) {
                         Text("Open Android notification settings")
                     }
+                }
+            }
+
+            SettingsSection("This device") {
+                SettingsValueRow(
+                    title = "Android notifications",
+                    icon = Icons.Default.Notifications,
+                    value = if (osAllowed) "Allowed" else "Blocked"
+                ) { openAppSettings(context) }
+                SettingsDivider()
+                SettingsValueRow(
+                    title = "Alert channel",
+                    icon = Icons.Default.NotificationsActive,
+                    value = if (channelHigh) "High" else "Lowered"
+                ) { openAlertChannelSettings(context) }
+                SettingsDivider()
+                SettingsValueRow(
+                    title = "Push registration",
+                    icon = Icons.Default.CloudDownload,
+                    value = when {
+                        checking && deviceStatus == null -> "Checking"
+                        deviceStatus?.registered == true && deviceStatus.devices > 1 -> "Registered (${deviceStatus.devices})"
+                        deviceStatus?.registered == true -> "Registered"
+                        else -> "Not registered"
+                    }
+                ) {
+                    // Forces a fresh FCM token and re-saves it on the account row, which is
+                    // what makes pushes arrive while the app is closed.
+                    scope.launch {
+                        PushTokens.register()
+                        delay(1500)
+                        refreshDeviceChecks()
+                        snackbar.showSnackbar("This device is registered for push.")
+                    }
+                }
+                SettingsDivider()
+                SettingsNavRow(
+                    title = "Send a test alert",
+                    icon = Icons.Default.Notifications,
+                    subtitle = "Shows the HolidayLink logo and sound. Close the app afterwards to see it arrive."
+                ) {
+                    Notifier.message(
+                        context,
+                        990_001,
+                        "HolidayLink",
+                        "This is how a new message will look on your phone."
+                    )
+                    scope.launch { snackbar.showSnackbar("Test alert sent — check your notification shade.") }
                 }
             }
 
@@ -1179,10 +1300,65 @@ fun AppearanceScreen(onBack: () -> Unit) {
                         onClick = { AppSettings.setChatWallpaper(null) }
                     )
                 }
+
+                // The background actually in use, rendered live. A photo picked from the
+                // device used to be applied with no preview and no way to dim it, because
+                // the brightness slider only lived inside the preset gallery.
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                    Box(Modifier.fillMaxWidth().height(140.dp).clip(RoundedCornerShape(16.dp))) {
+                        ChatWallpaper(
+                            uri = settings.chatWallpaper,
+                            solid = settings.chatWallpaperSolid,
+                            preset = settings.chatWallpaperPreset,
+                            modifier = Modifier.matchParentSize()
+                        )
+                        Column(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                "Their messages look like this",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                Text(
+                                    "Yours look like this",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(MaterialTheme.colorScheme.primaryContainer)
+                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                    }
+                    Text(
+                        "Brightness",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Slider(
+                        value = settings.wallpaperBrightness,
+                        onValueChange = { AppSettings.setWallpaperBrightness(it) },
+                        valueRange = 0.35f..1f,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "Lower brightness darkens the background so messages stay readable.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
                 Text(
-                    "The background chosen here is the default for every chat. " +
-                        "Any conversation can have its own background — open the chat and " +
-                        "use the ⋮ menu.",
+                    "This background is used inside your chats and groups. The rest of the app " +
+                        "keeps its plain background. A single conversation can have its own: " +
+                        "open the chat, tap its name at the top, then choose Chat background.",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
@@ -1218,8 +1394,8 @@ fun AppearanceScreen(onBack: () -> Unit) {
             onDismiss = { wallpaperGallery = false },
             extra = {
                 Text(
-                    "This is the default for every chat. A single chat can have its own " +
-                        "background from the ⋮ menu inside the conversation.",
+                    "This background is used inside your chats and groups. A single chat can " +
+                        "have its own from its profile page (tap the chat's name at the top).",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1262,6 +1438,122 @@ private fun persistUriPermission(context: Context, uri: Uri) {
             uri,
             Intent.FLAG_GRANT_READ_URI_PERMISSION
         )
+    }
+}
+
+// ==================================================================== animations
+
+/**
+ * Screen transition picker.
+ *
+ * One preview plays at a time — twenty looping cards would keep the GPU busy for nothing — and it
+ * runs the very same code the app uses when you move between screens, so what you see is what you
+ * get. Nothing is applied until "Use this transition" is tapped.
+ */
+@Composable
+fun AnimationsScreen(onBack: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
+    val settings = AppSettings.state
+    val applied = NavTransition.fromId(settings.transitionStyle)
+    var previewing by remember { mutableStateOf(applied) }
+
+    SettingsScaffold("Animations", onBack, snackbar) {
+        Column(Modifier.padding(bottom = 30.dp)) {
+            SettingsSection("Playback") {
+                SettingsSwitchRow(
+                    title = "Animations",
+                    icon = Icons.Default.Animation,
+                    subtitle = if (settings.animationsEnabled) {
+                        "Transitions play when you move between screens"
+                    } else {
+                        "Off: every screen change is instant"
+                    },
+                    checked = settings.animationsEnabled,
+                    onCheckedChange = { AppSettings.setAnimations(it) }
+                )
+            }
+
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Text(
+                    previewing.label,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    previewing.description(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(10.dp))
+                NavTransitionPreview(
+                    transition = if (settings.animationsEnabled) previewing else NavTransition.NONE,
+                    modifier = Modifier.fillMaxWidth().height(160.dp)
+                )
+                Spacer(Modifier.height(14.dp))
+                Button(
+                    onClick = {
+                        AppSettings.setTransitionStyle(previewing.id)
+                        scope.launch {
+                            snackbar.showSnackbar(
+                                if (previewing == NavTransition.NONE) "Screens now change instantly."
+                                else "${previewing.label} is your screen transition."
+                            )
+                        }
+                    },
+                    enabled = settings.animationsEnabled && previewing != applied
+                ) {
+                    Text(
+                        when {
+                            !settings.animationsEnabled -> "Turn animations on first"
+                            previewing == applied -> "In use"
+                            else -> "Use this transition"
+                        }
+                    )
+                }
+            }
+
+            NavTransition.entries.groupBy { it.group }.forEach { (group, styles) ->
+                SettingsSection(group) {
+                    styles.forEachIndexed { index, style ->
+                        if (index > 0) SettingsDivider()
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .selectable(
+                                    selected = style == previewing,
+                                    onClick = { previewing = style }
+                                )
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(style.label, style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    style.description(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            if (style == applied) {
+                                Icon(
+                                    Icons.Default.CheckCircle,
+                                    contentDescription = "In use",
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            } else if (style == previewing) {
+                                Icon(
+                                    Icons.Default.RadioButtonChecked,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1591,7 +1883,7 @@ fun ChatSettingsScreen(api: Api, onBack: () -> Unit) {
                 SettingsSwitchRow(
                     title = "Read receipts",
                     icon = Icons.Default.DoneAll,
-                    subtitle = "Let other people see when you've read their messages",
+                    subtitle = "Blue ticks both ways. Off means you send none and see none.",
                     checked = settings.readReceipts,
                     onCheckedChange = {
                         AppSettings.setReadReceipts(it)
@@ -1608,7 +1900,7 @@ fun ChatSettingsScreen(api: Api, onBack: () -> Unit) {
                 SettingsSwitchRow(
                     title = "Typing indicators",
                     icon = Icons.Default.TextFields,
-                    subtitle = "Show others when you're typing",
+                    subtitle = "\"typing…\" both ways. Off means you send none and see none.",
                     checked = settings.typingIndicators,
                     onCheckedChange = {
                         AppSettings.setTypingIndicators(it)

@@ -6,7 +6,10 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,8 +25,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Message
+import androidx.compose.material.icons.filled.AlternateEmail
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.Lock
@@ -49,12 +57,14 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.safeTimestamp
@@ -76,7 +86,8 @@ fun UserProfileScreen(
     user: User,
     onBack: () -> Unit,
     onOpenChat: (User) -> Unit,
-    onStartCall: (User, String) -> Unit
+    onStartCall: (User, String) -> Unit,
+    onOpenScheduled: (String, String) -> Unit = { _, _ -> }
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
@@ -89,6 +100,7 @@ fun UserProfileScreen(
     var confirmReport by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var viewerUrl by remember { mutableStateOf<String?>(null) }
+    var muted by remember { mutableStateOf(false) }
 
     suspend fun reload() {
         try {
@@ -108,7 +120,7 @@ fun UserProfileScreen(
                 avatarUrl = snap.getString("profilePic"),
                 about = snap.getString("bio"),
                 phone = snap.getString("phone"),
-                online = snap.getBoolean("online"),
+                online = FirebaseBackend.snapshotOnline(snap),
                 lastSeen = snap.safeTimestamp("lastSeen")?.toDate()?.toInstant()?.toString(),
                 isBlocked = myBlocked.contains(user.id),
                 blockedByThem = theirBlocked.contains(me)
@@ -141,12 +153,25 @@ fun UserProfileScreen(
         else ref.update("blocked", com.google.firebase.firestore.FieldValue.arrayRemove(user.id)).await()
     }
 
-    LaunchedEffect(user.id) { reload() }
+    suspend fun directChatId(peerId: String): String? = runCatching {
+        val me = FirebaseBackend.uid.orEmpty()
+        FirebaseBackend.db.collection("chats").whereArrayContains("users", me).limit(60).get().await()
+            .documents.firstOrNull { d ->
+                d.getBoolean("isGroup") != true &&
+                    ((d.get("users") as? List<*>)?.filterIsInstance<String>()?.contains(peerId) == true)
+            }?.id
+    }.getOrNull()
+
+    LaunchedEffect(user.id) {
+        reload()
+        runCatching { directChatId(user.id) }.getOrNull()?.let { muted = AppSettings.isChatMuted(it) }
+    }
 
     val shown = profile
     val blocked = shown?.isBlocked == true
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(
                 title = { Text("Profile") },
@@ -170,100 +195,62 @@ fun UserProfileScreen(
                     .padding(padding)
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp)
             ) {
-                Spacer(Modifier.height(20.dp))
-                Avatar(
+                ProfileHero(
                     name = shown.displayName,
-                    photo = shown.avatarUrl,
-                    size = 108.dp,
-                    onClick = { shown.avatarUrl?.takeIf { it.isNotBlank() }?.let { viewerUrl = it } }
-                )
-                Spacer(Modifier.height(14.dp))
-                Text(
-                    shown.displayName,
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (!shown.username.isNullOrBlank()) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "@${shown.username}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-
-                Spacer(Modifier.height(10.dp))
-                val trulyOnline = shown.online == true && runCatching {
-                    val ms = shown.lastSeen?.let { java.time.Instant.parse(it).toEpochMilli() }
-                    ms == null || System.currentTimeMillis() - ms < 5 * 60 * 1000L
-                }.getOrDefault(false)
-                Text(
-                    when {
+                    username = shown.username,
+                    avatarUrl = shown.avatarUrl,
+                    status = when {
                         shown.blockedByThem -> "You can't see their details while you're blocked"
-                        trulyOnline -> "Online now"
-                        else -> shown.lastSeen?.let { "Last seen ${friendlyWhen(it)}" } ?: "Last seen hidden"
+                        trulyOnline(shown) -> "Online"
+                        else -> shown.lastSeen?.let { "Last seen ${friendlyWhen(it)}" } ?: "Last seen recently"
                     },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
+                    onAvatar = { shown.avatarUrl?.takeIf { it.isNotBlank() }?.let { viewerUrl = it } }
                 )
 
-                if (!shown.about.isNullOrBlank()) {
-                    Spacer(Modifier.height(18.dp))
-                    Text(
-                        shown.about,
-                        style = MaterialTheme.typography.bodyLarge,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                // Three round actions, Telegram-style, centred under the photo.
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 18.dp, bottom = 6.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.Top
+                ) {
+                    ProfileAction(Icons.AutoMirrored.Filled.Message, "Message", !blocked && !shown.blockedByThem && !busy) { onOpenChat(user) }
+                    Spacer(Modifier.width(18.dp))
+                    ProfileAction(Icons.Default.Call, "Audio", !blocked && !shown.blockedByThem && !busy) { onStartCall(user, "audio") }
+                    Spacer(Modifier.width(18.dp))
+                    ProfileAction(Icons.Default.Videocam, "Video", !blocked && !shown.blockedByThem && !busy) { onStartCall(user, "video") }
                 }
 
-                Spacer(Modifier.height(24.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = { onOpenChat(user) },
-                        enabled = !blocked && !shown.blockedByThem && !busy,
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                        modifier = Modifier.weight(1f).heightIn(min = 64.dp)
+                Spacer(Modifier.height(14.dp))
+                SettingsSection("About") {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.Top
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.AutoMirrored.Filled.Message, null, Modifier.size(19.dp))
-                            Text("Message", maxLines = 1, softWrap = false, fontSize = 12.sp)
-                        }
-                    }
-                    OutlinedButton(
-                        onClick = { onStartCall(user, "audio") },
-                        enabled = !blocked && !shown.blockedByThem && !busy,
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                        modifier = Modifier.weight(1f).heightIn(min = 64.dp)
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.Default.Call, null, Modifier.size(19.dp))
-                            Text("Audio", maxLines = 1, softWrap = false, fontSize = 12.sp)
-                        }
-                    }
-                    OutlinedButton(
-                        onClick = { onStartCall(user, "video") },
-                        enabled = !blocked && !shown.blockedByThem && !busy,
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                        modifier = Modifier.weight(1f).heightIn(min = 64.dp)
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.Default.Videocam, null, Modifier.size(19.dp))
-                            Text("Video", maxLines = 1, softWrap = false, fontSize = 12.sp)
-                        }
+                        Icon(
+                            Icons.Default.Info,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.width(16.dp))
+                        Text(
+                            shown.about?.takeIf { it.isNotBlank() } ?: "No bio yet.",
+                            style = MaterialTheme.typography.bodyLarge
+                        )
                     }
                 }
 
-                Spacer(Modifier.height(26.dp))
+                Spacer(Modifier.height(18.dp))
                 SettingsSection("Contact details") {
+                    if (!shown.username.isNullOrBlank()) {
+                        SettingsValueRow(
+                            title = "Username",
+                            icon = Icons.Default.AlternateEmail,
+                            value = "@${shown.username}"
+                        ) { copyToClipboard(context, "@${shown.username}", snackbar, scope, "Username copied") }
+                        SettingsDivider()
+                    }
                     val visiblePhone = shown.phone
                     if (!visiblePhone.isNullOrBlank()) {
                         SettingsValueRow(
@@ -271,11 +258,15 @@ fun UserProfileScreen(
                             icon = Icons.Default.Call,
                             value = PhoneNumbers.mask(visiblePhone)
                         ) { openDialer(context, visiblePhone) }
+                        SettingsDivider()
+                        SettingsNavRow(
+                            title = "Copy phone number",
+                            icon = Icons.Default.ContentCopy,
+                            subtitle = PhoneNumbers.mask(visiblePhone)
+                        ) { copyToClipboard(context, visiblePhone, snackbar, scope, "Phone number copied") }
                     } else {
                         Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 13.dp),
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 13.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
@@ -294,7 +285,36 @@ fun UserProfileScreen(
                     }
                 }
 
-                Spacer(Modifier.height(20.dp))
+                Spacer(Modifier.height(18.dp))
+                SettingsSection("Notifications") {
+                    SettingsSwitchRow(
+                        title = "Mute notifications",
+                        icon = if (muted) Icons.Default.NotificationsOff else Icons.Default.Notifications,
+                        subtitle = if (muted) "You won't be alerted about new messages" else "Message alerts are on",
+                        checked = muted,
+                        onCheckedChange = { want ->
+                            muted = want
+                            scope.launch {
+                                val chatId = directChatId(user.id)
+                                if (chatId != null) AppSettings.setChatMuted(chatId, want)
+                                else snackbar.showSnackbar("Open a chat with ${shown.displayName} first.")
+                            }
+                        }
+                    )
+                }
+
+                Spacer(Modifier.height(18.dp))
+                val chatId = org.holidaylink.app.net.FirestoreChat.directId(
+                    FirebaseBackend.uid.orEmpty(),
+                    user.id
+                )
+                ChatExtrasSection(
+                    chatId = chatId,
+                    chatLabel = shown.displayName,
+                    onOpenScheduled = { onOpenScheduled(chatId, shown.displayName) }
+                )
+
+                Spacer(Modifier.height(18.dp))
                 SettingsSection("Safety") {
                     SettingsNavRow(
                         title = if (blocked) "Unblock ${shown.displayName}" else "Block ${shown.displayName}",
@@ -386,6 +406,106 @@ fun UserProfileScreen(
     viewerUrl?.let { url ->
         PhotoViewer(url = url, title = shown?.displayName.orEmpty(), onDismiss = { viewerUrl = null })
     }
+}
+
+/** Telegram-style header: tinted band, large photo, name, handle and presence. */
+@Composable
+private fun ProfileHero(
+    name: String,
+    username: String?,
+    avatarUrl: String?,
+    status: String,
+    onAvatar: () -> Unit
+) {
+    val scheme = MaterialTheme.colorScheme
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .background(
+                androidx.compose.ui.graphics.Brush.verticalGradient(
+                    listOf(scheme.primary.copy(alpha = 0.16f), scheme.surface.copy(alpha = 0f))
+                )
+            )
+            .padding(top = 18.dp, bottom = 6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Avatar(name = name, photo = avatarUrl, size = 104.dp, onClick = onAvatar)
+            Spacer(Modifier.height(12.dp))
+            Text(
+                name,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+            if (!username.isNullOrBlank()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "@$username",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = scheme.primary
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                status,
+                style = MaterialTheme.typography.bodySmall,
+                color = scheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProfileAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val scheme = MaterialTheme.colorScheme
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(84.dp)) {
+        Box(
+            Modifier
+                .size(52.dp)
+                .clip(androidx.compose.foundation.shape.CircleShape)
+                .background(scheme.primary.copy(alpha = if (enabled) 0.12f else 0.06f))
+                .then(if (enabled) Modifier.clickable { onClick() } else Modifier),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                icon,
+                contentDescription = label,
+                tint = if (enabled) scheme.primary else scheme.onSurfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.size(23.dp)
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (enabled) scheme.onSurface else scheme.onSurfaceVariant.copy(alpha = 0.6f)
+        )
+    }
+}
+
+private fun trulyOnline(p: Profile): Boolean = p.online == true && runCatching {
+    val ms = p.lastSeen?.let { java.time.Instant.parse(it).toEpochMilli() }
+    ms == null || System.currentTimeMillis() - ms < 5 * 60 * 1000L
+}.getOrDefault(false)
+
+private fun copyToClipboard(
+    context: Context,
+    text: String,
+    snackbar: SnackbarHostState,
+    scope: kotlinx.coroutines.CoroutineScope,
+    message: String
+) {
+    runCatching {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        cm?.setPrimaryClip(android.content.ClipData.newPlainText("HolidayLink", text))
+    }
+    scope.launch { snackbar.showSnackbar(message) }
 }
 
 /**

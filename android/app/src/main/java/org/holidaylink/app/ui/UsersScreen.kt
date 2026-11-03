@@ -3,12 +3,11 @@ package org.holidaylink.app.ui
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -35,7 +34,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -46,6 +44,7 @@ import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.User
+import org.holidaylink.app.net.awaitOrNull
 import org.holidaylink.app.phone.ContactMatcher
 import org.holidaylink.app.phone.DeviceContacts
 import org.holidaylink.app.phone.PhoneNumbers
@@ -95,12 +94,16 @@ fun UsersScreen(
             val foundIds = mutableSetOf<String>()
             for (chunk in deviceNumbers.chunked(10)) {
                 if (chunk.isEmpty()) continue
-                val snap = FirebaseBackend.db.collection("users").whereIn("phone", chunk).get().await()
+                // Bounded waits: offline this used to spin on the cache forever and the
+                // screen never left the loading state.
+                val snap = FirebaseBackend.db.collection("users").whereIn("phone", chunk)
+                    .get().awaitOrNull(8_000) ?: continue
                 snap.documents.forEach { foundIds.add(it.id) }
             }
             contactIds = foundIds
 
-            val dir = FirebaseBackend.db.collection("users").limit(300).get().await()
+            val dir = FirebaseBackend.db.collection("users").limit(300).get().awaitOrNull(12_000)
+                ?: throw IllegalStateException("offline")
             val all = dir.documents.filter { it.id != uid }.mapNotNull { d ->
                 val name = d.getString("name").orEmpty()
                 if (name.isBlank()) return@mapNotNull null
@@ -115,8 +118,9 @@ fun UsersScreen(
                     lastSeen = seenMs?.let { java.time.Instant.ofEpochMilli(it).toString() }
                 )
             }
-            val chatDocs = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().await()
-            val directPeers = chatDocs.documents
+            val chatDocList = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid)
+                .get().awaitOrNull(12_000)?.documents.orEmpty()
+            val directPeers = chatDocList
                 .filter { it.getBoolean("isGroup") != true }
                 .mapNotNull { doc ->
                     ((doc.get("users") as? List<String>) ?: emptyList()).firstOrNull { it != uid }
@@ -124,7 +128,7 @@ fun UsersScreen(
             friendIds = directPeers
             // Common ground: how many groups/channels/communities share each user.
             val counts = mutableMapOf<String, Int>()
-            chatDocs.documents
+            chatDocList
                 .filter { it.getBoolean("isGroup") == true }
                 .forEach { doc ->
                     val members = ((doc.get("members") as? List<String>)
@@ -162,30 +166,50 @@ fun UsersScreen(
         }
     }.sortedWith(compareByDescending<User> { rankScore(it) }.thenBy { it.displayName.lowercase() })
 
-    Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Users", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
-            Button(onClick = { showDevice = true }) { Icon(Icons.Default.Contacts, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Phone contacts") }
-        }
-        OutlinedTextField(value = query, onValueChange = { query = it }, placeholder = { Text("Search people") },
-            leadingIcon = { Icon(Icons.Default.PersonSearch, null) }, singleLine = true, shape = RoundedCornerShape(24.dp),
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("All", "Contacts", "Friends").forEach { f -> FilterChip(selected = filter == f, onClick = { filter = f }, label = { Text(f) }) }
+    if (!loading && users.isNotEmpty()) PeopleLoadState.loadedOnce = true
+
+    // The title, search and filters are the list's first item, so they scroll away with the
+    // people instead of collapsing on a scroll listener — same as the Chats tab.
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = floatingNavBottomPadding()
+    ) {
+        item(key = "users-header") {
+            Column(Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Users", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+                    Button(onClick = { showDevice = true }) { Icon(Icons.Default.Contacts, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Phone contacts") }
+                }
+                OutlinedTextField(value = query, onValueChange = { query = it }, placeholder = { Text("Search people") },
+                    leadingIcon = { Icon(Icons.Default.PersonSearch, null) }, singleLine = true, shape = RoundedCornerShape(24.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("All", "Contacts", "Friends").forEach { f -> FilterChip(selected = filter == f, onClick = { filter = f }, label = { Text(f) }) }
+                }
+            }
         }
         when {
-            loading -> LoadingState(label = "Loading people…")
-            error.isNotBlank() && users.isEmpty() -> ErrorState(error) { reload++ }
-            filtered.isEmpty() -> EmptyState(icon = Icons.Default.PersonSearch, title = "Nobody found", subtitle = "Try another name or open phone contacts.")
-            else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
-                items(filtered, key = { it.id }) { u ->
-                    WhatsAppUserRow(user = u, isContact = contactIds.contains(u.id), isFriend = friendIds.contains(u.id),
-                        mutual = mutualCount[u.id] ?: 0, onOpen = { onOpenProfile(u) }, onMessage = { onOpenChat(u) })
-                }
+            loading && users.isEmpty() && !PeopleLoadState.loadedOnce -> item(key = "users-skeleton") {
+                LoadingState(Modifier.heightIn(min = 420.dp), label = "Loading people…")
+            }
+            error.isNotBlank() && users.isEmpty() -> item(key = "users-error") {
+                ErrorState(error, Modifier.heightIn(min = 420.dp)) { reload++ }
+            }
+            filtered.isEmpty() -> item(key = "users-empty") {
+                EmptyState(icon = Icons.Default.PersonSearch, title = "Nobody found",
+                    subtitle = "Try another name or open phone contacts.",
+                    modifier = Modifier.heightIn(min = 420.dp))
+            }
+            else -> items(filtered, key = { it.id }) { u ->
+                WhatsAppUserRow(user = u, isContact = contactIds.contains(u.id), isFriend = friendIds.contains(u.id),
+                    mutual = mutualCount[u.id] ?: 0, onOpen = { onOpenProfile(u) }, onMessage = { onOpenChat(u) })
             }
         }
     }
 }
+
+/** The people list only shows its skeleton once per launch. */
+private object PeopleLoadState { var loadedOnce = false }
 
 @Composable
 private fun WhatsAppUserRow(

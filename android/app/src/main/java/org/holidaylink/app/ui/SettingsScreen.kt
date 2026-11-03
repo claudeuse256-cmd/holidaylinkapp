@@ -19,6 +19,7 @@ enum class SettingsRoute {
     Blocked,
     Notifications,
     Appearance,
+    Animations,
     DataStorage,
     Language,
     ChatSettings,
@@ -80,6 +81,9 @@ fun SettingsHost(
         SettingsRoute.Appearance ->
             AppearanceScreen(onBack = onBack)
 
+        SettingsRoute.Animations ->
+            AnimationsScreen(onBack = onBack)
+
         SettingsRoute.DataStorage ->
             DataStorageScreen(onBack = onBack)
 
@@ -129,8 +133,8 @@ private val HELP_TEXT = """
 
     1. Sign in with your phone number. HolidayLink checks the account first, then uses 2FA password login when enabled or SMS verification when needed.
     2. Chats is your home. Open Contacts to start conversations with people you already know.
-    3. Only one-way hashes of your contacts' numbers are sent for matching. Names, photos and
-       numbers stay on this phone.
+    3. Contact matching looks your contacts' phone numbers up against registered accounts. Their
+       names and photos are never uploaded, and matching is optional.
 
     If something looks wrong
 
@@ -165,7 +169,8 @@ private val PRIVACY_TEXT = """
     What HolidayLink does not do
 
     • It never sells your data.
-    • It never sends your contacts' names, photos or numbers to the server.
+    • It never sends your contacts' names or photos to the server. Their numbers are looked up
+      only if you allow contact matching.
     • Gemini credentials are never placed on your device. HolidayLink AI runs on HolidayLink's
       own servers and only the messages you type into the assistant are sent there.
 
@@ -177,8 +182,9 @@ private val PRIVACY_TEXT = """
 
     Contact matching
 
-    Only a SHA-256 hash of each contact number is uploaded. Names, photos and raw numbers never
-    leave the device, and the server cannot reverse a hash back into a phone number.
+    To show which of your contacts already use HolidayLink, the app looks up their phone numbers
+    against registered accounts. Their names and photos are never uploaded, and matching is
+    optional — you can skip it and use the rest of the app normally.
 
     Encryption
 

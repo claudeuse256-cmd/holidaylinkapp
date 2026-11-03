@@ -13,6 +13,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -80,6 +82,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,6 +93,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -105,19 +109,23 @@ import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.holidaylink.app.config.AppConfig
 import org.holidaylink.app.data.AppSettings
 import org.holidaylink.app.data.AccountStore
+import org.holidaylink.app.data.ProfileCache
 import org.holidaylink.app.net.Api
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.AccountSession
 import org.holidaylink.app.net.AnnouncementNotifier
 import org.holidaylink.app.net.safeTimestamp
+import org.holidaylink.app.net.awaitOrNull
 import kotlinx.coroutines.tasks.await
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestoreChat
 import org.holidaylink.app.net.CallManager
 import org.holidaylink.app.ui.CallScreen
+import org.holidaylink.app.ui.MinimizedCallBar
 import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.Me
 import org.holidaylink.app.net.Notifier
@@ -163,6 +171,12 @@ import org.holidaylink.app.ui.Avatar
 import org.holidaylink.app.ui.LoadingState
 import org.holidaylink.app.ui.EmptyState
 import org.holidaylink.app.ui.ErrorState
+import org.holidaylink.app.ui.floatingNavBottomPadding
+import org.holidaylink.app.ui.ChatLockScreen
+import org.holidaylink.app.ui.ScheduledMessagesScreen
+import org.holidaylink.app.ui.NavTransitionHost
+import org.holidaylink.app.ui.navTransitionOrNone
+import org.holidaylink.app.ui.InAppAlertHost
 
 /**
  * FragmentActivity, not ComponentActivity: the app-lock gate and Settings use
@@ -183,6 +197,11 @@ class MainActivity : FragmentActivity() {
         // Presence is tied to the visible app: the moment we leave the screen we go offline
         // so the server stops treating this phone as "already reading" and pushes instead.
         org.holidaylink.app.net.AppPresence.onForeground()
+        // Coming back from Settings, a reboot, or "clear all" wipes the ongoing card, so put
+        // the cached announcement back straight away instead of waiting on Firestore.
+        if (FirebaseBackend.uid?.isNotBlank() == true) {
+            AnnouncementNotifier.repost(this)
+        }
     }
 
     override fun onStop() {
@@ -250,6 +269,7 @@ private sealed interface Destination {
     data class WebFeature(val title: String, val url: String) : Destination
     data object FeatureHub : Destination
     data class Status(val startWithComposer: Boolean = false) : Destination
+    data class ScheduledMessages(val chatId: String, val chatLabel: String) : Destination
     data object Store : Destination
     data object Feed : Destination
     data object Quizzes : Destination
@@ -344,6 +364,9 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
             }
 
             Box(Modifier.fillMaxSize()) {
+                // No wallpaper here on purpose. A background is a property of a conversation,
+                // so ChatScreen draws its own; every other screen sits on the plain theme
+                // background rather than showing chat artwork behind Settings and the hubs.
                 when {
                     banMsg != null -> BannedScreen(message = banMsg, onSwitchNumber = {
                         FirebaseBackend.signOut()
@@ -413,7 +436,11 @@ private fun SignedInApp(
     onBanned: (String) -> Unit
 ) {
     val context = LocalContext.current
-    var me by remember { mutableStateOf<Me?>(null) }
+    // Seeded from the phone so Settings and the avatar are right before (or without) a network
+    // round trip; the Firestore copy replaces it a moment later when there is internet.
+    var me by remember {
+        mutableStateOf(cachedMe(prefs, FirebaseBackend.uid.orEmpty()))
+    }
     var tab by remember { mutableStateOf(Tab.Chats) }
     val stack = remember { mutableStateListOf<Destination>(Destination.Tabs) }
     val scope = rememberCoroutineScope()
@@ -421,8 +448,20 @@ private fun SignedInApp(
     val callManager = remember { CallManager(context, api) }
     var activeCall by remember { mutableStateOf<Triple<String,String,User>?>(null) }
     var incomingCall by remember { mutableStateOf(false) }
+    // A minimised call keeps running: the full-screen surface is swapped for a small bar so
+    // the user can keep using the rest of the app without dropping the call.
+    var callMinimized by remember { mutableStateOf(false) }
     DisposableEffect(Unit) {
         callManager.onIncoming = { inc -> activeCall = Triple(inc.callId, inc.kind, inc.caller); incomingCall = true }
+        // Active while the call screen is not composed (i.e. while minimised). The call screen
+        // saves and restores this handler, so a hang-up from the other side clears the bar.
+        callManager.onState = { state ->
+            if (state == "ended" || state == "declined" || state == "missed" || state == "failed") {
+                activeCall = null
+                incomingCall = false
+                callMinimized = false
+            }
+        }
         callManager.connect()
         onDispose { callManager.close() }
     }
@@ -431,6 +470,11 @@ private fun SignedInApp(
     // whenever a newer poster document lands.
     LaunchedEffect(Unit) {
         runCatching { AnnouncementNotifier.start(context) }
+    }
+    // Every time the screen comes back (from Settings, the permission dialog, "clear all",
+    // or after the app was killed) the ongoing card is put back from the cached copy.
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+        runCatching { AnnouncementNotifier.repost(context) }
     }
     DisposableEffect(Unit) {
         onDispose { runCatching { AnnouncementNotifier.stop() } }
@@ -491,8 +535,12 @@ private fun SignedInApp(
         runCatching {
             val uid = FirebaseBackend.uid ?: return@runCatching
             FirebaseBackend.touchPresence()
-            val profile = FirebaseBackend.loadProfile(uid) ?: return@runCatching
-            me = Me(
+            // Bounded on purpose: offline Firestore keeps this call pending for a long time,
+            // and the profile from the phone is already on screen, so there is nothing to gain
+            // by waiting — without the timeout the app sat on "Not signed in".
+            val profile = withTimeoutOrNull(8_000) { FirebaseBackend.loadProfile(uid) }
+                ?: return@runCatching
+            val fresh = Me(
                 id = uid,
                 phone = profile.phone,
                 email = profile.email.takeIf { it.isNotBlank() },
@@ -502,6 +550,8 @@ private fun SignedInApp(
                 about = profile.bio.takeIf { it.isNotBlank() },
                 online = true
             )
+            me = fresh
+            ProfileCache.save(prefs, fresh)
         }
         // A website-admin ban lands mid-session too: re-check quietly every minute.
         // Same tick keeps presence truthful (online + fresh lastSeen) — but only while the
@@ -657,6 +707,19 @@ private fun SignedInApp(
         }
     }
 
+    // Drains the scheduled-message queue. The queue lives on this phone, so sending happens
+    // here while the app is open; a message that fails (no internet) simply stays queued and
+    // is tried again on the next pass instead of being dropped.
+    LaunchedEffect(Unit) {
+        while (true) {
+            AppSettings.dueScheduled().forEach { item ->
+                val sent = runCatching { FirestoreChat.send(item.chatId, item.text) }.isSuccess
+                if (sent) AppSettings.removeScheduled(item.id)
+            }
+            kotlinx.coroutines.delay(20_000)
+        }
+    }
+
     // Tapping a system notification opens the conversation it refers to.
     val notifiedChatId = NotificationRouter.pendingChatId
     LaunchedEffect(notifiedChatId) {
@@ -668,11 +731,31 @@ private fun SignedInApp(
 
     BackHandler(enabled = stack.size > 1) { pop() }
 
-    activeCall?.let { c ->
-        CallScreen(callManager, c.third, c.first, c.second, incomingCall, onClose={ activeCall=null; incomingCall=false })
+    val ongoingCall = activeCall
+    if (ongoingCall != null && !callMinimized) {
+        CallScreen(
+            callManager,
+            ongoingCall.third,
+            ongoingCall.first,
+            ongoingCall.second,
+            incomingCall,
+            onClose = { activeCall = null; incomingCall = false; callMinimized = false },
+            // Once the call has been answered it is no longer "incoming": if the screen is
+            // restored from the minimised bar it must come back as a live call, not ring again.
+            onMinimize = { callMinimized = true; incomingCall = false }
+        )
         return
     }
 
+    // Navigation itself is a hard cut; any movement comes from the transition the user picked
+    // in Settings > Animations, and the default is none.
+    val settings = AppSettings.state
+    Box(Modifier.fillMaxSize()) {
+    NavTransitionHost(
+        transition = navTransitionOrNone(settings.transitionStyle, settings.animationsEnabled),
+        key = stack.last(),
+        enabled = true
+    ) {
     when (val current = stack.last()) {
         Destination.Tabs -> TabShell(
             api = api,
@@ -700,21 +783,35 @@ private fun SignedInApp(
             onNewCommunity = { push(Destination.NewCommunity) }
         )
 
-        is Destination.Chat -> ChatScreen(
-            api = api,
-            chat = current.chat,
-            currentUserId = userId,
-            onBack = pop,
-            onOpenProfile = { push(Destination.PersonProfile(it)) },
-            onOpenGroupInfo = { push(Destination.GroupInfo(it)) },
-            onStartCall = { user, kind -> beginCall(user, kind) }
-        )
+        is Destination.Chat -> {
+            val chatId = current.chat.id
+            if (AppSettings.isChatLocked(chatId) && !AppSettings.isChatUnlockedNow(chatId)) {
+                ChatLockScreen(
+                    chatLabel = current.chat.peer?.displayName?.takeIf { it.isNotBlank() }
+                        ?: current.chat.title?.takeIf { it.isNotBlank() }
+                        ?: "This chat",
+                    onUnlocked = { AppSettings.markChatUnlocked(chatId) },
+                    onCancel = pop
+                )
+            } else {
+                ChatScreen(
+                    api = api,
+                    chat = current.chat,
+                    currentUserId = userId,
+                    onBack = pop,
+                    onOpenProfile = { push(Destination.PersonProfile(it)) },
+                    onOpenGroupInfo = { push(Destination.GroupInfo(it)) },
+                    onStartCall = { user, kind -> beginCall(user, kind) }
+                )
+            }
+        }
 
         is Destination.GroupInfo -> GroupInfoScreen(
             chat = current.chat,
             meId = userId,
             onBack = pop,
             onOpenUser = openDirectChat,
+            onScheduled = { push(Destination.ScheduledMessages(current.chat.id, current.chat.title ?: "this chat")) },
             onLeft = { while (stack.size > 1) stack.removeAt(stack.lastIndex) }
         )
 
@@ -726,7 +823,14 @@ private fun SignedInApp(
                 while (stack.size > 1) stack.removeAt(stack.lastIndex)
                 openDirectChat(user)
             },
-            onStartCall = { user, kind -> beginCall(user, kind) }
+            onStartCall = { user, kind -> beginCall(user, kind) },
+            onOpenScheduled = { chatId, label -> push(Destination.ScheduledMessages(chatId, label)) }
+        )
+
+        is Destination.ScheduledMessages -> ScheduledMessagesScreen(
+            chatId = current.chatId,
+            chatLabel = current.chatLabel,
+            onBack = pop
         )
 
         Destination.MyProfile -> MyProfileScreen(api = api, onBack = pop)
@@ -809,7 +913,12 @@ private fun SignedInApp(
 
         Destination.Invite -> InviteScreen(api = api, onBack = pop)
 
-        is Destination.Status -> StatusScreen(api = api, me = me, startWithComposer = current.startWithComposer)
+        is Destination.Status -> StatusScreen(
+            api = api,
+            me = me,
+            startWithComposer = current.startWithComposer,
+            onBack = pop
+        )
 
         is Destination.WebFeature -> WebFeatureScreen(
             url = current.url,
@@ -858,6 +967,28 @@ private fun SignedInApp(
             onOpenPage = { page, _ -> push(aiPageDestination(page)) },
             onBack = pop
         )
+    }
+    }
+
+    // Drawn last so it sits above whichever screen is showing. This is where an alert goes
+    // when the app is already open; the system shade only gets the ones that arrive while
+    // the phone is in a pocket.
+    InAppAlertHost(onOpen = openConversationById)
+
+    // The minimised call bar sits above every screen but only covers the top strip, so the
+    // rest of the app stays usable while the call keeps its audio.
+    if (ongoingCall != null && callMinimized) {
+        MinimizedCallBar(
+            user = ongoingCall.third,
+            onOpen = { callMinimized = false },
+            onEnd = {
+                callManager.end()
+                activeCall = null
+                incomingCall = false
+                callMinimized = false
+            }
+        )
+    }
     }
 }
 
@@ -941,36 +1072,11 @@ private fun TabShell(
     val glassBlue = Color(0xFF0B5CFF)
     val glassCyan = Color(0xFF00D9FF)
     val glassPurple = Color(0xFF7A2CFF)
-    val scheme = MaterialTheme.colorScheme
-    // Dark/light aware: use theme background, keep glass tint only as overlay.
-    val pageBg = Brush.verticalGradient(
-        listOf(scheme.background, scheme.surfaceContainerLow, scheme.background)
-    )
     var fabOpen by remember { mutableStateOf(false) }
 
-    // Collapsing header: the status row and the search bar stay put while the first chat is
-    // still on screen, then slide away once the list has scrolled a full row past it, and
-    // slide back in as soon as the user scrolls up. Pure per-pixel toggling made the header
-    // twitch on the first touch; this only collapses after a deliberate scroll.
-    val headerHidden = remember { mutableStateOf(false) }
-    val headerScrollPx = remember { mutableStateOf(0f) }
-    val hideAfterPx = with(LocalDensity.current) { 100.dp.toPx() }
-    val headerScroller = object : NestedScrollConnection {
-        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-            if (source == NestedScrollSource.UserInput) {
-                // available.y < 0 means the fingers drag up (list moving down the screen).
-                val scrolled = (headerScrollPx.value - available.y).coerceAtLeast(0f)
-                headerScrollPx.value = scrolled
-                headerHidden.value = scrolled > hideAfterPx
-            }
-            return Offset.Zero
-        }
-    }
-    // A new tab always starts with its header in place.
-    LaunchedEffect(tab) { headerHidden.value = false; headerScrollPx.value = 0f }
-
     Scaffold(
-        containerColor = scheme.background,
+        // Transparent: the app-wide wallpaper is drawn once at the root and shows through.
+        containerColor = Color.Transparent,
         bottomBar = {
             GlassBottomBar(tab = tab, onTab = onTab, onMenu = onOpenMenu, onSettings = onSettings)
         },
@@ -1000,9 +1106,10 @@ private fun TabShell(
     ) { padding ->
         Column(
             Modifier
-                .padding(padding)
                 .fillMaxSize()
-                .background(pageBg)
+                // Only the top inset is applied: the lists run behind the floating nav bar
+                // instead of stopping above it, which is what used to read as a hard edge.
+                .padding(top = padding.calculateTopPadding())
         ) {
             NotificationPermissionBanner(notificationPermission)
 
@@ -1015,37 +1122,25 @@ private fun TabShell(
                 onProfile = onOpenProfileTab
             )
 
-            if (tab == Tab.Chats) {
-                // Auto-hiding: the status row and the search bar collapse while the list
-                // is scrolled and return as soon as the user scrolls back up.
-                AnimatedVisibility(
-                    visible = !headerHidden.value,
-                    enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
-                    exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut()
-                ) {
-                    Column(Modifier.fillMaxWidth()) {
-                        GlassStatusRow(
-                            api = api,
-                            me = me,
-                            onOpenStatus = onOpenStatus,
-                            onPostStatus = onPostStatus
-                        )
-
-                        GlassSearchBar(onClick = {
-                            headerHidden.value = false
-                            onSearch()
-                        })
-                    }
-                }
-            }
-
-            Box(Modifier.weight(1f).fillMaxWidth().nestedScroll(headerScroller)) {
+            Box(Modifier.weight(1f).fillMaxWidth()) {
                 when (tab) {
                     Tab.Chats -> ChatsScreen(
                         api = api,
                         currentUserId = me?.id.orEmpty(),
                         onOpenChat = onOpenChat,
-                        showChrome = false
+                        // The status row and search bar live inside the list now, so they
+                        // scroll away with the chats instead of collapsing on their own.
+                        header = {
+                            Column(Modifier.fillMaxWidth()) {
+                                GlassStatusRow(
+                                    api = api,
+                                    me = me,
+                                    onOpenStatus = onOpenStatus,
+                                    onPostStatus = onPostStatus
+                                )
+                                GlassSearchBar(onClick = onSearch)
+                            }
+                        }
                     )
                     Tab.Users -> UsersScreen(
                         api = api,
@@ -1198,32 +1293,65 @@ private fun GlassSearchBar(onClick: () -> Unit) {
 @Composable
 private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onMenu: () -> Unit, onSettings: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
-    val shape = RoundedCornerShape(32.dp)
-    Row(
-        Modifier.fillMaxWidth().navigationBarsPadding()
-            .padding(horizontal = 14.dp, vertical = 8.dp).clip(shape)
-            .background(scheme.surfaceContainerHigh.copy(alpha = 0.95f))
-            .border(1.dp, scheme.outlineVariant, shape).padding(horizontal = 4.dp, vertical = 5.dp),
-        horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically
+    val shape = RoundedCornerShape(28.dp)
+    // Telegram style: a floating, translucent pill over a soft scrim so the page behind it
+    // stays visible. The pill carries exactly one hairline edge — an elevation shadow *and* a
+    // border together read as a second outline on top of the first.
+    Box(
+        Modifier
+            .fillMaxWidth()
+            // A short, soft fade only: rows now scroll behind the pill, so the scrim just
+            // keeps them readable. It used to cover the full bar height at up to 0.9 alpha,
+            // which read as a solid band — the "boundary" above the nav.
+            .background(
+                Brush.verticalGradient(
+                    listOf(
+                        scheme.background.copy(alpha = 0f),
+                        scheme.background.copy(alpha = 0.35f)
+                    )
+                )
+            )
+            .navigationBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
     ) {
-        val items = listOf(
-            Triple(Tab.Chats, Icons.Default.Chat, "Chats"),
-            Triple(Tab.Users, Icons.Default.Contacts, "Users"),
-            Triple(Tab.Channels, Icons.Default.Campaign, "Channels"),
-            Triple(Tab.Settings, Icons.Default.Settings, "Settings"),
-            Triple(Tab.Menu, Icons.Default.Menu, "Menu")
-        )
-        items.forEach { (entry, icon, title) ->
-            val selected = tab == entry
-            Column(
-                Modifier.weight(1f).clip(RoundedCornerShape(22.dp))
-                    .background(if (selected) Brush.horizontalGradient(listOf(Color(0xFF1152C8).copy(alpha=.75f), Color(0xFF5B2CFF).copy(alpha=.55f))) else Brush.linearGradient(listOf(Color.Transparent, Color.Transparent)))
-                    .clickable { when (entry) { Tab.Menu -> onMenu(); Tab.Settings -> onSettings(); else -> onTab(entry) } }
-                    .padding(vertical = 7.dp), horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Icon(icon, null, tint = if (selected) scheme.primary else scheme.onSurfaceVariant, modifier = Modifier.size(24.dp))
-                Text(title, color = if (selected) scheme.primary else scheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
-                if (selected) Box(Modifier.padding(top = 3.dp).size(width = 28.dp, height = 3.dp).clip(RoundedCornerShape(3.dp)).background(Brush.horizontalGradient(listOf(Color(0xFF00D9FF), Color(0xFF8B2DFF)))))
+        Row(
+            Modifier.fillMaxWidth()
+                .clip(shape)
+                .background(scheme.surface.copy(alpha = 0.9f))
+                .border(0.6.dp, scheme.outlineVariant.copy(alpha = 0.45f), shape)
+                .padding(horizontal = 4.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically
+        ) {
+            val items = listOf(
+                Triple(Tab.Chats, R.drawable.ic_tg_chats, "Chats"),
+                Triple(Tab.Users, R.drawable.ic_tg_users, "Users"),
+                Triple(Tab.Channels, R.drawable.ic_tg_channels, "Channels"),
+                Triple(Tab.Settings, R.drawable.ic_tg_settings, "Settings"),
+                Triple(Tab.Menu, R.drawable.ic_tg_menu, "Menu")
+            )
+            items.forEach { (entry, iconRes, title) ->
+                val selected = tab == entry
+                val tint = if (selected) scheme.primary else scheme.onSurfaceVariant
+                Column(
+                    Modifier.weight(1f).clip(RoundedCornerShape(22.dp))
+                        .clickable { when (entry) { Tab.Menu -> onMenu(); Tab.Settings -> onSettings(); else -> onTab(entry) } }
+                        .padding(vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(
+                        Modifier.clip(CircleShape)
+                            .background(if (selected) scheme.primary.copy(alpha = 0.12f) else Color.Transparent)
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            painter = androidx.compose.ui.res.painterResource(iconRes),
+                            contentDescription = title,
+                            tint = tint,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    Text(title, color = tint, fontSize = 10.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                }
             }
         }
     }
@@ -1247,7 +1375,9 @@ private fun ChannelsScreen(
     LaunchedEffect(reload) {
         loading = rows.isEmpty()
         try {
-            rows = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().await()
+            val snap = FirebaseBackend.db.collection("chats").whereArrayContains("users", uid).get().awaitOrNull()
+                ?: throw IllegalStateException("channels timeout")
+            rows = snap
                 .documents.mapNotNull { d ->
                     val users = (d.get("users") as? List<String>) ?: emptyList()
                     if (!users.contains(uid)) return@mapNotNull null
@@ -1303,7 +1433,7 @@ private fun ChannelsScreen(
             loading -> LoadingState(label = "Loading channels…")
             error.isNotBlank() && rows.isEmpty() -> ErrorState(error) { reload++ }
             shown.isEmpty() -> EmptyState(icon = Icons.Default.Campaign, title = "Nothing here yet", subtitle = "Create the first $filter to get started.", action = { Button(onClick = onNewChannel) { Text("Create") } })
-            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = floatingNavBottomPadding()) {
                 items(shown, key = { it.id }) { row ->
                     val chat = toItem(row)
                     val badge = when {
@@ -1427,8 +1557,23 @@ private suspend fun rememberCurrentAccount(context: Context, prefs: SharedPrefer
     )
 }
 
-/** Best guess at the country of a switched-to number; keeps the stored one when unsure. */
-private fun countryIsoFor(phone: String, prefs: SharedPreferences): String {
+/**
+ * The signed-in user as this phone remembers them, so a launch without internet still knows
+ * who is signed in. The Firestore profile overwrites this as soon as it can be fetched.
+ */
+private fun cachedMe(prefs: SharedPreferences, uid: String): Me? {
+    if (uid.isBlank()) return null
+    ProfileCache.load(prefs, uid)?.let { return it }
+    val account = AccountStore.all(prefs).firstOrNull { it.userId == uid } ?: return null
+    return Me(
+        id = uid,
+        phone = account.phone.ifBlank { prefs.getString("phone", "").orEmpty() },
+        displayName = account.displayName.ifBlank { "HolidayLink user" },
+        username = account.username
+    )
+}
+
+/** Best guess at the country of a switched-to number; keeps the stored one when unsure. */private fun countryIsoFor(phone: String, prefs: SharedPreferences): String {
     val hit = Countries.ALL.firstOrNull { phone.startsWith("+${it.dialCode}") }
     return hit?.iso ?: prefs.getString("countryIso", Countries.DEFAULT_ISO) ?: Countries.DEFAULT_ISO
 }

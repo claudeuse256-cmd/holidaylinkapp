@@ -98,6 +98,7 @@ fun AiProfileScreen(
     LaunchedEffect(Unit) { reload() }
 
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(
                 title = { Text("HolidayLink AI") },

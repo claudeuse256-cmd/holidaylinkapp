@@ -6,6 +6,7 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
 /**
@@ -29,7 +30,29 @@ object FirebaseBackend {
             ?: throw ApiException("Sign-in failed. Please try again.")
     }
 
-    fun signOut() = auth.signOut()
+    /**
+     * Signs out after detaching this device from the account's push list.
+     *
+     * The removal has to happen *before* the session disappears: Firestore refuses the
+     * write once there is no signed-in user. It is bounded so a dead network can never
+     * trap somebody on the sign-out button.
+     */
+    fun signOut() {
+        val uid = auth.currentUser?.uid
+        if (uid == null) {
+            auth.signOut()
+            return
+        }
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO).launch {
+            kotlinx.coroutines.withTimeoutOrNull(4_000) {
+                org.holidaylink.app.push.PushTokens.unregisterFrom(uid)
+            }
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                runCatching { auth.signOut() }
+                Unit
+            }
+        }
+    }
 
     /** Website users doc shape (login.html / signup.html). */
     data class FirebaseProfile(
@@ -104,12 +127,29 @@ object FirebaseBackend {
         }
     }
 
-    /** True only when the online flag is fresh (5 min). Stale flags lie. */
+    /**
+     * True only when the online flag is fresh.
+     *
+     * The visible app writes a heartbeat once a minute, so two minutes allows one missed
+     * tick on a slow network. The old five-minute window left a green dot next to somebody
+     * who had already put the phone down, which read as "they are online" when they were not.
+     */
     fun isTrulyOnline(online: Boolean, lastSeenMillis: Long?): Boolean {
         if (!online) return false
         if (lastSeenMillis == null) return false
-        return System.currentTimeMillis() - lastSeenMillis < 5 * 60 * 1000L
+        return System.currentTimeMillis() - lastSeenMillis < 2 * 60 * 1000L
     }
+
+    /**
+     * The green dot for a user document, computed the only honest way.
+     *
+     * `online` is set to false by a clean `onStop`, and Firestore has no `onDisconnect`
+     * hook, so a phone whose app was swiped away or killed leaves the flag true forever.
+     * Reading it raw is what put a green dot next to people who had not opened the app in
+     * days; the heartbeat timestamp is the only real evidence that somebody is there.
+     */
+    fun snapshotOnline(doc: com.google.firebase.firestore.DocumentSnapshot): Boolean =
+        isTrulyOnline(doc.getBoolean("online") == true, docLastSeenMillis(doc.data.orEmpty()))
 
     /** Reads lastSeen whether stored as Timestamp, millis Long, or ISO string. */
     fun docLastSeenMillis(data: Map<String, Any?>): Long? {

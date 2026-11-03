@@ -55,6 +55,7 @@ import androidx.compose.material.icons.filled.Leaderboard
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Newspaper
 import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Quiz
 import androidx.compose.material.icons.filled.ShoppingBag
 import androidx.compose.material.icons.filled.SmartToy
@@ -112,7 +113,7 @@ private val sections = listOf(
         "Messaging",
         listOf(
             HolidayFeature("Messages", "Open the full HolidayLink messaging experience", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:chats"),
-            HolidayFeature("Calls", "Open your audio and video call history", Icons.Default.Chat, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:calls"),
+            HolidayFeature("Calls", "Open your audio and video call history", Icons.Default.Phone, listOf(Color(0xFF06B6D4), Color(0xFF2563EB)), "native:calls"),
             HolidayFeature("Starred messages", "Keep and revisit messages you starred", Icons.Default.Star, listOf(Color(0xFFF59E0B), Color(0xFFFACC15)), "native:starred"),
             HolidayFeature("Status", "Updates that vanish after 24 hours", Icons.Default.Schedule, listOf(Color(0xFF10B981), Color(0xFF06B6D4)), "native:status")
         )
@@ -236,7 +237,10 @@ fun StoreScreen(api: Api?, onBack: () -> Unit) {
     suspend fun placeOrder(i: Int) {
         placing = true
         try {
-            val p = products[i]
+            // The product list is a live snapshot, so the tapped row can disappear
+            // between opening the sheet and confirming the order.
+            val p = products.getOrNull(i) ?: throw ApiException("That item is no longer available.")
+            val productId = ids.getOrNull(i).orEmpty()
             val unit = ((p["price"] as? Number)?.toLong()
                 ?: (p["priceMinor"] as? Number)?.toLong()?.div(100) ?: 0L)
             val count = qty.toIntOrNull()?.coerceIn(1, 99) ?: 1
@@ -255,7 +259,7 @@ fun StoreScreen(api: Api?, onBack: () -> Unit) {
                     "phone" to buyerPhone.ifBlank { me?.phone ?: "" },
                     "items" to listOf(
                         mapOf(
-                            "productId" to ids[i],
+                            "productId" to productId,
                             "name" to ((p["title"] as? String ?: p["name"] as? String).orEmpty()),
                             "price" to unit,
                             "qty" to count
@@ -354,9 +358,10 @@ fun StoreScreen(api: Api?, onBack: () -> Unit) {
     }
 
     buying?.let { i ->
+        val product = products.getOrNull(i) ?: return@let
         AlertDialog(
             onDismissRequest = { if (!placing) buying = null },
-            title = { Text("Buy ${((products[i]["title"] as? String ?: products[i]["name"] as? String).orEmpty()).ifBlank { "item" }}") },
+            title = { Text("Buy ${((product["title"] as? String ?: product["name"] as? String).orEmpty()).ifBlank { "item" }}") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(value = qty, onValueChange = { qty = it.filter { c -> c.isDigit() }.take(2) }, label = { Text("Quantity") }, singleLine = true, modifier = Modifier.fillMaxWidth())

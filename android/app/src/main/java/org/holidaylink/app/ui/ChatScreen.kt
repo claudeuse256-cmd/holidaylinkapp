@@ -12,6 +12,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -27,6 +28,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
@@ -44,9 +46,11 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
@@ -59,6 +63,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardVoice
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Wallpaper
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PhotoCamera
@@ -114,6 +119,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -138,6 +144,7 @@ import org.holidaylink.app.net.AiBot
 import org.holidaylink.app.net.AppPresence
 import org.holidaylink.app.net.ChatItem
 import org.holidaylink.app.net.Cloudinary
+import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
 import org.holidaylink.app.net.FirestoreBots
 import org.holidaylink.app.net.FirestoreChat
@@ -185,11 +192,14 @@ fun ChatScreen(
     var outbox by remember { mutableStateOf<List<OutgoingItem>>(emptyList()) }
     // The "edit before sending" screen for a picked photo, video or document.
     var editorFor by remember { mutableStateOf<EditorSource?>(null) }
-    // Chat background picker for this conversation only.
-    var showWallpaper by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var peerUser by remember { mutableStateOf(chat.peer) }
     var peerOnline by remember { mutableStateOf<Boolean?>(null) }
+    // Whether the other person is writing right now. Both sides have to allow typing
+    // indicators — the same rule the read receipts follow — otherwise the switch in
+    // Settings would only ever work in one direction.
+    val typingAllowed = AppSettings.state.typingIndicators && (peerUser?.typingIndicators ?: true)
+    var peerTyping by remember(chat.id) { mutableStateOf(false) }
 
     var sheetFor by remember { mutableStateOf<FirestoreChat.ChatMessage?>(null) }
     var showAttach by remember { mutableStateOf(false) }
@@ -226,14 +236,35 @@ fun ChatScreen(
         ?: chat.title?.takeIf { it.isNotBlank() }
         ?: if (chat.kind == "direct") "Contact" else "Group"
 
+    // Coming back into a conversation used to start from an empty list, so the screen flashed
+    // "no messages" for a beat before Firestore replayed the thread. The last copy seen in this
+    // session seeds the list instead and the live snapshot replaces it silently.
+    val cachedMessages = remember(chat.id) {
+        DeviceCache.memory<List<FirestoreChat.ChatMessage>>("messages.${chat.id}") ?: emptyList()
+    }
     val rawMessages by remember(chat.id) { FirestoreChat.messagesFlow(chat.id) }
-        .collectAsState(initial = emptyList())
-    // "Delete for me" hides the message on this device only; it stays on the server
-    // for everyone else, exactly like WhatsApp.
+        .collectAsState(initial = cachedMessages)
+    LaunchedEffect(rawMessages) {
+        if (rawMessages.isNotEmpty()) DeviceCache.put("messages.${chat.id}", rawMessages)
+    }
+    // "Delete for me" keeps the row on this device but strips its content, so the thread
+    // still reads in order with "This message was deleted" in the gap. On the server the
+    // message is untouched and everyone else still sees it, exactly like WhatsApp.
     val hiddenMessages = AppSettings.state.hiddenMessages
     val messages = remember(rawMessages, hiddenMessages) {
         if (hiddenMessages.isEmpty()) rawMessages
-        else rawMessages.filter { hiddenMessages["${chat.id}/${it.id}"] != true }
+        else rawMessages.map { message ->
+            if (hiddenMessages["${chat.id}/${message.id}"] == true) {
+                message.copy(
+                    deleted = true,
+                    text = "",
+                    imageUrl = null,
+                    fileUrl = null,
+                    audioBlob = null,
+                    reactions = emptyMap()
+                )
+            } else message
+        }
     }
     // Server copies of the messages that are still travelling. They are hidden while the
     // local bubble stands in for them, so a message is never shown twice.
@@ -295,8 +326,75 @@ fun ChatScreen(
         runCatching { aiBots = FirestoreBots.list() }
     }
 
+    // Presence is a claim that goes stale: while this conversation stays open, re-check who is
+    // actually on the other end instead of showing the state from the moment it was opened.
+    LaunchedEffect(chat.id) {
+        while (true) {
+            delay(45_000)
+            val pid = peerUser?.id?.takeIf { it.isNotBlank() && !it.startsWith("00000000") } ?: continue
+            runCatching { FirestoreChat.resolvePeer(pid) }.onSuccess {
+                peerUser = it
+                peerOnline = it.online
+            }
+        }
+    }
+
+    LaunchedEffect(chat.id, typingAllowed) {
+        if (!typingAllowed) {
+            peerTyping = false
+            return@LaunchedEffect
+        }
+        runCatching {
+            FirestoreChat.typingFlow(chat.id).collect { peerTyping = it }
+        }
+    }
+
+    // Saying "I am typing" without flooding Firestore: one write every few seconds while keys
+    // are being pressed, then one more to stop. The marker also expires on the other phone by
+    // age, so a killed app cannot leave somebody staring at a permanent "typing…".
+    var typingMarked by remember(chat.id) { mutableStateOf(false) }
+    var lastTypingWrite by remember(chat.id) { mutableLongStateOf(0L) }
+    LaunchedEffect(draft) {
+        if (!AppSettings.state.typingIndicators) return@LaunchedEffect
+        if (draft.isBlank()) {
+            if (typingMarked) {
+                typingMarked = false
+                runCatching { FirestoreChat.setTyping(chat.id, false) }
+            }
+            return@LaunchedEffect
+        }
+        val now = System.currentTimeMillis()
+        if (!typingMarked || now - lastTypingWrite >= 3_000) {
+            typingMarked = true
+            lastTypingWrite = now
+            runCatching { FirestoreChat.setTyping(chat.id, true) }
+        }
+        delay(5_000)
+        typingMarked = false
+        runCatching { FirestoreChat.setTyping(chat.id, false) }
+    }
+    DisposableEffect(chat.id) {
+        onDispose {
+            if (typingMarked) {
+                val id = chat.id
+                scope.launch { runCatching { FirestoreChat.setTyping(id, false) } }
+            }
+        }
+    }
+
+    // Bring the typing bubble into view, but only for somebody already reading the newest
+    // message: yanking a person back down while they scroll through history is worse than
+    // leaving the bubble just off screen.
+    LaunchedEffect(peerTyping) {
+        if (peerTyping && atBottom) {
+            listState.animateScrollToItem(shownMessages.size + outbox.size)
+        }
+    }
+
     LaunchedEffect(messages, outbox.size) {
-        val total = shownMessages.size + outbox.size
+        // The typing bubble is a real list item, so the newest row is one further down when
+        // it is on screen.
+        val total = shownMessages.size + outbox.size + (if (peerTyping) 1 else 0)
         if (total > 0) listState.animateScrollToItem(total - 1)
         if (messages.isNotEmpty()) {
             if (pendingTexts.isNotEmpty()) {
@@ -311,7 +409,13 @@ fun ChatScreen(
                 unreadAnchor = messages.indexOfFirst { it.senderId != uid && !it.read }
             }
             if (messages.any { it.senderId != uid && !it.read }) {
-                runCatching { FirestoreChat.markRead(chat.id) }
+                runCatching {
+                    FirestoreChat.markRead(
+                        chat.id,
+                        sendReceipts = AppSettings.state.readReceipts &&
+                            (peerUser?.readReceipts ?: true)
+                    )
+                }
             }
             // Receiving these on this device flips the sender's single tick to a double tick.
             if (messages.any { it.senderId != uid && !it.delivered }) {
@@ -727,7 +831,17 @@ fun ChatScreen(
     val blockedPeerId = peerUser?.id?.takeIf { it.isNotBlank() }
     val isBlocked = blockedPeerId != null && AppSettings.isUserBlocked(blockedPeerId)
 
+    Box(Modifier.fillMaxSize()) {
+        // One continuous background: the wallpaper now also runs behind the composer and the
+        // top bar instead of stopping where the message list ends.
+        ChatWallpaper(
+            uri = AppSettings.state.chatWallpaper,
+            solid = AppSettings.state.chatWallpaperSolid,
+            preset = AppSettings.wallpaperPresetFor(chat.id),
+            modifier = Modifier.matchParentSize()
+        )
     Scaffold(
+        containerColor = Color.Transparent,
         topBar = {
             if (searching) {
                 TopAppBar(
@@ -768,15 +882,30 @@ fun ChatScreen(
                         Spacer(Modifier.width(10.dp))
                         Column {
                             Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1)
-                            Text(
-                                text = when {
-                                    peerOnline == true -> "online"
-                                    peerUser?.lastSeen != null -> "last seen ${friendlyWhen(peerUser?.lastSeen)}"
-                                    else -> peerUser?.username?.let { "@$it" } ?: chat.peer?.username?.let { "@$it" } ?: "HolidayLink"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            if (peerTyping) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        "typing",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(Modifier.width(5.dp))
+                                    TypingDots(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        dotSize = 4.dp
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = when {
+                                        peerOnline == true -> "online"
+                                        peerUser?.lastSeen != null -> "last seen ${friendlyWhen(peerUser?.lastSeen)}"
+                                        else -> peerUser?.username?.let { "@$it" } ?: chat.peer?.username?.let { "@$it" } ?: "HolidayLink"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 },
@@ -789,9 +918,6 @@ fun ChatScreen(
                         IconButton(onClick = { onStartCall(peer, "video") }) {
                             Icon(Icons.Default.Videocam, "Video call")
                         }
-                    }
-                    IconButton(onClick = { showWallpaper = true }) {
-                        Icon(Icons.Default.MoreVert, "Chat options")
                     }
                 }
             )
@@ -902,12 +1028,6 @@ fun ChatScreen(
         }
     ) { padding ->
         Box(Modifier.padding(padding).fillMaxSize()) {
-            ChatWallpaper(
-                uri = AppSettings.state.chatWallpaper,
-                solid = AppSettings.state.chatWallpaperSolid,
-                preset = AppSettings.wallpaperPresetFor(chat.id),
-                modifier = Modifier.matchParentSize()
-            )
             Column(Modifier.fillMaxSize()) {
             if (searching && query.isNotBlank()) {
                 ChatSearchResults(
@@ -951,6 +1071,10 @@ fun ChatScreen(
                             message = message,
                             mine = message.senderId == uid,
                             myUid = uid,
+                            // Blue ticks need both people to allow them; a group has no single
+                            // peer to ask, so only the local switch applies there.
+                            receipts = AppSettings.state.readReceipts &&
+                                (peerUser?.readReceipts ?: true),
                             starred = AppSettings.isMessageStarred(chat.id, message.id),
                             pending = message.senderId == uid && !message.read && message.text in pendingTexts,
                             onLongPress = { sheetFor = message },
@@ -972,6 +1096,10 @@ fun ChatScreen(
                                 } else {
                                     viewOnceTarget = target
                                 }
+                            },
+                            onSwipeReply = {
+                                editingId = null
+                                replyingTo = message
                             }
                         )
                         }
@@ -985,6 +1113,11 @@ fun ChatScreen(
                             onDiscard = { outbox = outbox.filter { it.localId != item.localId } }
                         )
                     }
+                    // WhatsApp's typing bubble: three moving dots in an incoming bubble at the
+                    // very bottom, so the reply reads as being written rather than just announced.
+                    if (peerTyping) {
+                        item(key = "typing-bubble") { TypingBubble() }
+                    }
                 }
             }
         }
@@ -992,7 +1125,7 @@ fun ChatScreen(
             if (!atBottom && (messages.isNotEmpty() || outbox.isNotEmpty())) {
                 SmallFloatingActionButton(
                     onClick = {
-                        val total = shownMessages.size + outbox.size
+                        val total = shownMessages.size + outbox.size + (if (peerTyping) 1 else 0)
                         if (total > 0) scope.launch { listState.animateScrollToItem(total - 1) }
                     },
                     modifier = Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 14.dp),
@@ -1001,6 +1134,7 @@ fun ChatScreen(
                 ) { Icon(Icons.Default.KeyboardArrowDown, "Scroll to latest") }
             }
         }
+    }
     }
 
     photoUrl?.let { url -> PhotoViewer(url = url, onDismiss = { photoUrl = null }) }
@@ -1021,27 +1155,13 @@ fun ChatScreen(
         )
     }
 
-    // A background for this conversation only.
-    if (showWallpaper) {
-        WallpaperSheet(
-            current = AppSettings.wallpaperPresetFor(chat.id),
-            title = "Chat background",
-            onPick = { preset -> AppSettings.setChatWallpaperPresetFor(chat.id, preset) },
-            onDismiss = { showWallpaper = false },
-            extra = {
-                TextButton(onClick = {
-                    AppSettings.setChatWallpaperPresetFor(chat.id, null)
-                    showWallpaper = false
-                }) { Text("Use the default background") }
-            }
-        )
-    }
-
     // ---------------------------------------------------------------- sheets
 
     val sheetMsg = sheetFor
     if (sheetMsg != null) {
         val mine = sheetMsg.senderId == uid
+        // Nothing to react to, copy or forward on a deleted row or a call log entry.
+        val placeholder = sheetMsg.deleted || sheetMsg.type == "call"
         // WhatsApp rule: text messages editable within 2 minutes of sending.
         val editable = mine && sheetMsg.type == "text" && runCatching {
             val created = sheetMsg.createdAt?.seconds ?: 0
@@ -1052,6 +1172,12 @@ fun ChatScreen(
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ) {
             Column(Modifier.fillMaxWidth().padding(vertical = 8.dp, horizontal = 8.dp)) {
+                if (placeholder) {
+                    SheetAction("Message info", Icons.Default.Info, {
+                        infoFor = sheetMsg
+                        sheetFor = null
+                    })
+                } else {
                 // Quick reactions (WhatsApp/Telegram). Tapping again removes your reaction.
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
@@ -1097,9 +1223,11 @@ fun ChatScreen(
                             sheetFor = null
                         })
                     }
-                    SheetAction("Delete", Icons.Default.Delete, {
+                    SheetAction("Delete for everyone", Icons.Default.Delete, {
                         scope.launch {
-                            runCatching { FirestoreChat.deleteMessage(chat.id, sheetMsg.id) }
+                            // The row survives with its content stripped, so both phones show
+                            // "This message was deleted" where it used to be.
+                            runCatching { FirestoreChat.markDeleted(chat.id, sheetMsg.id) }
                                 .onFailure { snackbar.showSnackbar("Couldn't delete that message") }
                         }
                         sheetFor = null
@@ -1132,6 +1260,7 @@ fun ChatScreen(
                         reportTarget = sheetMsg
                         sheetFor = null
                     })
+                }
                 }
             }
         }
@@ -1299,7 +1428,12 @@ fun ChatScreen(
 
     val info = infoFor
     if (info != null) {
-        MessageInfoDialog(chatId = chat.id, message = info, myUid = uid) { infoFor = null }
+        MessageInfoDialog(
+            chatId = chat.id,
+            message = info,
+            myUid = uid,
+            receipts = AppSettings.state.readReceipts && (peerUser?.readReceipts ?: true)
+        ) { infoFor = null }
     }
 }
 
@@ -1375,6 +1509,7 @@ private fun MessageInfoDialog(
     chatId: String,
     message: FirestoreChat.ChatMessage,
     myUid: String,
+    receipts: Boolean = true,
     onDismiss: () -> Unit
 ) {
     val mine = message.senderId == myUid
@@ -1385,8 +1520,10 @@ private fun MessageInfoDialog(
     } ?: "—"
     val status = when {
         !mine -> "Received"
-        message.read -> "Read"
-        message.delivered -> "Delivered"
+        // With read receipts off on either side the tick stays grey, so this dialog must not
+        // leak the one thing the conversation has deliberately hidden.
+        message.read && receipts -> "Read"
+        message.read || message.delivered -> "Delivered"
         else -> "Sent"
     }
     AlertDialog(
@@ -1428,7 +1565,9 @@ private fun FsMessageBubble(
     onOpenImage: (String) -> Unit,
     onReact: (String) -> Unit,
     onJumpTo: (String) -> Unit,
-    onOpenViewOnce: (FirestoreChat.ChatMessage) -> Unit
+    onOpenViewOnce: (FirestoreChat.ChatMessage) -> Unit,
+    onSwipeReply: () -> Unit = {},
+    receipts: Boolean = true
 ) {
     val bubbleColor = if (mine) MaterialTheme.colorScheme.primaryContainer
     else MaterialTheme.colorScheme.surfaceContainerHigh
@@ -1437,10 +1576,54 @@ private fun FsMessageBubble(
     // The full-screen in-app video player, opened by tapping a video bubble.
     var playingVideo by remember { mutableStateOf<java.io.File?>(null) }
 
-    Column(
-        Modifier.fillMaxWidth().padding(vertical = 1.dp),
-        horizontalAlignment = if (mine) Alignment.End else Alignment.Start
-    ) {
+    // A message deleted for everyone and a call log entry carry no content of their own,
+    // so they get a plain pill and cannot be replied to or swiped.
+    if (message.deleted || message.type == "call") {
+        SystemBubble(message = message, mine = mine)
+        return
+    }
+
+    // Swipe a message into the empty side of the row to reply, like Telegram: right for
+    // messages you received, left for your own. Only horizontal drags are taken, so
+    // scrolling the conversation up and down still works.
+    var dragX by remember(message.id) { mutableFloatStateOf(0f) }
+    val triggerPx = with(androidx.compose.ui.platform.LocalDensity.current) { 54.dp.toPx() }
+    // Own bubbles sit against the right edge, so they can only travel left without leaving
+    // the screen; received bubbles sit against the left edge and travel right.
+    val travel = if (mine) -triggerPx * 1.5f..0f else 0f..triggerPx * 1.5f
+
+    Box(Modifier.fillMaxWidth()) {
+        if (kotlin.math.abs(dragX) > 4f) {
+            Icon(
+                Icons.Default.Reply,
+                contentDescription = "Swipe to reply",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                    alpha = (kotlin.math.abs(dragX) / triggerPx).coerceIn(0.15f, 1f)
+                ),
+                modifier = Modifier
+                    .align(if (mine) Alignment.CenterEnd else Alignment.CenterStart)
+                    .padding(horizontal = 8.dp)
+                    .size(20.dp)
+            )
+        }
+        Column(
+            Modifier.fillMaxWidth().padding(vertical = 1.dp)
+                .offset { androidx.compose.ui.unit.IntOffset(dragX.toInt(), 0) }
+                .pointerInput(message.id) {
+                    detectHorizontalDragGestures(
+                        onDragEnd = {
+                            if (kotlin.math.abs(dragX) >= triggerPx) onSwipeReply()
+                            dragX = 0f
+                        },
+                        onDragCancel = { dragX = 0f },
+                        onHorizontalDrag = { change, amount ->
+                            change.consume()
+                            dragX = (dragX + amount).coerceIn(travel.start, travel.endInclusive)
+                        }
+                    )
+                },
+            horizontalAlignment = if (mine) Alignment.End else Alignment.Start
+        ) {
         Box(
             Modifier
                 .widthIn(max = 300.dp)
@@ -1594,13 +1777,74 @@ private fun FsMessageBubble(
                         message.read -> "read"
                         message.delivered -> "delivered"
                         else -> "sent"
-                    }
+                    },
+                    receipts
                 )
             }
+        }
         }
     }
     playingVideo?.let { file ->
         VideoPlayerDialog(file = file, onDismiss = { playingVideo = null })
+    }
+}
+
+/**
+ * The rows that stand in for content that is gone or was never a message: "This message was
+ * deleted" after a delete-for-everyone, and the call log (missed, declined or the length of
+ * a call that was picked up). Both stay in the thread so it still reads in order.
+ */
+@Composable
+private fun SystemBubble(message: FirestoreChat.ChatMessage, mine: Boolean) {
+    val deleted = message.deleted
+    val video = message.callKind == "video"
+    val seconds = message.callSeconds ?: 0
+    val label = when {
+        deleted -> "This message was deleted"
+        message.callStatus == "missed" -> if (video) "Missed video call" else "Missed voice call"
+        message.callStatus == "declined" -> if (video) "Declined video call" else "Declined voice call"
+        message.callStatus == "failed" -> if (video) "Video call didn't connect" else "Voice call didn't connect"
+        seconds > 0 -> if (video) "Video call · ${formatDuration(seconds * 1000)}"
+        else "Voice call · ${formatDuration(seconds * 1000)}"
+        else -> if (video) "Video call" else "Voice call"
+    }
+    val tint = when {
+        deleted -> MaterialTheme.colorScheme.onSurfaceVariant
+        message.callStatus == "missed" -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.primary
+    }
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 1.dp),
+        horizontalAlignment = if (mine) Alignment.End else Alignment.Start
+    ) {
+        Row(
+            Modifier.widthIn(max = 300.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.85f))
+                .padding(horizontal = 12.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (deleted) Icons.Default.Block else if (video) Icons.Default.Videocam else Icons.Default.Call,
+                contentDescription = null,
+                tint = tint,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyMedium,
+                fontStyle = if (deleted) FontStyle.Italic else FontStyle.Normal,
+                color = if (deleted) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                clockOf(message.createdAt?.toDate()?.toInstant()?.toString()),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 
@@ -1781,6 +2025,7 @@ private fun VideoPlayerDialog(file: java.io.File, onDismiss: () -> Unit) {
     var position by remember { mutableIntStateOf(0) }
     var duration by remember { mutableIntStateOf(0) }
     var controlsVisible by remember { mutableStateOf(true) }
+    val saveToGallery = rememberSaveToGallery()
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1826,6 +2071,12 @@ private fun VideoPlayerDialog(file: java.io.File, onDismiss: () -> Unit) {
                     modifier = Modifier.align(Alignment.TopStart).padding(12.dp)
                 ) {
                     Icon(Icons.Default.Close, "Close", tint = Color.White, modifier = Modifier.size(28.dp))
+                }
+                IconButton(
+                    onClick = { saveToGallery(null, file) },
+                    modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
+                ) {
+                    Icon(Icons.Default.Download, "Save to gallery", tint = Color.White, modifier = Modifier.size(28.dp))
                 }
                 IconButton(
                     onClick = {
@@ -1994,11 +2245,31 @@ private fun VoicePlayer(filePath: String? = null, streamUrl: String? = null, nam
     }
 }
 
+/** The "somebody is writing" bubble: an incoming bubble holding nothing but the three dots. */
 @Composable
-private fun StatusTick(status: String) {
-    val tint = when (status) {
-        "read" -> MaterialTheme.colorScheme.primary
-        "delivered" -> MaterialTheme.colorScheme.onSurfaceVariant
+private fun TypingBubble() {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.Start
+    ) {
+        Box(
+            Modifier
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                .padding(horizontal = 14.dp, vertical = 11.dp)
+        ) {
+            TypingDots(dotSize = 7.dp)
+        }
+    }
+}
+
+@Composable
+private fun StatusTick(status: String, receipts: Boolean = true) {
+    val tint = when {
+        // Read receipts off on either side means no blue ticks in this conversation, which is
+        // the whole point of the switch: it has to hold in both directions at once.
+        status == "read" && receipts -> MaterialTheme.colorScheme.primary
+        status == "read" || status == "delivered" -> MaterialTheme.colorScheme.onSurfaceVariant
         else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
     }
     Icon(
@@ -2167,7 +2438,7 @@ private fun ChatComposer(
     onLockRecording: () -> Unit
 ) {
     Column(
-        Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)
+        Modifier.fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
         if (editingId != null || replyPreview != null) {
