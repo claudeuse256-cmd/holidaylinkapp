@@ -422,6 +422,45 @@ async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
 }
 
 /**
+ * POST /push/register — store this device's FCM token with the Admin SDK.
+ *
+ * The app also writes `users/{uid}.fcmTokens` directly, but that only works when the
+ * deployed Firestore rules let an owner update their own row. This route bypasses the
+ * rules, so background notifications keep working even with the website's older rules.
+ *
+ * Body: { token }. Auth: Firebase ID token (`Authorization: Bearer`).
+ */
+app.post('/push/register', async (req, res) => {
+  if (!serviceAccount) {
+    return res.status(503).json({ error: 'PUSH_UNAVAILABLE', message: 'Push is not configured on the server.' });
+  }
+  const idToken = bearer(req);
+  if (!idToken) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  let user;
+  try {
+    user = await auth().verifyIdToken(idToken);
+  } catch {
+    return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  }
+  const token = String(req.body.token || '').trim().slice(0, 4096);
+  if (!token) return res.status(400).json({ error: 'NO_TOKEN' });
+  try {
+    await db().collection('users').doc(user.uid).set(
+      {
+        fcmTokens: admin.firestore.FieldValue.arrayUnion(token),
+        fcmTokenAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+  } catch (err) {
+    console.error('[push/register] store failed:', err.message);
+    return res.status(500).json({ error: 'STORE_FAILED' });
+  }
+  console.log(`[push/register] stored a device token for ${user.uid}`);
+  res.json({ ok: true });
+});
+
+/**
  * POST /push/send — "buzz the other side" for a message or an incoming call.
  *
  * The caller proves identity with a Firebase ID token (`Authorization: Bearer`).
@@ -507,9 +546,14 @@ app.post('/push/send', async (req, res) => {
   // Calls are urgent and short-lived; messages can wait a day.
   const ttlSeconds = type === 'call' ? 60 : 24 * 3600;
   const results = await Promise.all(recipients.map((uid) =>
+    // Never skip a message push just because presence looks "online". That flag is only
+    // cleared by a clean onStop, so an app that was swiped away or killed can stay "online"
+    // for minutes and the recipient hears nothing. The phone already suppresses a duplicate
+    // alert while it is actually on screen (HolidayMessagingService checks AppPresence), so
+    // always asking FCM is the reliable choice.
     // `forUid` lets a phone that holds several accounts label the notification with the
     // account it arrived for, the way WhatsApp marks its linked accounts.
-    pushToUser(uid, { ...data, forUid: uid }, ttlSeconds, type === 'message')
+    pushToUser(uid, { ...data, forUid: uid }, ttlSeconds, false)
       .catch((err) => {
         console.error(`[push/send] push failed for ${uid}:`, err && err.message);
         return { sent: 0, failed: 0, skipped: false };
