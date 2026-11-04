@@ -67,7 +67,7 @@ fun UpdateScreen(onBack: () -> Unit) {
         failed = false
         update = null
         upToDate = false
-        runCatching { AppUpdater.check() }
+        runCatching { AppUpdater.check(context) }
             .onSuccess { found ->
                 if (found == null) upToDate = true else update = found
             }

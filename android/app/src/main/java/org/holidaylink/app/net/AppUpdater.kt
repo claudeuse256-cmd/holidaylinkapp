@@ -11,6 +11,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.holidaylink.app.BuildConfig
+import org.holidaylink.app.config.AppConfig
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -18,10 +19,11 @@ import java.util.concurrent.TimeUnit
 /**
  * In-app self-update so a new build never needs a manual reinstall.
  *
- * Two feeds are tried, in order:
- *   1. The GitHub release for this repo (`releases/latest`) — the release tag should be the
- *      versionCode, e.g. `5`, or a `target_code` field can be added to the release body JSON.
- *   2. A plain `{versionName, code, url, notes}` document on holidaylink.org as a fallback.
+ * Three feeds are tried, in order:
+ *   1. The HolidayLink server's `/app/latest` feed, which proxies the private GitHub release
+ *      built by GitHub Actions. This is the normal path for the Android app.
+ *   2. The GitHub release for this repo (`releases/latest`) when the repo is publicly readable.
+ *   3. A plain `{versionName, code, url, notes}` document on holidaylink.org as a fallback.
  *
  * Whichever feed reports a code greater than [BuildConfig.VERSION_CODE] wins. The APK is
  * downloaded into the app cache and handed to the system installer through a FileProvider.
@@ -46,8 +48,10 @@ object AppUpdater {
         .build()
 
     /** A newer version than this build, or null when we are current / offline / feed is quiet. */
-    suspend fun check(): Update? = withContext(Dispatchers.IO) {
-        runCatching { parse(fetch(RELEASES_URL)) }.getOrNull()
+    suspend fun check(context: Context): Update? = withContext(Dispatchers.IO) {
+        val serverFeed = AppConfig.resolve(context).trimEnd('/') + "/app/latest"
+        runCatching { parse(fetch(serverFeed)) }.getOrNull()
+            ?: runCatching { parse(fetch(RELEASES_URL)) }.getOrNull()
             ?: runCatching { parse(fetch(FALLBACK_URL)) }.getOrNull()
     }
 
@@ -61,7 +65,12 @@ object AppUpdater {
                     onProgress(100)
                     return@runCatching target
                 }
-                val req = Request.Builder().url(update.apkUrl)
+                val apkUrl = if (update.apkUrl.startsWith("http://") || update.apkUrl.startsWith("https://")) {
+                    update.apkUrl
+                } else {
+                    AppConfig.resolve(context).trimEnd('/') + update.apkUrl
+                }
+                val req = Request.Builder().url(apkUrl)
                     .header("User-Agent", "HolidayLink")
                     .build()
                 client.newCall(req).execute().use { res ->

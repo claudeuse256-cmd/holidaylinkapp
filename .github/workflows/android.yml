@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -49,6 +52,23 @@ jobs:
           unzip -q gradle-8.9-bin.zip
           echo "$PWD/gradle-8.9/bin" >> "$GITHUB_PATH"
 
+      - name: Read version
+        working-directory: android
+        run: |
+          CODE=$(grep -oP 'versionCode\s*=\s*\K\d+' app/build.gradle.kts | head -1)
+          NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
+          echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "Building HolidayLink $NAME ($CODE)"
+
+      - name: Restore signing keystore
+        run: |
+          if [ -z "${{ secrets.HL_KEYSTORE_BASE64 }}" ]; then
+            echo "HL_KEYSTORE_BASE64 is not set; refusing to publish an APK that cannot update the installed app." >&2
+            exit 1
+          fi
+          echo "${{ secrets.HL_KEYSTORE_BASE64 }}" | base64 -d > android/holidaylink.jks
+
       - name: Resolve production API URL
         run: |
           if [ -n "${{ secrets.HL_API_BASE_URL }}" ]; then
@@ -69,3 +89,18 @@ jobs:
           name: HolidayLink-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
+
+      - name: Name release APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk "android/app/build/outputs/apk/debug/HolidayLink-${VERSION_NAME}-debug.apk"
+
+      - name: Publish GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION_CODE }}
+          name: ${{ env.VERSION_NAME }}
+          body_path: UPDATE_NOTES.md
+          files: android/app/build/outputs/apk/debug/HolidayLink-${{ env.VERSION_NAME }}-debug.apk
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

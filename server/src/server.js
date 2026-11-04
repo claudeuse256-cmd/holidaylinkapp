@@ -4,6 +4,7 @@ import express from 'express';
 import cors from 'cors';
 import admin from 'firebase-admin';
 import nodemailer from 'nodemailer';
+import { Readable } from 'node:stream';
 
 /**
  * HolidayLink OTP service (v3).
@@ -922,6 +923,94 @@ app.post('/account/revoke', async (req, res) => {
       .catch(() => {});
   }
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------- in-app updates
+
+/**
+ * GitHub Actions publishes each successful main-branch build as a release (tag v<code>).
+ * The repository is private, so the phone cannot call GitHub itself. These two routes use
+ * the server's GITHUB_TOKEN and expose only the small feed + the APK bytes the app needs.
+ */
+const GITHUB_REPO = String(process.env.GITHUB_REPO || 'claudeuse256-cmd/holidaylinkapp').trim();
+const GITHUB_TOKEN = String(process.env.GITHUB_TOKEN || '').trim();
+let releaseCache = { at: 0, data: null };
+
+async function latestGithubRelease() {
+  if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN is not configured');
+  if (releaseCache.data && Date.now() - releaseCache.at < 60_000) return releaseCache.data;
+  const response = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, {
+    headers: {
+      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'HolidayLink-Server'
+    }
+  });
+  if (!response.ok) throw new Error(`GitHub release lookup failed (${response.status})`);
+  const release = await response.json();
+  releaseCache = { at: Date.now(), data: release };
+  return release;
+}
+
+function releaseCode(release) {
+  const match = String(release.tag_name || '').match(/\d+/);
+  return match ? Number(match[0]) : 0;
+}
+
+function releaseApk(release) {
+  return (release.assets || []).find((asset) => /\.apk$/i.test(String(asset.name || ''))) || null;
+}
+
+/** GET /app/latest - the JSON feed consumed by AppUpdater. */
+app.get('/app/latest', async (_req, res) => {
+  try {
+    const release = await latestGithubRelease();
+    const code = releaseCode(release);
+    const asset = releaseApk(release);
+    if (!code || !asset) return res.status(404).json({ error: 'NO_APK' });
+    res.json({
+      versionName: String(release.name || release.tag_name || `v${code}`),
+      code,
+      url: `/app/download/${code}`,
+      notes: String(release.body || ''),
+      publishedAt: String(release.published_at || '')
+    });
+  } catch (err) {
+    console.error('[app/latest]', err.message);
+    res.status(503).json({ error: 'UPDATE_UNAVAILABLE', message: err.message });
+  }
+});
+
+/** GET /app/download/:code - streams the APK from the latest GitHub release. */
+app.get('/app/download/:code', async (req, res) => {
+  try {
+    const release = await latestGithubRelease();
+    const code = releaseCode(release);
+    const requested = Number(req.params.code || 0);
+    if (!code || (requested && requested !== code)) {
+      return res.status(404).json({ error: 'VERSION_NOT_FOUND' });
+    }
+    const asset = releaseApk(release);
+    if (!asset) return res.status(404).json({ error: 'NO_APK' });
+
+    const upstream = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/assets/${asset.id}`, {
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: 'application/octet-stream',
+        'User-Agent': 'HolidayLink-Server'
+      }
+    });
+    if (!upstream.ok) throw new Error(`GitHub asset download failed (${upstream.status})`);
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', `attachment; filename="${String(asset.name || 'holidaylink.apk').replace(/"/g, '')}"`);
+    const length = upstream.headers.get('content-length');
+    if (length) res.setHeader('Content-Length', length);
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (err) {
+    console.error('[app/download]', err.message);
+    if (!res.headersSent) res.status(503).json({ error: 'DOWNLOAD_UNAVAILABLE', message: err.message });
+    else res.destroy(err);
+  }
 });
 
 app.listen(PORT, '0.0.0.0', () => {

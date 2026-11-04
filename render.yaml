@@ -42,3 +42,5 @@ services:
         sync: false
       - key: CLOUDINARY_FOLDER
         value: "holidaylink"
+      - key: GITHUB_TOKEN
+        sync: false
