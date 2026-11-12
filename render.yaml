@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: holidaylink-otp
+    runtime: node
+    plan: free
+    autoDeploy: true
+    buildCommand: cd server && npm install --omit=dev --no-audit --no-fund
+    startCommand: cd server && npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: DEFAULT_COUNTRY_CODE
+        value: "256"
+      - key: OTP_COOLDOWN_SECONDS
+        value: "45"
+      - key: YOOLA_API_KEY
+        sync: false
+      - key: YOOLA_SENDER
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_SECURE
+        value: "false"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_UPLOAD_PRESET
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: "holidaylink"
+      - key: GITHUB_TOKEN
+        sync: false
