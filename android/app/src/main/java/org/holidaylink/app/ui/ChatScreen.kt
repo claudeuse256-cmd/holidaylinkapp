@@ -36,7 +36,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.animateItem
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -1126,8 +1125,8 @@ fun ChatScreen(
                     itemsIndexed(shownMessages, key = { _, m -> m.id }) { index, message ->
                         val day = dayOf(message)
                         val prevDay = if (index > 0) dayOf(shownMessages[index - 1]) else null
-                        Column(Modifier.fillMaxWidth().animateItem()) {
-                        if (day != null && day != prevDay) {
+                        Column(Modifier.fillMaxWidth()) {
+                            if (day != null && day != prevDay) {
                             DateSeparator(dayLabel(day))
                         }
                         if (index == unreadAnchor) {
