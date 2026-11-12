@@ -82,12 +82,14 @@ jobs:
           echo "HL_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
           echo "Building Android app with API URL: $API_URL"
 
+      
       - name: Build Debug APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon \
-          -PHL_API_BASE_URL="$HL_API_BASE_URL" \
-          -PHL_VERSION_CODE="$VERSION_CODE" \
-          -PHL_VERSION_NAME="$VERSION_NAME"
+        run: |
+          gradle assembleDebug --no-daemon \
+            -PHL_API_BASE_URL="$HL_API_BASE_URL" \
+            -PHL_VERSION_CODE="$VERSION_CODE" \
+            -PHL_VERSION_NAME="$VERSION_NAME"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
