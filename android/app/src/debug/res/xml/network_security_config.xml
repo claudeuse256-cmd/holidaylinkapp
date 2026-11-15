@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-only override: allows cleartext HTTP to any development host (for example a
+  Termux server reached over the Wi-Fi LAN address). This file lives in the debug
+  source set, so release builds keep the HTTPS-only policy in src/main.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
