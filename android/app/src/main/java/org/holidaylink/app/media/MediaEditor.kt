@@ -75,7 +75,8 @@ object MediaEditor {
         degrees: Int,
         cropZoom: Float,
         overlayText: String,
-        strokes: List<List<Pair<Float, Float>>>
+        strokes: List<List<Pair<Float, Float>>>,
+        cropAspectRatio: Float = 1f
     ): File? {
         val source = preview(file, 2048) ?: return null
         return try {
@@ -83,10 +84,16 @@ object MediaEditor {
             val rotated = Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
             if (rotated !== source) source.recycle()
             val zoom = cropZoom.coerceIn(1f, 2.5f)
-            val cropW = (rotated.width / zoom).toInt().coerceAtLeast(1)
-            val cropH = (rotated.height / zoom).toInt().coerceAtLeast(1)
-            val left = (rotated.width - cropW) / 2
-            val top = (rotated.height - cropH) / 2
+            var cropW = (rotated.width / zoom).toInt().coerceAtLeast(1)
+            var cropH = (rotated.height / zoom).toInt().coerceAtLeast(1)
+            val targetRatio = cropAspectRatio.takeIf { it.isFinite() && it > 0f } ?: (cropW.toFloat() / cropH)
+            if (cropW.toFloat() / cropH > targetRatio) {
+                cropW = (cropH * targetRatio).toInt().coerceAtLeast(1)
+            } else {
+                cropH = (cropW / targetRatio).toInt().coerceAtLeast(1)
+            }
+            val left = ((rotated.width - cropW) / 2).coerceAtLeast(0)
+            val top = ((rotated.height - cropH) / 2).coerceAtLeast(0)
             val cropped = Bitmap.createBitmap(rotated, left, top, cropW, cropH)
             if (cropped !== rotated) rotated.recycle()
             val output = cropped.copy(Bitmap.Config.ARGB_8888, true)

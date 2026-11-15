@@ -99,7 +99,7 @@ fun MediaEditorDialog(
     statusMode: Boolean = false,
     onAddMusic: () -> Unit = {},
     onAddSticker: () -> Unit = {},
-    onSend: (caption: String, rotation: Int, trimStartMs: Long, trimEndMs: Long, cropZoom: Float, overlayText: String, strokes: List<List<Pair<Float, Float>>>) -> Unit
+    onSend: (caption: String, rotation: Int, trimStartMs: Long, trimEndMs: Long, cropZoom: Float, overlayText: String, strokes: List<List<Pair<Float, Float>>>, cropAspectRatio: Float) -> Unit
 ) {
     val scheme = MaterialTheme.colorScheme
     var caption by remember { mutableStateOf("") }
@@ -109,6 +109,7 @@ fun MediaEditorDialog(
     var duration by remember { mutableLongStateOf(0L) }
     var preparing by remember { mutableStateOf(false) }
     var cropZoom by remember { mutableStateOf(1f) }
+    var cropAspectRatio by remember(statusMode) { mutableStateOf(if (statusMode) 9f / 16f else 1f) }
     var overlayText by remember { mutableStateOf("") }
     var drawingEnabled by remember { mutableStateOf(true) }
     val strokes = remember { mutableStateListOf<MutableList<Offset>>() }
@@ -134,7 +135,7 @@ fun MediaEditorDialog(
         ) {
             // Title bar
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+                Modifier.fillMaxWidth().background(if (statusMode) Color(0xFF080D16) else scheme.surface).padding(horizontal = 6.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = onCancel) {
@@ -153,13 +154,13 @@ fun MediaEditorDialog(
                 Text(
                     "Send",
                     style = MaterialTheme.typography.titleSmall,
-                    color = scheme.primary,
+                    color = if (statusMode) Color(0xFF54D6C8) else scheme.primary,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier
                         .clip(RoundedCornerShape(20.dp))
                         .clickable(enabled = !preparing) {
                             preparing = true
-                            onSend(caption.trim(), rotation, trimStart, trimEnd, cropZoom, overlayText, strokes.map { line -> line.map { p -> (p.x / 10000f).coerceIn(0f,1f) to (p.y / 10000f).coerceIn(0f,1f) } })
+                            onSend(caption.trim(), rotation, trimStart, trimEnd, cropZoom, overlayText, strokes.map { line -> line.map { p -> (p.x / 10000f).coerceIn(0f,1f) to (p.y / 10000f).coerceIn(0f,1f) } }, cropAspectRatio)
                         }
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                 )
@@ -184,7 +185,7 @@ fun MediaEditorDialog(
                 Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .background(scheme.surfaceContainerLowest),
+                    .background(if (statusMode) Color(0xFF05080D) else scheme.surfaceContainerLowest),
                 contentAlignment = Alignment.Center
             ) {
                 when {

@@ -1235,12 +1235,12 @@ fun ChatScreen(
             fileName = editor.fileName,
             mimeType = editor.mimeType,
             onCancel = { editorFor = null },
-            onSend = { caption, rotation, trimStart, trimEnd, cropZoom, overlayText, strokes ->
+            onSend = { caption, rotation, trimStart, trimEnd, cropZoom, overlayText, strokes, cropAspectRatio ->
                 editorFor = null
                 scope.launch {
                     val editedSource = if (editor.kind == "image" && (rotation != 0 || cropZoom > 1f || overlayText.isNotBlank() || strokes.isNotEmpty())) {
                         val rendered = withContext(Dispatchers.IO) {
-                            MediaEditor.applyPhotoEdits(editor.file, rotation, cropZoom, overlayText, strokes)
+                            MediaEditor.applyPhotoEdits(editor.file, rotation, cropZoom, overlayText, strokes, cropAspectRatio)
                         }
                         if (rendered != null) editor.copy(file = rendered) else {
                             snackbar.showSnackbar("Some photo edits could not be applied; sending the original photo instead.")

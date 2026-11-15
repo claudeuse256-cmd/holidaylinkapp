@@ -1076,7 +1076,7 @@ private fun StatusComposer(
             onAddMusic = { musicPicker.launch(arrayOf("audio/*")) },
             onAddSticker = { stickerPicker = true },
             onCancel = { statusEditorOpen = false },
-            onSend = { caption, rotation, trimStart, trimEnd, cropZoom, overlayText, strokes ->
+            onSend = { caption, rotation, trimStart, trimEnd, cropZoom, overlayText, strokes, cropAspectRatio ->
                 statusEditorOpen = false
                 if (caption.isNotBlank()) text = caption.take(280)
                 scope.launch {
@@ -1085,7 +1085,7 @@ private fun StatusComposer(
                         videoTrimEndMs = trimEnd
                     } else {
                         val rendered = withContext(Dispatchers.IO) {
-                            MediaEditor.applyPhotoEdits(editingFile, rotation, cropZoom, overlayText, strokes)
+                            MediaEditor.applyPhotoEdits(editingFile, rotation, cropZoom, overlayText, strokes, cropAspectRatio)
                         }
                         if (rendered != null) {
                             val bytes = withContext(Dispatchers.IO) { rendered.readBytes() }

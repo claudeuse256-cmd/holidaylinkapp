@@ -61,7 +61,9 @@ object AppUpdater {
     suspend fun check(context: Context): Update? = withContext(Dispatchers.IO) {
         val serverFeed = AppConfig.resolve(context).trimEnd('/') + "/app/latest"
         var lastError: Throwable? = null
-        for (feed in listOf(serverFeed, RELEASES_URL, FALLBACK_URL)) {
+        // GitHub Releases is the public source of truth for APKs produced by Actions.
+        // Check it first so a sleeping Render instance cannot make update checks appear broken.
+        for (feed in listOf(RELEASES_URL, serverFeed, FALLBACK_URL)) {
             try {
                 return@withContext parse(fetch(feed))
             } catch (t: Throwable) {
@@ -158,7 +160,8 @@ object AppUpdater {
     private fun fetch(url: String): String {
         val req = Request.Builder().url(url)
             .header("Accept", "application/vnd.github+json, application/json")
-            .header("User-Agent", "HolidayLink")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "HolidayLink-Android")
             .build()
         client.newCall(req).execute().use { res ->
             if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
