@@ -1,3 +1,4 @@
+
 name: Build HolidayLink APK
 
 on:
@@ -52,10 +53,8 @@ jobs:
           unzip -q gradle-8.9-bin.zip
           echo "$PWD/gradle-8.9/bin" >> "$GITHUB_PATH"
 
-      - name: Set unique version for this Actions build
+      - name: Set unique version
         run: |
-          # GitHub run_number increases on every run of this workflow.
-          # This makes every published APK newer than the checked-in baseline.
           CODE=$((10000 + GITHUB_RUN_NUMBER))
           NAME="2.4.6+build.${GITHUB_RUN_NUMBER}"
           echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
@@ -68,7 +67,7 @@ jobs:
             echo "${{ secrets.HL_KEYSTORE_BASE64 }}" | base64 -d > android/holidaylink.jks
             echo "HAS_RELEASE_KEYSTORE=true" >> "$GITHUB_ENV"
           else
-            echo "HL_KEYSTORE_BASE64 is not set; building with debug signing (updates may not install over release builds)."
+            echo "HL_KEYSTORE_BASE64 is not set; using debug signing."
             echo "HAS_RELEASE_KEYSTORE=false" >> "$GITHUB_ENV"
           fi
 
@@ -80,14 +79,12 @@ jobs:
             API_URL="https://holidaylink-server.onrender.com"
           fi
           echo "HL_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
-          echo "Building Android app with API URL: $API_URL"
+          echo "Building with API URL: $API_URL"
 
-      - name: Build Debug APK
+      - name: Build APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon \
-          -PHL_API_BASE_URL="$HL_API_BASE_URL" \
-          -PHL_VERSION_CODE="$VERSION_CODE" \
-          -PHL_VERSION_NAME="$VERSION_NAME"
+        run: |
+          gradle assembleDebug --no-daemon "-PHL_API_BASE_URL=${HL_API_BASE_URL}" "-PHL_VERSION_CODE=${VERSION_CODE}" "-PHL_VERSION_NAME=${VERSION_NAME}"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -97,7 +94,8 @@ jobs:
           retention-days: 14
 
       - name: Name release APK
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk "android/app/build/outputs/apk/debug/HolidayLink-${VERSION_NAME}-debug.apk"
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk "android/app/build/outputs/apk/debug/HolidayLink-${VERSION_NAME}-debug.apk"
 
       - name: Publish latest Actions APK as a GitHub Release asset
         if: github.ref == 'refs/heads/main'
