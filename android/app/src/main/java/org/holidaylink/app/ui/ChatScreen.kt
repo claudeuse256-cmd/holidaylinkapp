@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -159,67 +160,11 @@ import org.holidaylink.app.net.StudyBuddy
 import org.holidaylink.app.net.User
 import org.holidaylink.app.net.StatusUpdate
 import org.holidaylink.app.voice.VoiceRecorder
+import org.holidaylink.app.ui.AnimatedSticker
+import org.holidaylink.app.ui.StickerCatalog
 import org.holidaylink.app.ui.StickerItem
+import org.holidaylink.app.ui.stickerAssetPath
 import java.util.UUID
-
-/**
- * Built-in animated sticker pack. Each entry is a Lottie JSON URL placeholder that can be
- * swapped for HolidayLink's own sticker art later.
- */
-private data class StickerDef(val id: String, val title: String, val resId: Int)
-
-private val stickerPack = listOf(
-    StickerDef("happy", "Happy", org.holidaylink.app.R.raw.hl_sticker_happy),
-    StickerDef("laugh", "Laugh", org.holidaylink.app.R.raw.hl_sticker_laugh),
-    StickerDef("love", "Love", org.holidaylink.app.R.raw.hl_sticker_love),
-    StickerDef("heart", "Heart", org.holidaylink.app.R.raw.hl_sticker_heart),
-    StickerDef("kiss", "Kiss", org.holidaylink.app.R.raw.hl_sticker_kiss),
-    StickerDef("wink", "Wink", org.holidaylink.app.R.raw.hl_sticker_wink),
-    StickerDef("cool", "Cool", org.holidaylink.app.R.raw.hl_sticker_cool),
-    StickerDef("fire", "Fire", org.holidaylink.app.R.raw.hl_sticker_fire),
-    StickerDef("star", "Star", org.holidaylink.app.R.raw.hl_sticker_star),
-    StickerDef("clap", "Clap", org.holidaylink.app.R.raw.hl_sticker_clap),
-    StickerDef("wave", "Wave", org.holidaylink.app.R.raw.hl_sticker_wave),
-    StickerDef("party", "Party", org.holidaylink.app.R.raw.hl_sticker_party),
-    StickerDef("sad", "Sad", org.holidaylink.app.R.raw.hl_sticker_sad),
-    StickerDef("cry", "Cry", org.holidaylink.app.R.raw.hl_sticker_cry),
-    StickerDef("angry", "Angry", org.holidaylink.app.R.raw.hl_sticker_angry),
-    StickerDef("wow", "Wow", org.holidaylink.app.R.raw.hl_sticker_wow),
-    StickerDef("sleep", "Sleep", org.holidaylink.app.R.raw.hl_sticker_sleep),
-    StickerDef("coffee", "Coffee", org.holidaylink.app.R.raw.hl_sticker_coffee),
-    StickerDef("music", "Music", org.holidaylink.app.R.raw.hl_sticker_music),
-    StickerDef("dance", "Dance", org.holidaylink.app.R.raw.hl_sticker_dance),
-    StickerDef("rocket", "Rocket", org.holidaylink.app.R.raw.hl_sticker_rocket),
-    StickerDef("trophy", "Trophy", org.holidaylink.app.R.raw.hl_sticker_trophy),
-    StickerDef("flower", "Flower", org.holidaylink.app.R.raw.hl_sticker_flower),
-    StickerDef("sun", "Sun", org.holidaylink.app.R.raw.hl_sticker_sun),
-    StickerDef("moon", "Moon", org.holidaylink.app.R.raw.hl_sticker_moon),
-    StickerDef("rainbow", "Rainbow", org.holidaylink.app.R.raw.hl_sticker_rainbow),
-    StickerDef("cat", "Cat", org.holidaylink.app.R.raw.hl_sticker_cat),
-    StickerDef("dog", "Dog", org.holidaylink.app.R.raw.hl_sticker_dog),
-    StickerDef("bear", "Bear", org.holidaylink.app.R.raw.hl_sticker_bear),
-    StickerDef("bunny", "Bunny", org.holidaylink.app.R.raw.hl_sticker_bunny),
-    StickerDef("ghost", "Ghost", org.holidaylink.app.R.raw.hl_sticker_ghost),
-    StickerDef("robot", "Robot", org.holidaylink.app.R.raw.hl_sticker_robot),
-    StickerDef("alien", "Alien", org.holidaylink.app.R.raw.hl_sticker_alien),
-    StickerDef("crown", "Crown", org.holidaylink.app.R.raw.hl_sticker_crown),
-    StickerDef("diamond", "Diamond", org.holidaylink.app.R.raw.hl_sticker_diamond),
-    StickerDef("gift", "Gift", org.holidaylink.app.R.raw.hl_sticker_gift),
-    StickerDef("balloon", "Balloon", org.holidaylink.app.R.raw.hl_sticker_balloon),
-    StickerDef("pizza", "Pizza", org.holidaylink.app.R.raw.hl_sticker_pizza),
-    StickerDef("icecream", "Ice cream", org.holidaylink.app.R.raw.hl_sticker_icecream),
-    StickerDef("football", "Football", org.holidaylink.app.R.raw.hl_sticker_football),
-    StickerDef("thumbsup", "Thumbs up", org.holidaylink.app.R.raw.hl_sticker_thumbsup),
-    StickerDef("ok", "OK", org.holidaylink.app.R.raw.hl_sticker_ok),
-    StickerDef("pray", "Pray", org.holidaylink.app.R.raw.hl_sticker_pray),
-    StickerDef("strong", "Strong", org.holidaylink.app.R.raw.hl_sticker_strong),
-    StickerDef("thinking", "Thinking", org.holidaylink.app.R.raw.hl_sticker_thinking),
-    StickerDef("shy", "Shy", org.holidaylink.app.R.raw.hl_sticker_shy),
-    StickerDef("sparkle", "Sparkle", org.holidaylink.app.R.raw.hl_sticker_sparkle),
-    StickerDef("butterfly", "Butterfly", org.holidaylink.app.R.raw.hl_sticker_butterfly),
-    StickerDef("lightning", "Lightning", org.holidaylink.app.R.raw.hl_sticker_lightning),
-    StickerDef("hug", "Hug", org.holidaylink.app.R.raw.hl_sticker_hug)
-)
 
 /**
  * Conversation screen on Firestore (same docs as the website room).
@@ -1483,19 +1428,57 @@ fun ChatScreen(
     }
 
     if (showStickers) {
+        val packs = remember(context) { StickerCatalog.packs(context) }
+        var selectedPack by remember(showStickers) { mutableStateOf(packs.firstOrNull()?.id.orEmpty()) }
+        val current = packs.firstOrNull { it.id == selectedPack } ?: packs.firstOrNull()
         ModalBottomSheet(
             onDismissRequest = { showStickers = false },
             sheetState = rememberModalBottomSheetState()
         ) {
-            Column(Modifier.padding(10.dp)) {
+            Column(Modifier.fillMaxWidth().heightIn(max = 520.dp).padding(horizontal = 10.dp, vertical = 6.dp)) {
                 Text("Stickers", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(8.dp))
-                LazyVerticalGrid(columns = GridCells.Fixed(4)) {
-                    items(stickerPack, key = { it.title }) { s ->
+                if (packs.size > 1) {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                        items(packs, key = { it.id }) { pack ->
+                            val active = pack.id == current?.id
+                            Column(
+                                Modifier
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                                    .clickable { selectedPack = pack.id }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                val preview = pack.stickers.firstOrNull()
+                                if (preview != null) {
+                                    AnimatedSticker(
+                                        url = preview.ref,
+                                        assetPath = preview.assetPath,
+                                        resId = preview.resId,
+                                        size = 30.dp
+                                    )
+                                }
+                                Text(
+                                    pack.title,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                }
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(4),
+                    modifier = Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(min = 180.dp, max = 420.dp)
+                ) {
+                    items(current?.stickers.orEmpty(), key = { it.ref }) { s ->
                         StickerItem(
                             title = s.title,
-                            stickerId = s.id,
+                            ref = s.ref,
                             resId = s.resId,
+                            assetPath = s.assetPath,
                             onPick = { stickerRef ->
                                 scope.launch {
                                     runCatching { FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = stickerRef) }
@@ -1791,7 +1774,8 @@ private fun FsMessageBubble(
                     ViewOnceRow(mine = mine, onOpen = { onOpenViewOnce(message) })
                 } else if (message.type == "sticker" && !message.imageUrl.isNullOrBlank()) {
                     AnimatedSticker(
-                        url = message.imageUrl?.takeUnless { it.startsWith("hlsticker://") },
+                        url = message.imageUrl,
+                        assetPath = stickerAssetPath(message.imageUrl),
                         resId = bundledStickerResource(message.imageUrl),
                         size = 164.dp,
                         modifier = Modifier.padding(2.dp)

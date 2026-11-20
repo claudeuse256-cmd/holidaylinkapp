@@ -167,6 +167,7 @@ import org.holidaylink.app.ui.UserProfileScreen
 import org.holidaylink.app.ui.rememberBatteryOptimizationState
 import org.holidaylink.app.ui.rememberNotificationPermissionState
 import org.holidaylink.app.ui.theme.HolidayLinkTheme
+import org.holidaylink.app.ui.StartupUpdateGate
 import org.holidaylink.app.ui.FeatureHubScreen
 import org.holidaylink.app.ui.GroupInfoScreen
 import org.holidaylink.app.ui.StoreScreen
@@ -335,6 +336,7 @@ private fun HolidayLinkApp(activity: FragmentActivity) {
             modifier = Modifier.fillMaxSize(),
             color = androidx.compose.material3.MaterialTheme.colorScheme.background
         ) {
+        StartupUpdateGate()
         AppLockGate {
             var signedIn by remember { mutableStateOf(FirebaseBackend.currentUser != null) }
             var addingAccount by remember { mutableStateOf(false) }

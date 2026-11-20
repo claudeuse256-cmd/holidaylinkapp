@@ -35,8 +35,8 @@ android {
         targetSdk = 35
         // CI supplies a monotonically increasing code for every GitHub Actions build.
         // Local builds retain the checked-in fallback values.
-        versionCode = (project.findProperty("HL_VERSION_CODE") as String?)?.toIntOrNull() ?: 19
-        versionName = (project.findProperty("HL_VERSION_NAME") as String?) ?: "2.4.6"
+        versionCode = (project.findProperty("HL_VERSION_CODE") as String?)?.toIntOrNull() ?: 20
+        versionName = (project.findProperty("HL_VERSION_NAME") as String?) ?: "2.4.7"
 
         buildConfigField("String", "API_BASE_URL", "\"$apiBaseUrl\"")
         buildConfigField("String", "TURN_HOST", "\"$turnHost\"")

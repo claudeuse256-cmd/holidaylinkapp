@@ -56,7 +56,7 @@ jobs:
       - name: Set unique version
         run: |
           CODE=$((10000 + GITHUB_RUN_NUMBER))
-          NAME="2.4.6+build.${GITHUB_RUN_NUMBER}"
+          NAME="2.4.7+build.${GITHUB_RUN_NUMBER}"
           echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
           echo "VERSION_NAME=$NAME" >> "$GITHUB_ENV"
           echo "Building HolidayLink $NAME ($CODE)"

@@ -853,7 +853,7 @@ private fun StatusComposer(
                             if (text.isNotBlank()) Text(text, color = Color.White, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
                             if (selectedStickerIds.isNotEmpty()) {
                                 Row(horizontalArrangement = Arrangement.Center) {
-                                    selectedStickerIds.take(3).forEach { id -> AnimatedSticker(resId = bundledStickerResource("hlsticker://$id"), size = 54.dp) }
+                                    selectedStickerIds.take(3).forEach { id -> val ref = statusStickerRef(id); AnimatedSticker(url = ref, assetPath = stickerAssetPath(ref), resId = bundledStickerResource(ref), size = 54.dp) }
                                 }
                             }
                             val tagged = text.split(Regex("\\s+")).filter { it.startsWith("@") && it.length > 1 }
@@ -978,26 +978,61 @@ private fun StatusComposer(
                 if (selectedStickerIds.isNotEmpty()) {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(selectedStickerIds.toList(), key = { it }) { stickerId ->
+                            val ref = statusStickerRef(stickerId)
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                AnimatedSticker(resId = bundledStickerResource("hlsticker://$stickerId"), size = 48.dp)
+                                AnimatedSticker(
+                                    url = ref,
+                                    assetPath = stickerAssetPath(ref),
+                                    resId = bundledStickerResource(ref),
+                                    size = 48.dp
+                                )
                                 TextButton(onClick = { selectedStickerIds.remove(stickerId) }) { Text("Remove") }
                             }
                         }
                     }
                 }
                 if (stickerPicker) {
-                    val ids = listOf("happy","laugh","love","heart","kiss","wink","cool","fire","star","clap","wave","party","sad","cry","angry","wow","sleep","coffee","music","dance","rocket","trophy","flower","sun","moon","rainbow","cat","dog","bear","bunny","ghost","robot","alien","crown","diamond","gift","balloon","pizza","icecream","football","thumbsup","ok","pray","strong","thinking","shy","sparkle","butterfly","lightning","hug")
+                    val packs = remember { StickerCatalog.packs(context) }
+                    var selectedPack by remember { mutableStateOf(packs.firstOrNull()?.id.orEmpty()) }
+                    val currentPack = packs.firstOrNull { it.id == selectedPack } ?: packs.firstOrNull()
                     AlertDialog(
                         onDismissRequest = { stickerPicker = false },
                         title = { Text("Animated stickers") },
                         text = {
-                            LazyVerticalGrid(columns = GridCells.Fixed(4), modifier = Modifier.height(300.dp)) {
-                                gridItems(ids, key = { it }) { id ->
-                                    Column(Modifier.clickable {
-                                        if (id !in selectedStickerIds) selectedStickerIds.add(id)
-                                    }.padding(4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                                        AnimatedSticker(resId = bundledStickerResource("hlsticker://$id"), size = 54.dp)
-                                        Text(id, style = MaterialTheme.typography.labelSmall)
+                            Column {
+                                if (packs.size > 1) {
+                                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 8.dp)) {
+                                        items(packs, key = { it.id }) { pack ->
+                                            val active = pack.id == currentPack?.id
+                                            Column(
+                                                Modifier
+                                                    .clip(RoundedCornerShape(10.dp))
+                                                    .background(if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+                                                    .clickable { selectedPack = pack.id }
+                                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                                horizontalAlignment = Alignment.CenterHorizontally
+                                            ) {
+                                                pack.stickers.firstOrNull()?.let { preview ->
+                                                    AnimatedSticker(url = preview.ref, assetPath = preview.assetPath, resId = preview.resId, size = 26.dp)
+                                                }
+                                                Text(pack.title, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                                            }
+                                        }
+                                    }
+                                }
+                                LazyVerticalGrid(columns = GridCells.Fixed(4), modifier = Modifier.height(300.dp)) {
+                                    gridItems(currentPack?.stickers.orEmpty(), key = { it.ref }) { sticker ->
+                                        val chosen = sticker.ref in selectedStickerIds || sticker.ref.removePrefix("hlsticker://") in selectedStickerIds
+                                        Column(
+                                            Modifier.clickable {
+                                                val value = sticker.ref
+                                                if (value !in selectedStickerIds) selectedStickerIds.add(value)
+                                            }.padding(4.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally
+                                        ) {
+                                            AnimatedSticker(url = sticker.ref, assetPath = sticker.assetPath, resId = sticker.resId, size = 54.dp)
+                                            Text(if (chosen) "Added" else sticker.title, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        }
                                     }
                                 }
                             }
@@ -1611,7 +1646,7 @@ private fun StatusViewer(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     current.stickerIds.take(4).forEach { stickerId ->
-                        AnimatedSticker(resId = bundledStickerResource("hlsticker://$stickerId"), size = 104.dp)
+                        run { val ref = statusStickerRef(stickerId); AnimatedSticker(url = ref, assetPath = stickerAssetPath(ref), resId = bundledStickerResource(ref), size = 104.dp) }
                     }
                 }
             }
@@ -1818,4 +1853,17 @@ private fun statusGradientColor(i: Int): Color {
         Color(0xFF6A1B9A), Color(0xFF00897B), Color(0xFF3949AB)
     )
     return palette[i.mod(palette.size)]
+}
+
+private fun statusStickerRef(idOrRef: String): String {
+    return when {
+        idOrRef.startsWith("hlsticker://") -> idOrRef
+        idOrRef.startsWith("pack:") -> {
+            val rest = idOrRef.removePrefix("pack:")
+            val parts = rest.split(":", limit = 2)
+            if (parts.size == 2) "hlsticker://pack/${parts[0]}/${parts[1]}" else "hlsticker://$idOrRef"
+        }
+        idOrRef.contains('/') -> "hlsticker://$idOrRef"
+        else -> "hlsticker://$idOrRef"
+    }
 }

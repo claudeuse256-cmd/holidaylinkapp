@@ -1,3 +1,10 @@
+# HolidayLink 2.4.7
+
+## What's new
+- Telegram-style sticker packs: added Orangoutang, OwledDidi, SnappyCrab, and UtyaDuck packs with in-chat pack picker.
+- App updates: checks for new releases on open, shows updates immediately, and requires updating after 24 hours from release.
+- Push notification delivery flow verified and kept active (FCM token registration, server relay, and message/call alerts).
+
 HolidayLink 2.4.4
 
 • In-app updates now check the latest GitHub Actions build automatically.

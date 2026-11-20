@@ -37,7 +37,26 @@ object AppUpdater {
         val apkUrl: String,
         val notes: String,
         val publishedAt: String
-    )
+    ) {
+        /** True when this release has been out for at least 24 hours and must be installed. */
+        fun isMandatory(nowMs: Long = System.currentTimeMillis()): Boolean {
+            val publishedMs = parsePublishedAt(publishedAt) ?: return false
+            return nowMs - publishedMs >= 24L * 60L * 60L * 1000L
+        }
+    }
+
+    private fun parsePublishedAt(raw: String): Long? {
+        if (raw.isBlank()) return null
+        return runCatching { java.time.Instant.parse(raw).toEpochMilli() }.getOrNull()
+            ?: runCatching {
+                java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssX", java.util.Locale.US)
+                    .parse(raw)?.time
+            }.getOrNull()
+            ?: runCatching {
+                java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX", java.util.Locale.US)
+                    .parse(raw)?.time
+            }.getOrNull()
+    }
 
     private const val RELEASES_URL =
         "https://api.github.com/repos/claudeuse256-cmd/holidaylinkapp/releases/latest"
