@@ -1733,19 +1733,24 @@ private fun FsMessageBubble(
                 },
             horizontalAlignment = if (mine) Alignment.End else Alignment.Start
         ) {
+        val isStickerMessage = message.type == "sticker" && !message.imageUrl.isNullOrBlank()
         Box(
             Modifier
                 .widthIn(max = 300.dp)
-                .clip(
-                    RoundedCornerShape(
-                        topStart = 16.dp, topEnd = 16.dp,
-                        bottomStart = if (mine) 16.dp else 4.dp,
-                        bottomEnd = if (mine) 4.dp else 16.dp
-                    )
+                .then(
+                    if (isStickerMessage) Modifier
+                    else Modifier
+                        .clip(
+                            RoundedCornerShape(
+                                topStart = 16.dp, topEnd = 16.dp,
+                                bottomStart = if (mine) 16.dp else 4.dp,
+                                bottomEnd = if (mine) 4.dp else 16.dp
+                            )
+                        )
+                        .background(bubbleColor)
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
                 )
-                .background(bubbleColor)
                 .combinedClickable(onClick = {}, onLongClick = onLongPress)
-                .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             Column {
                 if (message.replyToBody != null) {
@@ -1776,7 +1781,6 @@ private fun FsMessageBubble(
                     AnimatedSticker(
                         url = message.imageUrl,
                         assetPath = stickerAssetPath(message.imageUrl),
-                        resId = bundledStickerResource(message.imageUrl),
                         size = 164.dp,
                         modifier = Modifier.padding(2.dp)
                     )

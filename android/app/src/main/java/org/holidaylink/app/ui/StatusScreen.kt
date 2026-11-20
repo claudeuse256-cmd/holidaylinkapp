@@ -853,7 +853,7 @@ private fun StatusComposer(
                             if (text.isNotBlank()) Text(text, color = Color.White, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
                             if (selectedStickerIds.isNotEmpty()) {
                                 Row(horizontalArrangement = Arrangement.Center) {
-                                    selectedStickerIds.take(3).forEach { id -> val ref = statusStickerRef(id); AnimatedSticker(url = ref, assetPath = stickerAssetPath(ref), resId = bundledStickerResource(ref), size = 54.dp) }
+                                    selectedStickerIds.take(3).forEach { id -> val ref = statusStickerRef(id); AnimatedSticker(url = ref, assetPath = stickerAssetPath(ref), size = 54.dp) }
                                 }
                             }
                             val tagged = text.split(Regex("\\s+")).filter { it.startsWith("@") && it.length > 1 }
@@ -983,7 +983,6 @@ private fun StatusComposer(
                                 AnimatedSticker(
                                     url = ref,
                                     assetPath = stickerAssetPath(ref),
-                                    resId = bundledStickerResource(ref),
                                     size = 48.dp
                                 )
                                 TextButton(onClick = { selectedStickerIds.remove(stickerId) }) { Text("Remove") }
@@ -1646,7 +1645,7 @@ private fun StatusViewer(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     current.stickerIds.take(4).forEach { stickerId ->
-                        run { val ref = statusStickerRef(stickerId); AnimatedSticker(url = ref, assetPath = stickerAssetPath(ref), resId = bundledStickerResource(ref), size = 104.dp) }
+                        run { val ref = statusStickerRef(stickerId); AnimatedSticker(url = ref, assetPath = stickerAssetPath(ref), size = 104.dp) }
                     }
                 }
             }
