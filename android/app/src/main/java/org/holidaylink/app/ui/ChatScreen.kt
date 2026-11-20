@@ -42,7 +42,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
@@ -1473,7 +1473,7 @@ fun ChatScreen(
                     columns = GridCells.Fixed(4),
                     modifier = Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(min = 180.dp, max = 420.dp)
                 ) {
-                    items(current?.stickers.orEmpty(), key = { it.ref }) { s ->
+                    gridItems(current?.stickers.orEmpty(), key = { it.ref }) { s ->
                         StickerItem(
                             title = s.title,
                             ref = s.ref,
