@@ -1,5 +1,5 @@
 package org.holidaylink.app.ui
-
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
