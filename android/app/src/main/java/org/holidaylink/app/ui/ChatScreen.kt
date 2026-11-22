@@ -163,6 +163,10 @@ import org.holidaylink.app.voice.VoiceRecorder
 import org.holidaylink.app.ui.AnimatedSticker
 import org.holidaylink.app.ui.StickerCatalog
 import org.holidaylink.app.ui.StickerItem
+import org.holidaylink.app.net.ChatSounds
+import org.holidaylink.app.net.FirestoreGroups
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.material.icons.filled.Schedule
 import org.holidaylink.app.ui.stickerAssetPath
 import java.util.UUID
 
@@ -219,7 +223,7 @@ fun ChatScreen(
     var uploading by remember { mutableStateOf(false) }
     // Messages that are on their way out. They appear the moment send is tapped and keep
     // showing what is happening (upload %, sending, failed + retry).
-    var outbox by remember { mutableStateOf<List<OutgoingItem>>(emptyList()) }
+    val outbox: List<OutgoingItem> = OutboxStore.items(chat.id)
     // The "edit before sending" screen for a picked photo, video or document.
     var editorFor by remember { mutableStateOf<EditorSource?>(null) }
     var error by remember { mutableStateOf("") }
@@ -233,7 +237,6 @@ fun ChatScreen(
 
     var sheetFor by remember { mutableStateOf<FirestoreChat.ChatMessage?>(null) }
     var showAttach by remember { mutableStateOf(false) }
-    var showEmoji by remember { mutableStateOf(false) }
     var showStickers by remember { mutableStateOf(false) }
     var viewOnceSend by remember { mutableStateOf(false) }
     var selfDestructSecs by remember { mutableLongStateOf(0L) }
@@ -455,11 +458,56 @@ fun ChatScreen(
         }
     }
 
+    // Groups show who wrote each message, with the admin / custom tag next to the name.
+    val isGroupChat = chat.kind != "direct"
+    val groupFlow = remember(chat.id) {
+        if (isGroupChat) FirestoreGroups.groupFlow(chat.id) else kotlinx.coroutines.flow.flowOf(null)
+    }
+    val groupInfo by groupFlow.collectAsState(initial = null)
+    if (isGroupChat) {
+        LaunchedEffect(chat.id, rawMessages.size) {
+            rawMessages.map { it.senderId }.distinct()
+                .filter { it != uid && it !in SenderNameCache.names }
+                .forEach { id ->
+                    val name = runCatching { FirebaseBackend.loadProfile(id)?.name }.getOrNull()
+                    SenderNameCache.names[id] = name?.takeIf { it.isNotBlank() } ?: "Member"
+                }
+        }
+    }
+
+    // A soft sound for a message that arrives while this conversation is open, like WhatsApp.
+    var heardIds by remember(chat.id) { mutableStateOf<Set<String>?>(null) }
+    LaunchedEffect(rawMessages) {
+        if (rawMessages.isEmpty()) return@LaunchedEffect
+        val before = heardIds
+        heardIds = rawMessages.map { it.id }.toSet()
+        // The first load is history, not news.
+        if (before == null) return@LaunchedEffect
+        val now = System.currentTimeMillis() / 1000
+        val fresh = rawMessages.any { m ->
+            m.id !in before && m.senderId != uid && m.type != "call" && !m.pending &&
+                (m.createdAt?.seconds ?: now) >= now - 30
+        }
+        if (fresh) ChatSounds.playReceive(context)
+    }
+
+    // Opening the keyboard shrinks the message list. Keep the newest message in view instead
+    // of leaving it hidden behind the keyboard and the input.
+    val imeVisible = WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
+    LaunchedEffect(imeVisible) {
+        if (!imeVisible) return@LaunchedEffect
+        repeat(2) {
+            delay(180)
+            val total = shownMessages.size + outbox.size + (if (peerTyping) 1 else 0)
+            if (total > 0) listState.scrollToItem(total - 1)
+        }
+    }
+
     // When the stored message finally arrives, the local bubble has done its job.
     LaunchedEffect(messages, outbox) {
         val ids = messages.map { it.id }.toSet()
         val done = outbox.filter { it.serverId != null && it.serverId in ids }.map { it.localId }
-        if (done.isNotEmpty()) outbox = outbox.filter { it.localId !in done }
+        if (done.isNotEmpty()) OutboxStore.removeAll(chat.id, done)
     }
 
     // Reading a conversation marks it as read: the tray alert disappears, and a message
@@ -505,24 +553,23 @@ fun ChatScreen(
         return Triple("@${bot.username}", bot.id, instruction)
     }
 
-    /**
-     * Applies a change to one outgoing message.
-     *
-     * The upload progress arrives on a network thread, so the change is always applied on
-     * the main thread — that keeps the list from flickering and the state consistent.
-     */
+    /** Applies a change to one outgoing message (kept in the app-wide outbox). */
     fun updateOutgoing(localId: String, block: (OutgoingItem) -> OutgoingItem) {
-        scope.launch {
-            outbox = outbox.map { if (it.localId == localId) block(it) else it }
-        }
+        OutboxStore.update(chat.id, localId, block)
     }
 
-    /** Writes a text message to Firestore and keeps the local bubble in step with it. */
+    /**
+     * Writes a text message to Firestore. The write is queued on the phone straight away, so
+     * the message shows in the list at once and, with no internet, waits there (with a clock)
+     * and is sent when the connection returns. Only a message the server actually refuses
+     * ends up as a "not sent" bubble with a retry button.
+     */
     fun deliverText(localId: String, body: String, replyToId: String?, replyToBody: String?) {
-        scope.launch {
+        val chatId = chat.id
+        OutboxStore.launch {
             try {
-                val serverId = FirestoreChat.send(
-                    chatId = chat.id,
+                FirestoreChat.send(
+                    chatId = chatId,
                     text = body,
                     kind = "text",
                     ttlSeconds = 0,
@@ -530,11 +577,21 @@ fun ChatScreen(
                     replyToBody = replyToBody,
                     replyToName = null
                 )
-                updateOutgoing(localId) { it.copy(stage = OutgoingStage.SENT, serverId = serverId) }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                updateOutgoing(localId) {
-                    it.copy(stage = OutgoingStage.FAILED, error = "Not sent — tap to retry")
-                }
+                OutboxStore.add(
+                    chatId,
+                    OutgoingItem(
+                        localId = localId,
+                        kind = "text",
+                        text = body,
+                        stage = OutgoingStage.FAILED,
+                        error = "Not sent — tap to retry",
+                        replyToId = replyToId,
+                        replyToBody = replyToBody
+                    )
+                )
             }
         }
     }
@@ -561,21 +618,14 @@ fun ChatScreen(
             }
             return
         }
-        // Sending is instant: the bubble shows up the moment the button is tapped and the
-        // tick follows when the message is really stored.
+        // The message is written at once and shows in the list straight away (with a clock
+        // until the server confirms it). Offline it stays queued and goes out when the
+        // connection returns, even if the app is closed in between.
         draft = ""
         replyingTo = null
-        val localId = UUID.randomUUID().toString()
-        outbox = outbox + OutgoingItem(
-            localId = localId,
-            kind = "text",
-            text = body,
-            stage = OutgoingStage.SENDING,
-            replyToId = reply?.id,
-            replyToBody = reply?.text?.take(120)?.ifBlank { "[photo]" }
-        )
+        ChatSounds.playSend(context)
         deliverText(
-            localId,
+            UUID.randomUUID().toString(),
             body,
             reply?.id,
             reply?.text?.take(120)?.ifBlank { "[photo]" }
@@ -619,76 +669,6 @@ fun ChatScreen(
         }
     }
 
-    /** Applies the edits the user made and hands the file to the sender. */
-    fun prepareFile(source: EditorSource, item: OutgoingItem): java.io.File {
-        if (item.kind != "video") return source.file
-        val duration = MediaEditor.videoDurationMs(source.file)
-        if (duration <= 0L) return source.file
-        val untouched = item.trimStartMs <= 0L && item.trimEndMs >= duration
-        if (untouched) return source.file
-        val dir = java.io.File(context.cacheDir, "edited").apply { mkdirs() }
-        val out = java.io.File(dir, "trim-${System.currentTimeMillis()}.mp4")
-        return MediaEditor.trimVideo(source.file, item.trimStartMs, item.trimEndMs, out) ?: source.file
-    }
-
-    /** Uploads the attachment and stores the message, reporting progress while it runs. */
-    fun deliverMedia(item: OutgoingItem, source: EditorSource) {
-        scope.launch {
-            try {
-                val prepared = withContext(kotlinx.coroutines.Dispatchers.IO) { prepareFile(source, item) }
-                val bytes = withContext(kotlinx.coroutines.Dispatchers.IO) { prepared.readBytes() }
-                val url: String
-                if (item.kind == "image") {
-                    val jpeg = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        val scaled = MediaEditor.jpegBytes(prepared) ?: bytes
-                        MediaEditor.rotateJpeg(scaled, item.rotation) ?: scaled
-                    }
-                    url = Imgbb.uploadJpeg(jpeg) { p ->
-                        updateOutgoing(item.localId) { it.copy(progress = p) }
-                    }
-                } else {
-                    if (bytes.size > MediaPicker.maxAttachmentBytes) {
-                        throw ApiException("That file is too large (max 20 MB).")
-                    }
-                    val name = item.fileName ?: "File"
-                    val mime = item.mimeType.ifBlank { Cloudinary.mimeOf(name) }
-                    url = runCatching {
-                        Cloudinary.upload(context, bytes, name, mime) { p ->
-                            updateOutgoing(item.localId) { it.copy(progress = p) }
-                        }
-                    }.getOrElse {
-                        // Cloudinary is not set up on the backend yet: keep working through
-                        // Firebase Storage instead of failing the send outright.
-                        val ext = name.substringAfterLast('.', "").takeIf { it.isNotBlank() } ?: "bin"
-                        val path = "chat_media/${chat.id}/${UUID.randomUUID()}.$ext"
-                        val ref = com.google.firebase.storage.FirebaseStorage.getInstance().getReference(path)
-                        ref.putBytes(bytes).await()
-                        ref.downloadUrl.await().toString()
-                    }
-                }
-                updateOutgoing(item.localId) { it.copy(stage = OutgoingStage.SENDING, progress = 100) }
-                val serverId = FirestoreChat.send(
-                    chat.id,
-                    item.text,
-                    imageUrl = if (item.kind == "image") url else null,
-                    fileUrl = if (item.kind == "image") null else url,
-                    fileName = if (item.kind == "image") null else item.fileName,
-                    kind = if (item.kind == "image") "image" else if (item.kind == "video") "video" else "file",
-                    viewOnce = item.viewOnce,
-                    ttlSeconds = item.ttlSeconds
-                )
-                updateOutgoing(item.localId) { it.copy(stage = OutgoingStage.SENT, serverId = serverId) }
-            } catch (e: Exception) {
-                updateOutgoing(item.localId) {
-                    it.copy(
-                        stage = OutgoingStage.FAILED,
-                        error = (e as? ApiException)?.message ?: "Not sent — tap to retry"
-                    )
-                }
-            }
-        }
-    }
-
     /** Adds the edited attachment to the outbox and starts sending it. */
     fun enqueueMedia(source: EditorSource, caption: String, rotation: Int, trimStart: Long, trimEnd: Long) {
         val once = viewOnceSend && (source.kind == "image" || source.kind == "video")
@@ -708,29 +688,19 @@ fun ChatScreen(
             viewOnce = once,
             ttlSeconds = ttl
         )
-        outbox = outbox + item
-        deliverMedia(item, source)
+        OutboxStore.add(chat.id, item)
+        ChatSounds.playSend(context)
+        OutboxStore.deliver(chat.id, item)
     }
 
     /** Tries the failed message once more. */
     fun retryOutgoing(item: OutgoingItem) {
         if (item.kind == "text") {
-            updateOutgoing(item.localId) {
-                it.copy(stage = OutgoingStage.SENDING, error = null, progress = 0)
-            }
+            OutboxStore.remove(chat.id, item.localId)
             deliverText(item.localId, item.text, item.replyToId, item.replyToBody)
             return
         }
-        val path = item.localPath ?: return
-        val source = EditorSource(
-            kind = item.kind,
-            file = java.io.File(path),
-            fileName = item.fileName ?: "File",
-            mimeType = item.mimeType
-        )
-        val revived = item.copy(stage = OutgoingStage.UPLOADING, error = null, progress = 0)
-        updateOutgoing(item.localId) { revived }
-        deliverMedia(revived, source)
+        OutboxStore.retry(chat.id, item)
     }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -817,6 +787,7 @@ fun ChatScreen(
         }
         val reply = replyingTo
         uploading = true
+        ChatSounds.playSend(context)
         scope.launch {
             try {
                 val bytes = clip.file.readBytes()
@@ -977,7 +948,7 @@ fun ChatScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         TextButton(onClick = { AppSettings.setUserBlocked(blockedPeerId, false) }) {
-                            Text("Unblock")
+                            Text(tr("Unblock"))
                         }
                     }
                 } else {
@@ -1034,7 +1005,6 @@ fun ChatScreen(
                     onListenOnceChange = { voiceListenOnce = it },
                     onAttach = { showAttach = true },
                     onStickers = { showStickers = true },
-                    onEmoji = { showEmoji = !showEmoji },
                     onSend = { send() },
                     onStartRecording = { beginRecording(locked = true); holding = false },
                     onHoldRecording = { beginRecording(locked = false); holding = true },
@@ -1109,6 +1079,15 @@ fun ChatScreen(
                                 (peerUser?.readReceipts ?: true),
                             starred = AppSettings.isMessageStarred(chat.id, message.id),
                             pending = message.senderId == uid && !message.read && message.text in pendingTexts,
+                            senderName = if (isGroupChat && message.senderId != uid) {
+                                SenderNameCache.names[message.senderId] ?: "…"
+                            } else null,
+                            senderTag = if (isGroupChat && message.senderId != uid) {
+                                groupInfo?.let { info ->
+                                    info.memberTags[message.senderId]
+                                        ?: if (info.isAdmin(message.senderId)) "Admin" else null
+                                }
+                            } else null,
                             onLongPress = { sheetFor = message },
                             onOpenImage = { photoUrl = it },
                             onJumpTo = { targetId ->
@@ -1142,7 +1121,7 @@ fun ChatScreen(
                         OutgoingBubble(
                             item = item,
                             onRetry = { retryOutgoing(item) },
-                            onDiscard = { outbox = outbox.filter { it.localId != item.localId } }
+                            onDiscard = { OutboxStore.remove(chat.id, item.localId) }
                         )
                     }
                     // WhatsApp's typing bubble: three moving dots in an incoming bubble at the
@@ -1417,82 +1396,32 @@ fun ChatScreen(
         }
     }
 
-    if (showEmoji) {
-        ModalBottomSheet(
-            onDismissRequest = { showEmoji = false },
-            sheetState = rememberModalBottomSheetState()
-        ) {
-            EmojiSheet { emoji ->
-                draft += emoji
-                showEmoji = false
-            }
-        }
-    }
-
     if (showStickers) {
-        val packs = remember(context) { StickerCatalog.packs(context) }
-        var selectedPack by remember(showStickers) { mutableStateOf(packs.firstOrNull()?.id.orEmpty()) }
-        val current = packs.firstOrNull { it.id == selectedPack } ?: packs.firstOrNull()
-        ModalBottomSheet(
-            onDismissRequest = { showStickers = false },
-            sheetState = rememberModalBottomSheetState()
-        ) {
-            Column(Modifier.fillMaxWidth().heightIn(max = 520.dp).padding(horizontal = 10.dp, vertical = 6.dp)) {
-                Text("Stickers", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(8.dp))
-                if (packs.size > 1) {
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                        items(packs, key = { it.id }) { pack ->
-                            val active = pack.id == current?.id
-                            Column(
-                                Modifier
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
-                                    .clickable { selectedPack = pack.id }
-                                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                val preview = pack.stickers.firstOrNull()
-                                if (preview != null) {
-                                    AnimatedSticker(
-                                        url = preview.ref,
-                                        assetPath = preview.assetPath,
-                                        resId = preview.resId,
-                                        size = 30.dp
-                                    )
-                                }
-                                Text(
-                                    pack.title,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
+        EmojiStickerSheet(
+            onDismiss = { showStickers = false },
+            // Emoji go into the message box and the sheet stays open for the next one.
+            onEmoji = { emoji -> draft += emoji },
+            onSticker = { stickerRef ->
+                showStickers = false
+                ChatSounds.playSend(context)
+                scope.launch {
+                    runCatching { FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = stickerRef) }
+                        .onFailure { snackbar.showSnackbar("Sticker not sent. Check your connection and try again.") }
                 }
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(4),
-                    modifier = Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(min = 180.dp, max = 420.dp)
-                ) {
-                    gridItems(current?.stickers.orEmpty(), key = { it.ref }) { s ->
-                        StickerItem(
-                            title = s.title,
-                            ref = s.ref,
-                            resId = s.resId,
-                            assetPath = s.assetPath,
-                            onPick = { stickerRef ->
-                                scope.launch {
-                                    runCatching { FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = stickerRef) }
-                                        .onFailure { snackbar.showSnackbar("Sticker not sent. Check your connection and try again.") }
-                                }
-                                showStickers = false
-                            }
-                        )
+            },
+            onCustomSticker = { file ->
+                showStickers = false
+                ChatSounds.playSend(context)
+                scope.launch {
+                    runCatching {
+                        val url = CustomStickers.urlFor(file)
+                        FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = url)
+                    }.onFailure {
+                        snackbar.showSnackbar((it as? ApiException)?.message ?: "Sticker not sent. Check your connection and try again.")
                     }
                 }
             }
-        }
+        )
     }
 
     val onceTarget = viewOnceTarget
@@ -1639,7 +1568,7 @@ private fun MessageInfoDialog(
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        confirmButton = { TextButton(onClick = onDismiss) { Text(tr("Close")) } },
         title = { Text("Message info") },
         text = {
             Column {
@@ -1678,7 +1607,10 @@ private fun FsMessageBubble(
     onJumpTo: (String) -> Unit,
     onOpenViewOnce: (FirestoreChat.ChatMessage) -> Unit,
     onSwipeReply: () -> Unit = {},
-    receipts: Boolean = true
+    receipts: Boolean = true,
+    /** Group chats: who wrote this (null in direct chats and for your own messages). */
+    senderName: String? = null,
+    senderTag: String? = null
 ) {
     val bubbleColor = if (mine) MaterialTheme.colorScheme.primaryContainer
     else MaterialTheme.colorScheme.surfaceContainerHigh
@@ -1755,6 +1687,32 @@ private fun FsMessageBubble(
                 .combinedClickable(onClick = {}, onLongClick = onLongPress)
         ) {
             Column {
+                if (senderName != null) {
+                    Row(Modifier.padding(bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            senderName,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = senderColor(message.senderId),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        if (!senderTag.isNullOrBlank()) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                senderTag,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                                    .padding(horizontal = 5.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+                }
                 if (message.replyToBody != null) {
                     Row(
                         Modifier.fillMaxWidth().padding(bottom = 6.dp)
@@ -1780,12 +1738,22 @@ private fun FsMessageBubble(
                 if (message.viewOnce && (message.imageUrl != null || message.fileUrl != null || message.audioBlob != null)) {
                     ViewOnceRow(mine = mine, onOpen = { onOpenViewOnce(message) })
                 } else if (message.type == "sticker" && !message.imageUrl.isNullOrBlank()) {
-                    AnimatedSticker(
-                        url = message.imageUrl,
-                        assetPath = stickerAssetPath(message.imageUrl),
-                        size = 164.dp,
-                        modifier = Modifier.padding(2.dp)
-                    )
+                    val stickerUrl = message.imageUrl.orEmpty()
+                    if (stickerUrl.startsWith("http") && !stickerUrl.substringBefore('?').endsWith(".json", true)) {
+                        // A sticker the sender made from a picture.
+                        RemoteImage(
+                            url = stickerUrl,
+                            modifier = Modifier.size(164.dp).padding(2.dp),
+                            preserveAspect = true
+                        )
+                    } else {
+                        AnimatedSticker(
+                            url = message.imageUrl,
+                            assetPath = stickerAssetPath(message.imageUrl),
+                            size = 164.dp,
+                            modifier = Modifier.padding(2.dp)
+                        )
+                    }
                 } else if (message.audioBlob != null) {
                     BlobVoicePlayer(
                         messageId = message.id,
@@ -1802,7 +1770,9 @@ private fun FsMessageBubble(
                             url = url,
                             modifier = Modifier.widthIn(max = 260.dp).heightIn(max = 320.dp)
                                 .clip(RoundedCornerShape(12.dp))
-                                .clickable { onOpenImage(url) },
+                                // combinedClickable: a plain clickable swallowed the long
+                                // press, so the delete/reply menu could never open on a picture.
+                                .combinedClickable(onClick = { onOpenImage(url) }, onLongClick = onLongPress),
                             preserveAspect = true
                         )
                         Spacer(Modifier.height(6.dp))
@@ -1897,6 +1867,7 @@ private fun FsMessageBubble(
                 // stays on a single tick until it actually arrives — not immediately.
                 StatusTick(
                     when {
+                        message.pending -> "pending"
                         message.read -> "read"
                         message.delivered -> "delivered"
                         else -> "sent"
@@ -2386,6 +2357,22 @@ private fun TypingBubble() {
     }
 }
 
+/** Names of the people who wrote in group chats, kept for the process. */
+private object SenderNameCache {
+    val names = mutableStateMapOf<String, String>()
+}
+
+private val senderColors = listOf(
+    androidx.compose.ui.graphics.Color(0xFF1E88E5), androidx.compose.ui.graphics.Color(0xFFD81B60),
+    androidx.compose.ui.graphics.Color(0xFF43A047), androidx.compose.ui.graphics.Color(0xFFF57C00),
+    androidx.compose.ui.graphics.Color(0xFF8E24AA), androidx.compose.ui.graphics.Color(0xFF00897B),
+    androidx.compose.ui.graphics.Color(0xFFE53935), androidx.compose.ui.graphics.Color(0xFF6D4C41)
+)
+
+/** A steady colour per person so a name is recognisable at a glance, like WhatsApp/Telegram. */
+private fun senderColor(userId: String): androidx.compose.ui.graphics.Color =
+    senderColors[(userId.hashCode() and 0x7fffffff) % senderColors.size]
+
 @Composable
 private fun StatusTick(status: String, receipts: Boolean = true) {
     val tint = when {
@@ -2396,7 +2383,11 @@ private fun StatusTick(status: String, receipts: Boolean = true) {
         else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
     }
     Icon(
-        imageVector = if (status == "sent") Icons.Default.Done else Icons.Default.DoneAll,
+        imageVector = when (status) {
+            "pending" -> Icons.Default.Schedule
+            "sent" -> Icons.Default.Done
+            else -> Icons.Default.DoneAll
+        },
         contentDescription = status,
         modifier = Modifier.size(14.dp),
         tint = tint
@@ -2551,7 +2542,6 @@ private fun ChatComposer(
     onListenOnceChange: (Boolean) -> Unit,
     onAttach: () -> Unit,
     onStickers: () -> Unit,
-    onEmoji: () -> Unit,
     onSend: () -> Unit,
     onStartRecording: () -> Unit,
     onHoldRecording: () -> Unit,
@@ -2681,7 +2671,7 @@ private fun ChatComposer(
         }
         Row(verticalAlignment = Alignment.Bottom) {
                 IconButton(onClick = onAttach) { Icon(Icons.Default.AttachFile, "Attach") }
-                IconButton(onClick = onStickers) { Icon(Icons.Default.EmojiEmotions, "Stickers") }
+                IconButton(onClick = onStickers) { Icon(Icons.Default.EmojiEmotions, "Emoji and stickers") }
                 BasicTextField(
                 value = draft,
                 onValueChange = onDraftChange,
@@ -2697,12 +2687,11 @@ private fun ChatComposer(
                 maxLines = 4,
                 decorationBox = { inner ->
                     if (draft.isEmpty()) {
-                        Text("Message", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(tr("Message"), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     inner()
                 }
             )
-            IconButton(onClick = onEmoji) { Icon(Icons.Default.EmojiEmotions, "Emoji") }
             if (draft.isNotBlank() || editingId != null) {
                 // Always tappable: the bubble appears straight away, so the button never
                 // feels stuck while the network is busy.
@@ -2802,7 +2791,7 @@ private fun ReportDialog(onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
             }
         },
         confirmButton = { TextButton(onClick = { onSubmit(reason.trim()) }) { Text("Send report") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = onDismiss) { Text(tr("Cancel")) } }
     )
 }
 
@@ -2826,7 +2815,7 @@ internal fun RemoteImage(
             modifier.height(140.dp).background(MaterialTheme.colorScheme.surfaceVariant),
             contentAlignment = Alignment.Center
         ) {
-            Text("Loading…", style = MaterialTheme.typography.labelSmall)
+            Text(tr("Loading…"), style = MaterialTheme.typography.labelSmall)
         }
     } else {
         // Match the box to the picture's aspect ratio so ContentScale.Fit never leaves the

@@ -598,7 +598,7 @@ fun WallpaperSheet(
             Spacer(Modifier.height(12.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f)) {
-                    Text("Cancel")
+                    Text(tr("Cancel"))
                 }
                 Button(
                     onClick = { onPick(preview); onDismiss() },

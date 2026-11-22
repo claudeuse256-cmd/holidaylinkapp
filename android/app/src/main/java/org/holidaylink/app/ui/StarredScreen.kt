@@ -92,7 +92,7 @@ fun StarredMessagesScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
         containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             TopAppBar(
-                title = { Text("Starred messages") },
+                title = { Text(tr("Starred messages")) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")

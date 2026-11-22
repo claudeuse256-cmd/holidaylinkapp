@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -71,7 +73,9 @@ data class OutgoingItem(
     val viewOnce: Boolean = false,
     val ttlSeconds: Long = 0,
     val replyToId: String? = null,
-    val replyToBody: String? = null
+    val replyToBody: String? = null,
+    /** Failed only because there was no connection: it is sent again by itself when it returns. */
+    val autoRetry: Boolean = false
 )
 
 /** A picked file waiting in the editor, copied into the app cache. */
@@ -213,9 +217,15 @@ private fun OutgoingMediaPreview(item: OutgoingItem) {
         }
     }
     val image = bitmap
+    // Same box the stored message will use (max 260x320, the picture's own proportions), so the
+    // bubble does not change size when the server copy replaces this one.
+    val ratio = image?.let { it.width.toFloat() / it.height.toFloat().coerceAtLeast(1f) }
     Box(
-        Modifier
-            .size(width = 168.dp, height = 168.dp)
+        (if (ratio != null && ratio > 0f) {
+            Modifier.widthIn(max = 260.dp).heightIn(max = 320.dp).aspectRatio(ratio)
+        } else {
+            Modifier.size(width = 168.dp, height = 168.dp)
+        })
             .clip(RoundedCornerShape(12.dp))
             .background(scheme.surfaceContainerHighest),
         contentAlignment = Alignment.Center
@@ -225,7 +235,7 @@ private fun OutgoingMediaPreview(item: OutgoingItem) {
                 bitmap = image.asImageBitmap(),
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                modifier = Modifier.size(168.dp)
+                modifier = Modifier.fillMaxSize()
             )
         } else {
             Icon(

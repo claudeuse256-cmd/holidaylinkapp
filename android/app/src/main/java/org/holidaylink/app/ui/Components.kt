@@ -144,7 +144,13 @@ fun Avatar(
     onClick: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
-    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, photo) {
+    // Seeded synchronously from memory: a photo that was already shown must be on screen in the
+    // very first frame. Starting from null drew the initial letter first, which is the
+    // "everything reloads" flash when a list is rebuilt.
+    val firstFrame = photo?.takeIf { it.isNotBlank() }?.let { src ->
+        avatarMemoryCache.get(src) ?: org.holidaylink.app.net.MediaCache.peek(src)
+    }
+    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = firstFrame, photo) {
         // Network + decode must stay off the main thread or every remote
         // photo silently fails and falls back to initials.
         value = withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -216,7 +222,7 @@ private fun avatarTint(seed: String): Color {
 }
 
 /** Small in-memory photo cache so lists don't re-download avatars per row. */
-private val avatarMemoryCache = android.util.LruCache<String, android.graphics.Bitmap>(48)
+private val avatarMemoryCache = android.util.LruCache<String, android.graphics.Bitmap>(160)
 
 /** Decodes a downscaled bitmap from a content:// or file:// URI or an http(s) URL. */
 private fun decodeAvatar(context: Context, source: String): android.graphics.Bitmap? = runCatching {
@@ -580,6 +586,31 @@ fun SkeletonRow(modifier: Modifier = Modifier) {
     }
 }
 
+/** Placeholder shaped like a profile page: big photo, name, a few lines and the action buttons. */
+@Composable
+fun ProfileSkeleton(modifier: Modifier = Modifier) {
+    val brush = shimmerBrush()
+    Column(
+        modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(Modifier.size(104.dp).clip(CircleShape).background(brush))
+        Spacer(Modifier.height(16.dp))
+        Box(Modifier.fillMaxWidth(0.5f).height(18.dp).clip(RoundedCornerShape(9.dp)).background(brush))
+        Spacer(Modifier.height(10.dp))
+        Box(Modifier.fillMaxWidth(0.3f).height(12.dp).clip(RoundedCornerShape(6.dp)).background(brush))
+        Spacer(Modifier.height(24.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            repeat(3) { Box(Modifier.size(width = 84.dp, height = 56.dp).clip(RoundedCornerShape(14.dp)).background(brush)) }
+        }
+        Spacer(Modifier.height(24.dp))
+        repeat(3) {
+            Box(Modifier.fillMaxWidth().height(14.dp).clip(RoundedCornerShape(7.dp)).background(brush))
+            Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
 @Composable
 fun SkeletonCard(modifier: Modifier = Modifier) {
     val brush = shimmerBrush()
@@ -651,7 +682,7 @@ fun ErrorState(
                 androidx.compose.material3.OutlinedButton(onClick = onRetry) {
                     Icon(Icons.Default.Refresh, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Try again")
+                    Text(tr("Try again"))
                 }
             }
         }

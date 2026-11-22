@@ -93,8 +93,25 @@ fun UserProfileScreen(
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
 
-    var profile by remember { mutableStateOf<Profile?>(null) }
-    var loading by remember { mutableStateOf(true) }
+    // What the list already knows is shown immediately; the full profile is fetched behind it.
+    // Waiting for the network with a blank skeleton made every profile feel slow to open.
+    var profile by remember(user.id) {
+        mutableStateOf<Profile?>(
+            user.displayName.takeIf { it.isNotBlank() }?.let {
+                Profile(
+                    id = user.id,
+                    displayName = it,
+                    username = user.username.takeIf { u -> u.isNotBlank() },
+                    avatarUrl = user.avatarUrl,
+                    about = user.about,
+                    phone = null,
+                    online = user.online,
+                    lastSeen = user.lastSeen
+                )
+            }
+        )
+    }
+    var loading by remember(user.id) { mutableStateOf(profile == null) }
     var error by remember { mutableStateOf("") }
     var confirmBlock by remember { mutableStateOf(false) }
     var confirmReport by remember { mutableStateOf(false) }
@@ -185,7 +202,7 @@ fun UserProfileScreen(
         snackbarHost = { SnackbarHost(snackbar) }
     ) { padding ->
         when {
-            loading -> LoadingState(Modifier.padding(padding), label = "Loading profile…")
+            loading -> ProfileSkeleton(Modifier.padding(padding))
 
             error.isNotBlank() && shown == null ->
                 ErrorState(error, Modifier.padding(padding)) { scope.launch { reload() } }
@@ -369,7 +386,7 @@ fun UserProfileScreen(
                     )
                 }
             },
-            dismissButton = { TextButton(onClick = { confirmBlock = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirmBlock = false }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -397,9 +414,9 @@ fun UserProfileScreen(
                                 snackbar.showSnackbar("We couldn't send that report.")
                             }
                     }
-                }) { Text("Report", color = MaterialTheme.colorScheme.error) }
+                }) { Text(tr("Report"), color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { confirmReport = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirmReport = false }) { Text(tr("Cancel")) } }
         )
     }
 

@@ -393,7 +393,7 @@ fun ScheduledMessagesScreen(chatId: String, chatLabel: String, onBack: () -> Uni
                     showDate = false
                 }) { Text("OK") }
             },
-            dismissButton = { TextButton(onClick = { showDate = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { showDate = false }) { Text(tr("Cancel")) } }
         ) { DatePicker(state = state) }
     }
 
@@ -420,7 +420,7 @@ fun ScheduledMessagesScreen(chatId: String, chatLabel: String, onBack: () -> Uni
                     showTime = false
                 }) { Text("OK") }
             },
-            dismissButton = { TextButton(onClick = { showTime = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { showTime = false }) { Text(tr("Cancel")) } }
         )
     }
 }

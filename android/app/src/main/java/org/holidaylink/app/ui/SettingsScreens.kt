@@ -197,7 +197,7 @@ private fun <T> ChoiceDialog(
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+        confirmButton = { TextButton(onClick = onDismiss) { Text(tr("Close")) } }
     )
 }
 
@@ -270,7 +270,7 @@ fun SettingsHub(
             SettingsNavRow("Appearance", Icons.Default.Palette, "Theme, text size, wallpaper", onClick = { onOpen(SettingsRoute.Appearance) })
             SettingsNavRow("Animations", Icons.Default.Animation, "Pick a screen transition and preview it", onClick = { onOpen(SettingsRoute.Animations) })
             SettingsNavRow("Data and storage", Icons.Default.Storage, "Storage, cache, downloads", onClick = { onOpen(SettingsRoute.DataStorage) })
-            SettingsNavRow("Language", Icons.Default.Language, "App language", onClick = { onOpen(SettingsRoute.Language) })
+            SettingsNavRow(tr("Language"), Icons.Default.Language, "App language", onClick = { onOpen(SettingsRoute.Language) })
             SettingsNavRow("Chats", Icons.Default.Groups, "Chat wallpaper and defaults", onClick = { onOpen(SettingsRoute.ChatSettings) })
             SettingsNavRow("HolidayLink AI", Icons.Default.AutoAwesome, "Assistant and AI settings", onClick = { onOpen(SettingsRoute.AiSettings) })
         }
@@ -325,7 +325,7 @@ fun SettingsHub(
                     onLoggedOut()
                 }) { Text("Log out") }
             },
-            dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -372,7 +372,7 @@ fun SettingsHub(
                     )
                 ) { Text("Delete permanently", color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text(tr("Cancel")) } }
         )
     }
 }
@@ -876,7 +876,7 @@ fun BlockedScreen(api: Api, onBack: () -> Unit) {
                                         .onFailure { snackbar.showSnackbar("Couldn't unblock. Check your internet.") }
                                 }
                             }
-                        ) { Text("Unblock") }
+                        ) { Text(tr("Unblock")) }
                     }
                 }
             }
@@ -1897,13 +1897,15 @@ fun LanguageScreen(onBack: () -> Unit) {
         Column(Modifier.padding(bottom = 30.dp)) {
             SettingsSection("App language") {
                 LanguageOption("English", "en", settings.language)
-                LanguageOption("Kiswahili", "sw", settings.language, available = false)
-                LanguageOption("Luganda", "lg", settings.language, available = false)
+                LanguageOption("Kiswahili", "sw", settings.language)
+                LanguageOption("Luganda", "lg", settings.language)
+                LanguageOption("Français", "fr", settings.language)
                 LanguageOption("Runyankole", "rn", settings.language, available = false)
             }
             Text(
-                "English is fully translated today. The other languages are prepared and will " +
-                    "switch on as soon as their translations land — no rebuild needed.",
+                "English is fully translated. Kiswahili, Luganda and Français already cover the " +
+                    "tabs, buttons and common actions; screens that are not translated yet stay in " +
+                    "English. Runyankole is coming.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 22.dp, vertical = 10.dp)
@@ -2154,7 +2156,7 @@ fun ServerSettingsScreen(api: Api, onBack: () -> Unit) {
                         status = "Saved."
                     },
                     enabled = input.isNotBlank()
-                ) { Text("Save") }
+                ) { Text(tr("Save")) }
                 OutlinedButton(
                     onClick = {
                         if (testing) return@OutlinedButton

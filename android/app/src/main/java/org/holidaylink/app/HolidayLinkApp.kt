@@ -28,5 +28,8 @@ class HolidayLinkApp : Application() {
         // Keep the old WorkManager registration harmless for upgrade compatibility; scheduled
         // delivery now runs from the authenticated Render/Firestore server queue.
         runCatching { ScheduledMessagesWorker.enqueue(this) }
+        // Pictures/videos still waiting to be sent survive closing the app and go out by
+        // themselves once the connection is back.
+        runCatching { org.holidaylink.app.ui.OutboxStore.init(this) }
     }
 }

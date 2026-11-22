@@ -322,7 +322,7 @@ private fun FeedCard(
                         onComment(draft.trim())
                         draft = ""
                     }
-                }) { Text("Send") }
+                }) { Text(tr("Send")) }
             }
         }
     }
@@ -331,7 +331,7 @@ private fun FeedCard(
             onDismissRequest = { showMore = false },
             title = { Text(title.ifBlank { "Details" }) },
             text = { Text(moreDetails) },
-            confirmButton = { TextButton(onClick = { showMore = false }) { Text("Close") } }
+            confirmButton = { TextButton(onClick = { showMore = false }) { Text(tr("Close")) } }
         )
     }
 }
@@ -472,7 +472,7 @@ fun QuizzesScreen(api: Api, onBack: () -> Unit) {
                         }
                     ) { Text("Submit") }
                 },
-                dismissButton = { TextButton(onClick = { playing = null }) { Text("Cancel") } }
+                dismissButton = { TextButton(onClick = { playing = null }) { Text(tr("Cancel")) } }
             )
             return@let
         }
@@ -791,7 +791,7 @@ fun PapersScreen(api: Api, onBack: () -> Unit) {
                                     OutlinedButton(
                                         onClick = { shareDoc(ids[i], title) },
                                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-                                    ) { Text("Share") }
+                                    ) { Text(tr("Share")) }
                                 }
                             }
                         }
@@ -1041,7 +1041,7 @@ fun EventsScreen(api: Api, onBack: () -> Unit) {
                     Text(if (booking) "Booking…" else "Book")
                 }
             },
-            dismissButton = { TextButton(enabled = !booking, onClick = { bookingFor = null }) { Text("Cancel") } }
+            dismissButton = { TextButton(enabled = !booking, onClick = { bookingFor = null }) { Text(tr("Cancel")) } }
         )
     }
 }
@@ -1093,7 +1093,7 @@ private fun MyTickets(uid: String) {
                                 ids = ids.filterIndexed { j, _ -> j != index }
                             }.onFailure { snackbar.showSnackbar("Couldn't delete that ticket.") }
                         }
-                    }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                    }) { Text(tr("Delete"), color = MaterialTheme.colorScheme.error) }
                 }
             }
         }
@@ -1289,7 +1289,7 @@ fun InviteScreen(api: Api, onBack: () -> Unit) {
             ) {
                 Text(link, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), maxLines = 2)
                 Spacer(Modifier.width(8.dp))
-                Button(onClick = { share("Join me on HolidayLink: $link") }) { Text("Share") }
+                Button(onClick = { share("Join me on HolidayLink: $link") }) { Text(tr("Share")) }
             }
             Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {

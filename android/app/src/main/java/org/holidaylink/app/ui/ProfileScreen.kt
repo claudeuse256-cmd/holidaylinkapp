@@ -276,7 +276,7 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                             OutlinedButton(
                                 onClick = { editing = false },
                                 modifier = Modifier.weight(1f)
-                            ) { Text("Cancel") }
+                            ) { Text(tr("Cancel")) }
                             Button(
                                 onClick = {
                                     if (saving) return@Button
@@ -307,7 +307,7 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                                 },
                                 enabled = displayName.isNotBlank() && username.length >= 3 && !saving,
                                 modifier = Modifier.weight(1f)
-                            ) { Text("Save") }
+                            ) { Text(tr("Save")) }
                         }
                         Spacer(Modifier.height(20.dp))
                     } else {
@@ -349,7 +349,7 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                                     }
                                 },
                                 modifier = Modifier.weight(1f)
-                            ) { Text("Share") }
+                            ) { Text(tr("Share")) }
                         }
                     }
 
@@ -451,7 +451,7 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                     }
                 }) { Text("Use photo") }
             },
-            dismissButton = { TextButton(onClick = { avatarEditBytes = null }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { avatarEditBytes = null }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -470,10 +470,10 @@ fun MyProfileScreen(api: Api, onBack: () -> Unit) {
                             }
                             .onFailure { snackbar.showSnackbar("We couldn't remove that photo.") }
                     }
-                }) { Text("Remove") }
+                }) { Text(tr("Remove")) }
             },
             dismissButton = {
-                TextButton(onClick = { confirmRemovePhoto = false }) { Text("Cancel") }
+                TextButton(onClick = { confirmRemovePhoto = false }) { Text(tr("Cancel")) }
             }
         )
     }
@@ -570,10 +570,10 @@ private fun QrCodeDialog(me: Me, onDismiss: () -> Unit) {
             }
         },
         confirmButton = {
-            TextButton(onClick = { shareProfile(context, me); onDismiss() }) { Text("Share") }
+            TextButton(onClick = { shareProfile(context, me); onDismiss() }) { Text(tr("Share")) }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Close") }
+            TextButton(onClick = onDismiss) { Text(tr("Close")) }
         }
     )
 }

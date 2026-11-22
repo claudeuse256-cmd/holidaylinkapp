@@ -114,6 +114,8 @@ fun GroupInfoScreen(
     var descDraft by remember { mutableStateOf("") }
     var addOpen by remember { mutableStateOf(false) }
     var actionMember by remember { mutableStateOf<User?>(null) }
+    var tagTarget by remember { mutableStateOf<User?>(null) }
+    var tagText by remember { mutableStateOf("") }
     var confirmLeave by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var wallpaperOpen by remember { mutableStateOf(false) }
@@ -313,7 +315,7 @@ fun GroupInfoScreen(
                                     modifier = Modifier.weight(1f)
                                 )
                                 if (canEditInfo) {
-                                    TextButton(onClick = { descDraft = gDesc; editDesc = true }) { Text("Edit") }
+                                    TextButton(onClick = { descDraft = gDesc; editDesc = true }) { Text(tr("Edit")) }
                                 }
                             }
                         }
@@ -447,6 +449,9 @@ fun GroupInfoScreen(
                             if (u.id == meId) {
                                 Text("You", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
+                            g?.memberTags?.get(u.id)?.let { tag ->
+                                Text(tag, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                            }
                         }
                         if (isTargetAdmin) {
                             Text(
@@ -529,9 +534,9 @@ fun GroupInfoScreen(
                                 .onFailure { snackbar.showSnackbar("Couldn't rename the group") }
                         }
                     }
-                ) { Text("Save") }
+                ) { Text(tr("Save")) }
             },
-            dismissButton = { TextButton(onClick = { editName = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { editName = false }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -554,9 +559,9 @@ fun GroupInfoScreen(
                             .onSuccess { snackbar.showSnackbar("Description updated") }
                             .onFailure { snackbar.showSnackbar("Couldn't update the description") }
                     }
-                }) { Text("Save") }
+                }) { Text(tr("Save")) }
             },
-            dismissButton = { TextButton(onClick = { editDesc = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { editDesc = false }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -601,9 +606,9 @@ fun GroupInfoScreen(
                                 .onFailure { snackbar.showSnackbar("Couldn't add members") }
                         }
                     }
-                ) { Text("Add") }
+                ) { Text(tr("Add")) }
             },
-            dismissButton = { TextButton(onClick = { addOpen = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { addOpen = false }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -618,7 +623,12 @@ fun GroupInfoScreen(
                     TextButton(onClick = {
                         actionMember = null
                         onOpenUser(targetMember)
-                    }) { Text("View profile") }
+                    }) { Text(tr("View profile")) }
+                    TextButton(onClick = {
+                        actionMember = null
+                        tagText = info?.memberTags?.get(targetMember.id).orEmpty()
+                        tagTarget = targetMember
+                    }) { Text(tr("Set tag")) }
                     TextButton(onClick = {
                         actionMember = null
                         scope.launch {
@@ -636,7 +646,42 @@ fun GroupInfoScreen(
                     }) { Text("Remove from group", color = MaterialTheme.colorScheme.error) }
                 }
             },
-            confirmButton = { TextButton(onClick = { actionMember = null }) { Text("Close") } }
+            confirmButton = { TextButton(onClick = { actionMember = null }) { Text(tr("Close")) } }
+        )
+    }
+
+    val taggedMember = tagTarget
+    if (taggedMember != null) {
+        AlertDialog(
+            onDismissRequest = { tagTarget = null },
+            title = { Text("Tag for ${taggedMember.displayName}") },
+            text = {
+                Column {
+                    Text(
+                        "A short label shown next to their name in the group, like \"Class rep\" or \"Treasurer\". Leave empty to remove it.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = tagText,
+                        onValueChange = { tagText = it.take(24) },
+                        singleLine = true,
+                        label = { Text(tr("Tag")) }
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val target = taggedMember
+                    val value = tagText
+                    tagTarget = null
+                    scope.launch {
+                        runCatching { FirestoreGroups.setMemberTag(chat.id, target.id, value) }
+                            .onFailure { snackbar.showSnackbar("Couldn't save the tag") }
+                    }
+                }) { Text(tr("Save")) }
+            },
+            dismissButton = { TextButton(onClick = { tagTarget = null }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -651,7 +696,7 @@ fun GroupInfoScreen(
                     leaveNow(scope, chat.id, onLeft)
                 }) { Text("Leave") }
             },
-            dismissButton = { TextButton(onClick = { confirmLeave = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirmLeave = false }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -667,9 +712,9 @@ fun GroupInfoScreen(
                         runCatching { FirestoreGroups.deleteGroup(chat.id) }
                         onLeft()
                     }
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                }) { Text(tr("Delete"), color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text(tr("Cancel")) } }
         )
     }
 }

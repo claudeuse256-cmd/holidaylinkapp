@@ -349,10 +349,10 @@ fun ContactsScreen(
                 TextButton(onClick = {
                     showRationale = false
                     permissionLauncher.launch(android.Manifest.permission.READ_CONTACTS)
-                }) { Text("Continue") }
+                }) { Text(tr("Continue")) }
             },
             dismissButton = {
-                TextButton(onClick = { showRationale = false }) { Text("Not now") }
+                TextButton(onClick = { showRationale = false }) { Text(tr("Not now")) }
             }
         )
     }

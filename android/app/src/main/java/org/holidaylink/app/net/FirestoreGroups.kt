@@ -29,7 +29,9 @@ object FirestoreGroups {
         val sendMessagesAdminsOnly: Boolean,
         val editInfoAdminsOnly: Boolean,
         val addMembersAdminsOnly: Boolean,
-        val approveNewMembers: Boolean
+        val approveNewMembers: Boolean,
+        /** Label an admin gave a member (shown next to their name in the chat), keyed by uid. */
+        val memberTags: Map<String, String> = emptyMap()
     ) {
         fun isAdmin(uid: String): Boolean = admins.contains(uid) || createdBy == uid
     }
@@ -80,7 +82,13 @@ object FirestoreGroups {
             sendMessagesAdminsOnly = settings["sendMessagesAdminsOnly"] == true,
             editInfoAdminsOnly = settings["editInfoAdminsOnly"] == true,
             addMembersAdminsOnly = settings["addMembersAdminsOnly"] == true,
-            approveNewMembers = settings["approveNewMembers"] == true
+            approveNewMembers = settings["approveNewMembers"] == true,
+            memberTags = (d["memberTags"] as? Map<*, *>)
+                ?.mapNotNull { (k, v) ->
+                    val key = k as? String ?: return@mapNotNull null
+                    val tag = (v as? String)?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    key to tag
+                }?.toMap().orEmpty()
         )
     }
 
@@ -88,6 +96,12 @@ object FirestoreGroups {
         val doc = HashMap<String, Any?>(fields)
         doc["updatedAt"] = Timestamp.now()
         FirebaseBackend.db.collection("chats").document(chatId).update(doc).await()
+    }
+
+    /** Sets (or, with a blank [tag], clears) the label shown next to a member's name. */
+    suspend fun setMemberTag(chatId: String, uid: String, tag: String) {
+        val clean = tag.trim().take(24)
+        patch(chatId, mapOf("memberTags.$uid" to (if (clean.isBlank()) FieldValue.delete() else clean)))
     }
 
     suspend fun setName(chatId: String, name: String) =

@@ -176,6 +176,11 @@ fun StatusScreen(
         }
     }
 
+    // A status that finished uploading (even after this screen was closed and reopened).
+    LaunchedEffect(StatusUploads.completed) {
+        if (StatusUploads.completed > 0) reload++
+    }
+
     LaunchedEffect(reload) {
         if (reload > 0) refreshing = true
         val fresh = DeviceCache.load("statuses", { source -> loadFirestoreStatuses(source) }) { data ->
@@ -251,6 +256,8 @@ fun StatusScreen(
             Spacer(Modifier.width(4.dp))
             RefreshButton { reload++ }
         }
+
+        StatusUploadBanner()
 
         when {
             loading -> LoadingState(label = "Loading status…")
@@ -504,44 +511,44 @@ fun StatusScreen(
             onSend = { caption, rotation, trimStart, trimEnd, cropRect, overlays, strokes ->
                 pendingEdit = null
                 val stickerIds = overlays.filter { it.kind == "sticker" }.mapNotNull { it.stickerRef }
-                scope.launch {
-                    runCatching {
-                        if (editing.kind == "video") {
-                            postFirestoreStatus(
-                                context = context,
-                                text = caption,
-                                mediaDataUrl = null,
-                                mediaUri = Uri.fromFile(editing.file),
-                                mediaKind = "video",
-                                fileName = editing.file.name,
-                                editedVideoFile = editing.file,
-                                trimStartMs = trimStart,
-                                trimEndMs = trimEnd,
-                                stickerIds = stickerIds
-                            )
-                        } else {
-                            val rendered = withContext(Dispatchers.IO) {
-                                MediaEditor.applyPhotoEdits(editing.file, rotation, cropRect, overlays, strokes)
-                            } ?: editing.file
-                            val bytes = withContext(Dispatchers.IO) { rendered.readBytes() }
-                            val dataUrl = "data:image/jpeg;base64," + android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                            if (rendered != editing.file) runCatching { rendered.delete() }
-                            postFirestoreStatus(
-                                context = context,
-                                text = caption,
-                                mediaDataUrl = dataUrl,
-                                mediaUri = null,
-                                mediaKind = "image",
-                                fileName = editing.file.name,
-                                stickerIds = stickerIds
-                            )
-                        }
-                    }.onSuccess {
-                        reload++
-                    }.onFailure {
-                        error = "We couldn't post that status. Check your internet."
+                val appContext = context.applicationContext
+                val source = editing.file
+                val isVideo = editing.kind == "video"
+                // The card appears at once with a progress bar and keeps running even if this
+                // screen is closed; the status list refreshes by itself when it finishes.
+                StatusUploads.start(kind = if (isVideo) "video" else "image", preview = source, cleanup = source) { onProgress ->
+                    if (isVideo) {
+                        postFirestoreStatus(
+                            context = appContext,
+                            text = caption,
+                            mediaDataUrl = null,
+                            mediaUri = Uri.fromFile(source),
+                            mediaKind = "video",
+                            fileName = source.name,
+                            editedVideoFile = source,
+                            trimStartMs = trimStart,
+                            trimEndMs = trimEnd,
+                            stickerIds = stickerIds,
+                            onProgress = onProgress
+                        )
+                    } else {
+                        val rendered = withContext(Dispatchers.IO) {
+                            MediaEditor.applyPhotoEdits(source, rotation, cropRect, overlays, strokes)
+                        } ?: source
+                        val bytes = withContext(Dispatchers.IO) { rendered.readBytes() }
+                        val dataUrl = "data:image/jpeg;base64," + android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                        if (rendered != source) runCatching { rendered.delete() }
+                        postFirestoreStatus(
+                            context = appContext,
+                            text = caption,
+                            mediaDataUrl = dataUrl,
+                            mediaUri = null,
+                            mediaKind = "image",
+                            fileName = source.name,
+                            stickerIds = stickerIds,
+                            onProgress = onProgress
+                        )
                     }
-                    runCatching { editing.file.delete() }
                 }
             }
         )
@@ -561,9 +568,9 @@ fun StatusScreen(
                             FirebaseBackend.db.collection("statuses").document(doomed.id).delete().await()
                         }.onSuccess { reload++ }
                     }
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                }) { Text(tr("Delete"), color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Keep") } }
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text(tr("Keep")) } }
         )
     }
 
@@ -718,7 +725,7 @@ private fun StatusRow(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Message, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(4.dp))
-                        Text("Reply", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = MaterialTheme.colorScheme.primary)
+                        Text(tr("Reply"), style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }
@@ -776,19 +783,22 @@ private fun StatusViewersSheet(status: StatusUpdate, onDismiss: () -> Unit) {
         title = { Text("Seen by ${names.size}") },
         text = {
             when {
-                loading -> Text("Loading…")
+                loading -> Text(tr("Loading…"))
                 names.isEmpty() -> Text("Nobody has opened this update yet.")
                 else -> Column {
                     names.take(50).forEach { Text("• $it", style = MaterialTheme.typography.bodyMedium) }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+        confirmButton = { TextButton(onClick = onDismiss) { Text(tr("Close")) } }
     )
 }
 
 
 /** Firestore statuses: same docs as the website (24h expiry, imgbb photos). */
+/** Names/photos of status authors, kept for the process so a refresh does not re-read each profile. */
+private val statusAuthorCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String?>>()
+
 private suspend fun loadFirestoreStatuses(
     source: com.google.firebase.firestore.Source = com.google.firebase.firestore.Source.DEFAULT
 ): List<StatusUpdate> {
@@ -803,8 +813,12 @@ private suspend fun loadFirestoreStatuses(
         val userId = d.getString("userId").orEmpty()
         if (userId.isBlank()) return@mapNotNull null
         val author = authors.getOrPut(userId) {
-            val p = runCatching { FirebaseBackend.loadProfile(userId) }.getOrNull()
-            (p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user") to p?.profilePic
+            statusAuthorCache[userId] ?: run {
+                val p = runCatching { FirebaseBackend.loadProfile(userId) }.getOrNull()
+                val found = (p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user") to p?.profilePic
+                if (p != null) statusAuthorCache[userId] = found
+                found
+            }
         }
         StatusUpdate(
             id = d.id,
@@ -843,7 +857,9 @@ internal suspend fun postFirestoreStatus(
     trimStartMs: Long = 0L,
     trimEndMs: Long = 0L,
     stickerIds: List<String> = emptyList(),
-    musicUri: Uri? = null
+    musicUri: Uri? = null,
+    /** 0..100 while the picture/video is uploading, so the UI can draw a progress bar. */
+    onProgress: (Int) -> Unit = {}
 ) {
     val uid = FirebaseBackend.uid ?: throw ApiException("Sign in again first.")
     var mediaUrl: String? = null
@@ -899,12 +915,22 @@ internal suspend fun postFirestoreStatus(
         val bytes = withContext(Dispatchers.IO) { uploadFile.readBytes() }
         val name = pickedName ?: "status.mp4"
         val mime = "video/mp4"
-        mediaUrl = runCatching { Cloudinary.upload(context, bytes, name, mime) }
-            .getOrElse {
-                val ref = FirebaseStorage.getInstance().reference
-                    .child("statuses/$uid/${System.currentTimeMillis()}.mp4")
-                ref.putFile(Uri.fromFile(uploadFile)).await()
-                ref.downloadUrl.await().toString()
+        mediaUrl = runCatching { Cloudinary.upload(context, bytes, name, mime, onProgress) }
+            .getOrElse { first ->
+                // The server/Cloudinary route failed: try Firebase Storage, and if that fails
+                // too say so plainly instead of posting a status without its video.
+                runCatching {
+                    val ref = FirebaseStorage.getInstance().reference
+                        .child("statuses/$uid/${System.currentTimeMillis()}.mp4")
+                    ref.putFile(Uri.fromFile(uploadFile)).addOnProgressListener { task ->
+                        val total = task.totalByteCount
+                        if (total > 0) onProgress(((task.bytesTransferred * 100) / total).toInt())
+                    }.await()
+                    ref.downloadUrl.await().toString()
+                }.getOrElse {
+                    throw (first as? ApiException)
+                        ?: ApiException("The video couldn't be uploaded. Check your internet and try again.")
+                }
             }
         if (uploadFile != source) runCatching { uploadFile.delete() }
         if (editedVideoFile == null) runCatching { source.delete() }
@@ -913,7 +939,7 @@ internal suspend fun postFirestoreStatus(
         val base64 = mediaDataUrl.substringAfter(",", "")
         if (base64.isBlank()) throw ApiException("That photo couldn't be read.")
         val bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
-        mediaUrl = Imgbb.uploadJpeg(bytes)
+        mediaUrl = Imgbb.uploadJpeg(bytes, onProgress)
     }
     var musicUrl: String? = null
     if (musicUri != null) {
@@ -1409,7 +1435,7 @@ private fun StatusViewer(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Default.Message, null, Modifier.size(18.dp), tint = Color.White)
                             Spacer(Modifier.width(6.dp))
-                            Text("Reply", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
+                            Text(tr("Reply"), style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
                         }
                     }
                 } else {

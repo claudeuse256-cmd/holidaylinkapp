@@ -42,7 +42,6 @@ import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.launch
 import org.holidaylink.app.BuildConfig
 import org.holidaylink.app.net.AppUpdater
-import java.io.File
 
 /**
  * Startup update gate:
@@ -79,16 +78,11 @@ fun StartupUpdateGate() {
 @Composable
 private fun OptionalUpdateDialog(update: AppUpdater.Update, onDismiss: () -> Unit) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var downloading by remember { mutableStateOf(false) }
-    var progress by remember { mutableIntStateOf(0) }
-    var readyFile by remember { mutableStateOf<File?>(null) }
-    var failed by remember { mutableStateOf(false) }
 
     AlertDialog(
-        onDismissRequest = { if (!downloading) onDismiss() },
+        onDismissRequest = onDismiss,
         icon = { Icon(Icons.Default.SystemUpdate, contentDescription = null) },
-        title = { Text("Update available") },
+        title = { Text(tr("Update available")) },
         text = {
             Column {
                 Text("HolidayLink ${update.versionName} is available.")
@@ -96,49 +90,13 @@ private fun OptionalUpdateDialog(update: AppUpdater.Update, onDismiss: () -> Uni
                     Spacer(Modifier.height(8.dp))
                     Text(update.notes.trim(), style = MaterialTheme.typography.bodySmall)
                 }
-                if (downloading) {
-                    Spacer(Modifier.height(12.dp))
-                    LinearProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(4.dp))
-                    Text("Downloading… $progress%", style = MaterialTheme.typography.labelSmall)
-                }
-                if (failed) {
-                    Spacer(Modifier.height(8.dp))
-                    Text("Couldn't download the update. Check your connection and try again.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                }
             }
         },
         confirmButton = {
-            val file = readyFile
-            when {
-                file != null -> {
-                    Button(onClick = {
-                        if (AppUpdater.canInstall(context)) AppUpdater.install(context, file)
-                        else AppUpdater.requestInstallPermission(context)
-                    }) {
-                        Text(if (AppUpdater.canInstall(context)) "Install" else "Allow install")
-                    }
-                }
-                downloading -> {}
-                else -> {
-                    Button(onClick = {
-                        scope.launch {
-                            downloading = true
-                            failed = false
-                            progress = 0
-                            val f = AppUpdater.download(context, update) { progress = it }
-                            downloading = false
-                            if (f == null) failed = true else {
-                                readyFile = f
-                                if (!AppUpdater.canInstall(context)) AppUpdater.requestInstallPermission(context)
-                            }
-                        }
-                    }) { Text("Update now") }
-                }
-            }
+            Button(onClick = { AppUpdater.openDownload(context, update) }) { Text(tr("Update now")) }
         },
         dismissButton = {
-            if (!downloading) TextButton(onClick = onDismiss) { Text("Later") }
+            TextButton(onClick = onDismiss) { Text("Later") }
         }
     )
 }
@@ -146,11 +104,6 @@ private fun OptionalUpdateDialog(update: AppUpdater.Update, onDismiss: () -> Uni
 @Composable
 private fun MandatoryUpdateScreen(update: AppUpdater.Update) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var downloading by remember { mutableStateOf(false) }
-    var progress by remember { mutableIntStateOf(0) }
-    var readyFile by remember { mutableStateOf<File?>(null) }
-    var failed by remember { mutableStateOf(false) }
 
     Dialog(
         onDismissRequest = { /* mandatory */ },
@@ -182,44 +135,10 @@ private fun MandatoryUpdateScreen(update: AppUpdater.Update) {
                     }
                 }
                 Spacer(Modifier.height(20.dp))
-                if (downloading) {
-                    LinearProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(8.dp))
-                    Text("Downloading… $progress%", style = MaterialTheme.typography.labelMedium)
-                } else {
-                    val file = readyFile
-                    if (failed) {
-                        Text("Download failed. Please check your internet connection.", color = MaterialTheme.colorScheme.error)
-                        Spacer(Modifier.height(10.dp))
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        if (file != null) {
-                            Button(onClick = {
-                                if (AppUpdater.canInstall(context)) AppUpdater.install(context, file)
-                                else AppUpdater.requestInstallPermission(context)
-                            }, modifier = Modifier.fillMaxWidth()) {
-                                Icon(Icons.Default.Download, contentDescription = null)
-                                Spacer(Modifier.width(8.dp))
-                                Text(if (AppUpdater.canInstall(context)) "Install update" else "Allow installing")
-                            }
-                        } else {
-                            Button(onClick = {
-                                scope.launch {
-                                    downloading = true
-                                    failed = false
-                                    progress = 0
-                                    val f = AppUpdater.download(context, update) { progress = it }
-                                    downloading = false
-                                    if (f == null) failed = true else {
-                                        readyFile = f
-                                        if (!AppUpdater.canInstall(context)) AppUpdater.requestInstallPermission(context)
-                                    }
-                                }
-                            }, modifier = Modifier.fillMaxWidth()) {
-                                Text(if (failed) "Try again" else "Download update")
-                            }
-                        }
-                    }
+                Button(onClick = { AppUpdater.openDownload(context, update) }, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Default.Download, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(tr("Download update"))
                 }
                 Spacer(Modifier.height(14.dp))
                 Text(

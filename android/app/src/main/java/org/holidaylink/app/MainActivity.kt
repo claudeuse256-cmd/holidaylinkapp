@@ -2,6 +2,7 @@
 
 package org.holidaylink.app
 
+import org.holidaylink.app.ui.tr
 import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
@@ -479,16 +480,8 @@ private fun SignedInApp(
     LaunchedEffect(activeCall) {
         val call = activeCall
         if (call != null) {
-            val intent = android.content.Intent(context, org.holidaylink.app.call.CallService::class.java).apply {
-                putExtra("callId", call.first)
-                putExtra("peer", call.third.displayName)
-                putExtra("kind", call.second)
-            }
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            // Never throws: a refused foreground service must not close the app mid-call.
+            org.holidaylink.app.call.CallService.start(context, call.first, call.third.displayName, call.second)
         } else {
             org.holidaylink.app.call.CallService.stop(context)
         }
@@ -1181,16 +1174,14 @@ private fun TabShell(
                         // The status row and search bar live inside the list now, so they
                         // scroll away with the chats instead of collapsing on their own.
                         header = {
-                            Column(Modifier.fillMaxWidth()) {
-                                GlassStatusRow(
-                                    api = api,
-                                    me = me,
-                                    onOpenStatus = onOpenStatus,
-                                    onPostStatus = onPostStatus
-                                )
-                                GlassSearchBar(onClick = onSearch)
-                            }
-                        }
+                            GlassStatusRow(
+                                api = api,
+                                me = me,
+                                onOpenStatus = onOpenStatus,
+                                onPostStatus = onPostStatus
+                            )
+                        },
+                        pinnedHeader = { GlassSearchBar(onClick = onSearch) }
                     )
                     Tab.Users -> UsersScreen(
                         api = api,
@@ -1276,11 +1267,23 @@ private fun TelegramFabOption(label: String, icon: androidx.compose.ui.graphics.
     }
 }
 
+/** Last status strip seen this session; survives the tab being rebuilt. */
+private object StatusStripCache {
+    var people: List<Triple<String, String, String?>> = emptyList()
+    var at: Long = 0L
+    val profiles = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String?>>()
+}
+
 @Composable
 private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostStatus: () -> Unit = onOpenStatus) {
     val scheme = MaterialTheme.colorScheme
-    var people by remember { mutableStateOf<List<Triple<String, String, String?>>>(emptyList()) }
+    // Seeded from the last copy this session, so coming back to the chats tab (or back from a
+    // chat) paints the strip at once instead of showing it empty while it is fetched again.
+    var people by remember { mutableStateOf(StatusStripCache.people) }
     LaunchedEffect(Unit) {
+        if (people.isNotEmpty() && System.currentTimeMillis() - StatusStripCache.at < 45_000L) {
+            return@LaunchedEffect
+        }
         runCatching {
             val now = com.google.firebase.Timestamp.now()
             val snap = FirebaseBackend.db.collection("statuses")
@@ -1289,14 +1292,19 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
             snap.documents.forEach { d ->
                 val userId = d.getString("userId").orEmpty()
                 if (userId.isBlank() || seen.containsKey(userId)) return@forEach
-                val p = runCatching { FirebaseBackend.loadProfile(userId) }.getOrNull()
-                seen[userId] = Triple(
-                    userId,
-                    p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user",
-                    p?.profilePic
-                )
+                val known = StatusStripCache.profiles[userId]
+                if (known != null) {
+                    seen[userId] = Triple(userId, known.first, known.second)
+                } else {
+                    val p = runCatching { FirebaseBackend.loadProfile(userId) }.getOrNull()
+                    val name = p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user"
+                    if (p != null) StatusStripCache.profiles[userId] = name to p.profilePic
+                    seen[userId] = Triple(userId, name, p?.profilePic)
+                }
             }
             people = seen.values.take(12)
+            StatusStripCache.people = people
+            StatusStripCache.at = System.currentTimeMillis()
         }
     }
     LazyRow(
@@ -1309,7 +1317,11 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
                 Box(Modifier.size(52.dp).clip(CircleShape).background(Brush.linearGradient(listOf(Color(0xFF00D9FF), Color(0xFF7A2CFF)))).padding(3.dp), contentAlignment = Alignment.Center) {
                     Box(Modifier.fillMaxSize().clip(CircleShape).background(scheme.surfaceContainerHigh), contentAlignment = Alignment.Center) { Icon(Icons.Default.Add, "Your status", tint = scheme.primary, modifier = Modifier.size(22.dp)) }
                 }
-                Spacer(Modifier.height(4.dp)); Text("Your status", color = scheme.onBackground, fontSize = 11.sp)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (org.holidaylink.app.ui.StatusUploads.active.any { it.error == null }) "Uploading…" else "Your status",
+                    color = scheme.onBackground, fontSize = 11.sp
+                )
             }
         }
         itemsIndexed(people) { _, person ->
@@ -1373,10 +1385,10 @@ private fun GlassBottomBar(tab: Tab, onTab: (Tab) -> Unit, onMenu: () -> Unit, o
             horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically
         ) {
             val items = listOf(
-                Triple(Tab.Chats, R.drawable.ic_tg_chats, "Chats"),
+                Triple(Tab.Chats, R.drawable.ic_tg_chats, tr("Chats")),
                 Triple(Tab.Users, R.drawable.ic_tg_users, "Users"),
                 Triple(Tab.Channels, R.drawable.ic_tg_channels, "Channels"),
-                Triple(Tab.Settings, R.drawable.ic_tg_settings, "Settings"),
+                Triple(Tab.Settings, R.drawable.ic_tg_settings, tr("Settings")),
                 Triple(Tab.Menu, R.drawable.ic_tg_menu, "Menu")
             )
             items.forEach { (entry, iconRes, title) ->
@@ -1604,7 +1616,7 @@ private fun OverflowMenu(onSettings: () -> Unit, onMyProfile: () -> Unit) {
                 }
             )
             DropdownMenuItem(
-                text = { Text("Settings") },
+                text = { Text(tr("Settings")) },
                 leadingIcon = { Icon(Icons.Default.Settings, null) },
                 onClick = {
                     expanded = false
@@ -1973,7 +1985,7 @@ fun AuthFlow(api: Api, prefs: SharedPreferences, onCancel: (() -> Unit)? = null,
                                 )
                                 Text("  Sending code...")
                             } else {
-                                Text("Continue")
+                                Text(tr("Continue"))
                             }
                         }
                     }

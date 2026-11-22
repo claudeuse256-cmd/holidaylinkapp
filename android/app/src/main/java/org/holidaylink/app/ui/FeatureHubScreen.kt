@@ -385,7 +385,7 @@ fun StoreScreen(api: Api?, onBack: () -> Unit) {
                     Text(if (placing) "Placing…" else "Place order")
                 }
             },
-            dismissButton = { TextButton(enabled = !placing, onClick = { buying = null }) { Text("Cancel") } }
+            dismissButton = { TextButton(enabled = !placing, onClick = { buying = null }) { Text(tr("Cancel")) } }
         )
     }
 }

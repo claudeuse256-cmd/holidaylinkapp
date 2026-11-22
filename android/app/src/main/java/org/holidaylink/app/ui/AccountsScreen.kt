@@ -129,9 +129,9 @@ fun AccountsScreen(
                         }.getOrNull()
                         runCatching { AccountSession.revoke(context, token, fcm) }
                     }
-                }) { Text("Remove") }
+                }) { Text(tr("Remove")) }
             },
-            dismissButton = { TextButton(onClick = { confirm = null }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text(tr("Cancel")) } }
         )
     }
 }

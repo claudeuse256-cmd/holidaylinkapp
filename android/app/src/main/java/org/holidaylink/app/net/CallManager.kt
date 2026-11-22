@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.ListenerRegistration
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -108,7 +109,12 @@ class CallManager(private val context: Context, private val api: Api) {
     @Volatile var eglContext: EglBase.Context? = null
         private set
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Without a handler, any exception thrown inside scope.launch (a Firestore permission or
+    // network error while signalling, for example) reaches the thread's uncaught-exception
+    // handler and closes the whole app in the middle of a call.
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, _ -> }
+    )
     private val db get() = FirebaseBackend.db
     private var incomingReg: ListenerRegistration? = null
     private var callReg: ListenerRegistration? = null
@@ -557,13 +563,17 @@ class CallManager(private val context: Context, private val api: Api) {
         // Offers/answers ride the call doc; ICE rides candidate subcollections.
         if (kind == "offer") {
             scope.launch {
-                db.collection("calls").document(id)
-                    .update("offer", mapOf("sdp" to (sdp.orEmpty()))).await()
+                runCatching {
+                    db.collection("calls").document(id)
+                        .update("offer", mapOf("sdp" to (sdp.orEmpty()))).await()
+                }
             }
             return
         }
         scope.launch {
-            db.collection("calls").document(id).collection(col).add(signalDoc(kind, sdp, cand)).await()
+            runCatching {
+                db.collection("calls").document(id).collection(col).add(signalDoc(kind, sdp, cand)).await()
+            }
         }
     }
 
@@ -593,7 +603,7 @@ class CallManager(private val context: Context, private val api: Api) {
                 when (track) {
                     is VideoTrack -> {
                         currentRemoteTrack = track
-                        onRemote?.invoke(track)
+                        runCatching { onRemote?.invoke(track) }
                     }
                     // The remote audio track is never drawn anywhere, but it still has to be
                     // enabled: an inbound receiver that starts disabled plays nothing at all,
@@ -604,7 +614,7 @@ class CallManager(private val context: Context, private val api: Api) {
                 }
             }
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState) {
-                setLink(s.name.lowercase())
+                runCatching { setLink(s.name.lowercase()) }
             }
             override fun onSignalingChange(p: PeerConnection.SignalingState) {}
             override fun onIceConnectionChange(p: PeerConnection.IceConnectionState) {
@@ -624,10 +634,11 @@ class CallManager(private val context: Context, private val api: Api) {
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(r: RtpReceiver, m: Array<MediaStream>) {}
         }) ?: return
+        val peer = pc ?: return
         val audio = f.createAudioSource(MediaConstraints())
         audioSource = audio
         localAudio = f.createAudioTrack("audio", audio)
-        pc!!.addTrack(localAudio)
+        runCatching { peer.addTrack(localAudio) }
         if (currentKind == "video") {
             // A camera that refuses to start (another app holding it, permission revoked
             // mid-call) must not take the whole call down: fall back to audio only.
@@ -646,16 +657,16 @@ class CallManager(private val context: Context, private val api: Api) {
                     capt.initialize(helper, context, src.capturerObserver)
                     capt.startCapture(640, 480, 24)
                     localVideo = f.createVideoTrack("video", src)
-                    pc!!.addTrack(localVideo)
+                    peer.addTrack(localVideo)
                     currentLocalTrack = localVideo
                     onLocal?.invoke(localVideo)
                 }
             }
         }
         if (offer) {
-            pc!!.createOffer(object : SdpObserverBase() {
+            peer.createOffer(object : SdpObserverBase() {
                 override fun onCreateSuccess(d: SessionDescription) {
-                    pc?.setLocalDescription(this, d)
+                    runCatching { pc?.setLocalDescription(this, d) }
                     sendSignal("offer", sdp = d.description)
                 }
             }, MediaConstraints())

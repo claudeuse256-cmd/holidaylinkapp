@@ -3,9 +3,6 @@ package org.holidaylink.app.net
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
-import android.provider.Settings
-import androidx.core.content.FileProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -14,11 +11,10 @@ import okhttp3.Request
 import org.holidaylink.app.BuildConfig
 import org.holidaylink.app.config.AppConfig
 import org.json.JSONObject
-import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * In-app self-update so a new build never needs a manual reinstall.
+ * Update check: tells the user when a newer build exists and where to download it.
  *
  * Three feeds are tried, in order:
  *   1. The HolidayLink server's `/app/latest` feed, which proxies the private GitHub release
@@ -26,8 +22,8 @@ import java.util.concurrent.TimeUnit
  *   2. The GitHub release for this repo (`releases/latest`) when the repo is publicly readable.
  *   3. A plain `{versionName, code, url, notes}` document on holidaylink.org as a fallback.
  *
- * Whichever feed reports a code greater than [BuildConfig.VERSION_CODE] wins. The APK is
- * downloaded into the app cache and handed to the system installer through a FileProvider.
+ * Whichever feed reports a code greater than [BuildConfig.VERSION_CODE] wins. The new build is
+ * opened in the browser (see [openDownload]); the app never installs APKs by itself.
  */
 object AppUpdater {
 
@@ -67,10 +63,6 @@ object AppUpdater {
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    private val downloadClient = client.newBuilder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(180, TimeUnit.SECONDS)
-        .build()
 
     /**
      * A newer version than this build, or null when the server says we are current.
@@ -93,86 +85,25 @@ object AppUpdater {
         throw lastError ?: IllegalStateException("No update feed available")
     }
 
-    /** Downloads the APK (or returns the cached copy) and reports 0-100 progress. */
-    suspend fun download(context: Context, update: Update, onProgress: (Int) -> Unit): File? =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val dir = File(context.cacheDir, "updates").apply { mkdirs() }
-                val target = File(dir, "holidaylink-${update.code}.apk")
-                if (target.exists() && target.length() > 0L) {
-                    onProgress(100)
-                    return@runCatching target
-                }
-                val partial = File(dir, "holidaylink-${update.code}.apk.part")
-                partial.delete()
-                try {
-                    val apkUrl = if (update.apkUrl.startsWith("http://") || update.apkUrl.startsWith("https://")) {
-                        update.apkUrl
-                    } else {
-                        AppConfig.resolve(context).trimEnd('/') + update.apkUrl
-                    }
-                    val req = Request.Builder().url(apkUrl)
-                        .header("User-Agent", "HolidayLink")
-                        .build()
-                    downloadClient.newCall(req).execute().use { res ->
-                        val body = res.body ?: throw IllegalStateException("Empty download")
-                        if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
-                        val total = body.contentLength()
-                        var read = 0L
-                        body.byteStream().use { ins ->
-                            partial.outputStream().use { out ->
-                                val buf = ByteArray(64 * 1024)
-                                while (true) {
-                                    val n = ins.read(buf)
-                                    if (n < 0) break
-                                    out.write(buf, 0, n)
-                                    read += n
-                                    if (total > 0) onProgress(((read * 100) / total).toInt().coerceIn(1, 99))
-                                }
-                            }
-                        }
-                    }
-                    if (partial.length() <= 0L) throw IllegalStateException("Empty download")
-                    if (target.exists()) target.delete()
-                    if (!partial.renameTo(target)) {
-                        partial.copyTo(target, overwrite = true)
-                        partial.delete()
-                    }
-                    onProgress(100)
-                    target
-                } catch (t: Throwable) {
-                    partial.delete()
-                    throw t
-                }
-            }.getOrNull()
-        }
-
-    /** Android 8+ requires the "install unknown apps" grant for this source. */
-    fun canInstall(context: Context): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.packageManager.canRequestPackageInstalls()
-        } else true
-
-    fun requestInstallPermission(context: Context) {
+    /**
+     * Opens the release download in the phone's browser / download manager.
+     *
+     * The app deliberately does NOT download an APK itself and hand it to the package
+     * installer any more. An app that fetches an APK at runtime and asks Android to install it
+     * (REQUEST_INSTALL_PACKAGES) is exactly the "dropper" pattern Google Play Protect blocks as
+     * a harmful app. The browser download is visible to the user, needs no special permission,
+     * and the system installer is then opened by the user from the Downloads notification.
+     */
+    fun openDownload(context: Context, update: Update) {
         runCatching {
-            context.startActivity(
-                Intent(
-                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                    Uri.parse("package:${context.packageName}")
-                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        }
-    }
-
-    fun install(context: Context, file: File) {
-        runCatching {
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val apkUrl = if (update.apkUrl.startsWith("http://") || update.apkUrl.startsWith("https://")) {
+                update.apkUrl
+            } else {
+                AppConfig.resolve(context).trimEnd('/') + update.apkUrl
             }
-            context.startActivity(intent)
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse(apkUrl)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
         }
     }
 

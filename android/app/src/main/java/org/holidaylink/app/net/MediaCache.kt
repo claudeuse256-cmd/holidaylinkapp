@@ -30,7 +30,9 @@ object MediaCache {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     // Byte-sized so a few large photos cannot exhaust the heap the way a count-based
     // cache of full-resolution bitmaps can.
-    private val memory = object : android.util.LruCache<String, Bitmap>(16 * 1024 * 1024) {
+    private val memory = object : android.util.LruCache<String, Bitmap>(
+        (Runtime.getRuntime().maxMemory() / 8L).toInt().coerceIn(16 * 1024 * 1024, 64 * 1024 * 1024)
+    ) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
     }
 
@@ -57,6 +59,32 @@ object MediaCache {
 
     fun cached(context: Context, url: String, fallbackExt: String = "bin"): File? =
         file(context, url, fallbackExt).takeIf { it.isFile && it.length() > 0L }
+
+    /**
+     * Files something the user just sent under the URL it was uploaded to. When the stored
+     * message comes back from the server, the picture or video is already on the phone, so it
+     * appears at once instead of flashing "Loading…" and downloading what we just uploaded.
+     */
+    fun seed(context: Context, url: String, source: File, fallbackExt: String = "bin", decodeImage: Boolean = false) {
+        runCatching {
+            if (!url.startsWith("http") || !source.isFile) return
+            val target = file(context.applicationContext, url, fallbackExt)
+            if (!target.isFile || target.length() == 0L) source.copyTo(target, overwrite = true)
+            if (decodeImage) {
+                BitmapFactory.decodeFile(target.absolutePath)?.let { memory.put(key(url), it) }
+            }
+        }
+    }
+
+    /** Same as [seed] for bytes held in memory (a photo that was re-encoded before upload). */
+    fun seed(context: Context, url: String, bytes: ByteArray, fallbackExt: String = "jpg") {
+        runCatching {
+            if (!url.startsWith("http") || bytes.isEmpty()) return
+            val target = file(context.applicationContext, url, fallbackExt)
+            if (!target.isFile || target.length() == 0L) target.writeBytes(bytes)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { memory.put(key(url), it) }
+        }
+    }
 
     /** In-memory hit, safe to call from composition for an instant first frame. */
     fun peek(url: String): Bitmap? = runCatching { memory.get(key(url)) }.getOrNull()

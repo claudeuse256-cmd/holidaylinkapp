@@ -89,7 +89,7 @@ private fun HolidayLinkPreviewContent() {
                     }
                 }
                 Spacer(Modifier.height(18.dp))
-                Text("Status", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(tr("Status"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(10.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                     PreviewStatus("Your status", "＋", false)
@@ -105,7 +105,7 @@ private fun HolidayLinkPreviewContent() {
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     shape = RoundedCornerShape(16.dp),
-                    placeholder = { Text("Search chats") }
+                    placeholder = { Text(tr("Search chats")) }
                 )
                 Spacer(Modifier.height(12.dp))
                 Text("Messages", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
@@ -349,7 +349,7 @@ private fun PreviewChatThreadContent() {
                         .background(MaterialTheme.colorScheme.surfaceVariant)
                         .padding(horizontal = 16.dp, vertical = 14.dp)
                 ) {
-                    Text("Message", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(tr("Message"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Spacer(Modifier.width(10.dp))
                 Box(Modifier.size(46.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
@@ -531,7 +531,7 @@ private fun PreviewSettingsContent() {
                         Text("Emma Nakato", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         Text("+256 700 123 456", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Text("Edit", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                    Text(tr("Edit"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 }
                 Spacer(Modifier.height(8.dp))
             }
@@ -589,7 +589,7 @@ private fun PreviewProfileContent() {
                             .padding(vertical = 13.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("Message", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onPrimary)
+                        Text(tr("Message"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onPrimary)
                     }
                     Box(
                         Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.surfaceVariant)

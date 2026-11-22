@@ -207,7 +207,7 @@ fun NotificationPermissionBanner(
                     dismissed = true
                     context.getSharedPreferences(AppConfig.PREFS, Context.MODE_PRIVATE)
                         .edit().putBoolean(dismissedKey, true).apply()
-                }) { Text("Not now", color = MaterialTheme.colorScheme.secondary) }
+                }) { Text(tr("Not now"), color = MaterialTheme.colorScheme.secondary) }
 
                 Button(onClick = { state.request() }) { Text("Turn on notifications") }
             }
@@ -223,30 +223,23 @@ fun isIgnoringBatteryOptimizations(context: Context): Boolean {
 }
 
 /**
- * Sends the user straight to the system "allow unrestricted battery usage" prompt for this
- * app — the same one-tap dialog WhatsApp shows, rather than a settings page they'd have to
- * navigate themselves. Falls back to the app's battery-usage settings page if the direct
- * dialog isn't available on this OEM's build.
+ * Sends the user to the system battery-optimization list, where they can set HolidayLink to
+ * "Unrestricted" / "Don't optimize". The one-tap ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+ * dialog is intentionally not used: it needs the REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+ * permission, which is on Google's list of sensitive permissions that security scanners
+ * (and Google Play Protect) treat as a warning sign. Falls back to the app's own settings
+ * page if the list isn't available on this OEM's build.
  */
 fun requestIgnoreBatteryOptimizations(context: Context) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
     try {
-        val intent = Intent(
-            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-            Uri.parse("package:${context.packageName}")
-        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
+        context.startActivity(
+            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
     } catch (e: Exception) {
-        Log.w(TAG, "could not open battery optimization prompt: ${e.message}")
-        try {
-            context.startActivity(
-                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        } catch (e2: Exception) {
-            Log.w(TAG, "could not open battery optimization settings either: ${e2.message}")
-            openAppSettings(context)
-        }
+        Log.w(TAG, "could not open battery optimization settings: ${e.message}")
+        openAppSettings(context)
     }
 }
 
@@ -337,7 +330,7 @@ fun BatteryOptimizationBanner(
                     dismissed = true
                     context.getSharedPreferences(AppConfig.PREFS, Context.MODE_PRIVATE)
                         .edit().putBoolean(dismissedKey, true).apply()
-                }) { Text("Not now", color = MaterialTheme.colorScheme.secondary) }
+                }) { Text(tr("Not now"), color = MaterialTheme.colorScheme.secondary) }
 
                 Button(onClick = { state.request() }) { Text("Allow") }
             }

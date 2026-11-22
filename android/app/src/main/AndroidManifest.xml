@@ -10,14 +10,6 @@
     <!-- Android 13+ notification permission, requested after an explanation. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!--
-        Lets the app ask the user to exempt it from battery optimization / Doze, the same
-        prompt WhatsApp shows. Without this, OEMs (Xiaomi/MIUI, Huawei, Samsung, stock Doze)
-        can kill the process in the background and delay or drop FCM pushes even though the
-        server already sends them at high priority.
-    -->
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-
     <!-- Voice messages: requested when the user taps the microphone, never at launch. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
@@ -39,14 +31,23 @@
     <!-- Call audio routing (earpiece vs loudspeaker) and keeping the screen awake in a call. -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!--
+        Calls. Since Android 9 any foreground service needs FOREGROUND_SERVICE, and since
+        Android 14 (we target 35) every foreground-service *type* needs its own permission.
+        The call service is declared phoneCall|microphone|camera and these were missing, so
+        startForeground() threw a SecurityException the instant a call was tapped and the
+        whole app closed.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
 
     <!-- App lock with fingerprint / face. -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.VIBRATE" />
-
-    <!-- In-app self-update: lets the downloaded APK reach the system installer. -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Saving photos/videos to the gallery on Android 9 and older only. -->
     <uses-permission
@@ -55,13 +56,6 @@
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
-    <!-- Android 11+ package visibility: needed to reach the system installer. -->
-    <queries>
-        <intent>
-            <action android:name="android.intent.action.VIEW" />
-            <data android:mimeType="application/vnd.android.package-archive" />
-        </intent>
-    </queries>
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.fingerprint" android:required="false" />
 
@@ -102,7 +96,7 @@
              leaves the app or locks the screen. -->
         <service
             android:name=".call.CallService"
-            android:foregroundServiceType="phoneCall"
+            android:foregroundServiceType="phoneCall|microphone|camera"
             android:exported="false" />
 
         <meta-data
@@ -115,7 +109,7 @@
             android:name="com.google.firebase.messaging.default_notification_color"
             android:resource="@color/notification_accent" />
 
-        <!-- Serves the downloaded APK to the system installer during an in-app update. -->
+        <!-- Shares in-app camera photos and cached chat media with other apps. -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

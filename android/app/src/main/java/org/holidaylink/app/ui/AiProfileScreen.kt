@@ -240,9 +240,9 @@ fun AiProfileScreen(
                             .onSuccess { bots = bots.filterNot { it.id == doomed.id } }
                             .onFailure { scope.launch { snackbar.showSnackbar("Couldn't delete that bot.") } }
                     }
-                }) { Text("Delete") }
+                }) { Text(tr("Delete")) }
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text(tr("Cancel")) } }
         )
     }
 }

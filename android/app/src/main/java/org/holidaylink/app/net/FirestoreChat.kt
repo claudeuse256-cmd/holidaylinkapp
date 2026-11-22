@@ -1,13 +1,18 @@
 package org.holidaylink.app.net
 
 import com.google.firebase.Timestamp
+import com.google.firebase.firestore.DocumentReference
+import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.MetadataChanges
+import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Firestore chats: same docs the website reads/writes (room.html).
@@ -261,13 +266,20 @@ object FirestoreChat {
         /** Only set on `type = "call"` rows, which are the in-chat call log. */
         val callKind: String? = null,
         val callStatus: String? = null,
-        val callSeconds: Long? = null
+        val callSeconds: Long? = null,
+        /**
+         * True while this phone has written the message but the server has not confirmed it
+         * yet (no internet). Firestore keeps such a write on disk and sends it when the
+         * connection returns, even after the app was closed; the chat shows a clock for it.
+         */
+        val pending: Boolean = false
     )
 
     fun messagesFlow(chatId: String): Flow<List<ChatMessage>> = callbackFlow {
         val reg = db.collection("chats").document(chatId).collection("messages")
             .orderBy("timestamp").limitToLast(200)
-            .addSnapshotListener { snap, _ ->
+            // INCLUDE so the clock turns into a tick the moment the server confirms the write.
+            .addSnapshotListener(MetadataChanges.INCLUDE) { snap, _ ->
                 try {
                     val rows = snap?.documents?.mapNotNull { d ->
                         ChatMessage(
@@ -293,7 +305,8 @@ object FirestoreChat {
                             deleted = d.getBoolean("deleted") == true,
                             callKind = d.getString("callKind"),
                             callStatus = d.getString("callStatus"),
-                            callSeconds = d.getLong("callSeconds")
+                            callSeconds = d.getLong("callSeconds"),
+                            pending = d.metadata.hasPendingWrites()
                         )
                     } ?: emptyList()
                     trySend(rows)
@@ -352,24 +365,43 @@ object FirestoreChat {
             else -> text.take(80)
         }
         val msgRef = chatRef.collection("messages").document()
-        db.runTransaction { tx ->
-            val snap = tx.get(chatRef)
-            val members = (snap.get("users") as? List<String>) ?: listOf(uid)
-            tx.set(msgRef, data)
-            val updates = hashMapOf<String, Any?>(
-                "lastText" to preview,
-                "lastAt" to now,
-                "updatedAt" to now
-            )
-            members.filter { it != uid }.forEach { updates["unread_$it"] = ((snap.getLong("unread_$it") ?: 0) + 1) }
-            tx.update(chatRef, updates)
-        }.await()
-
-        // Nudge the other side's phones so the alert lands even if their app is closed.
-        // Best effort only: on failure the message is already in Firestore for them.
-        runCatching { PushNotify.message(chatId, preview, msgRef.id) }
+        // A WriteBatch, not a transaction: a transaction needs the server and simply fails
+        // offline, which is why a message sent without internet vanished when the chat was
+        // closed. A batch is queued in Firestore's on-disk write queue straight away and is
+        // delivered when the connection comes back, even if the app was closed in between.
+        val members = membersOf(chatRef, chatId, uid)
+        val batch = db.batch()
+        batch.set(msgRef, data)
+        val updates = hashMapOf<String, Any?>(
+            "lastText" to preview,
+            "lastAt" to now,
+            "updatedAt" to now
+        )
+        members.filter { it != uid }.forEach { updates["unread_$it"] = FieldValue.increment(1) }
+        batch.update(chatRef, updates)
+        val commit = batch.commit()
+        // Nudge the other side's phones once the server really has the message. Best effort
+        // only: the message itself is already on its way through Firestore.
+        commit.addOnSuccessListener { runCatching { PushNotify.message(chatId, preview, msgRef.id) } }
+        // Give the server a moment to answer so a refused write (rules, bad chat) still shows
+        // up as "not sent". Offline, the answer never comes: the write stays queued and the
+        // message shows with a clock instead of being lost.
+        withTimeoutOrNull(SEND_ACK_WAIT_MS) { commit.await() }
         // The id lets the sender match its optimistic bubble to the stored one.
         return msgRef.id
+    }
+
+    /** How long [send] waits for the server before leaving the write queued offline. */
+    private const val SEND_ACK_WAIT_MS = 2_500L
+
+    /** Chat members without needing the network: disk cache first, then the server. */
+    private suspend fun membersOf(chatRef: DocumentReference, chatId: String, uid: String): List<String> {
+        fun parse(snap: DocumentSnapshot?): List<String>? =
+            (snap?.get("users") as? List<*>)?.mapNotNull { it as? String }?.takeIf { it.isNotEmpty() }
+        parse(runCatching { chatRef.get(Source.CACHE).await() }.getOrNull())?.let { return it }
+        parse(withTimeoutOrNull(3_000) { runCatching { chatRef.get().await() }.getOrNull() })?.let { return it }
+        // A direct chat id is both uids joined with "_".
+        return chatId.split("_").filter { it.isNotBlank() }.takeIf { uid in it } ?: listOf(uid)
     }
 
     suspend fun markRead(chatId: String, sendReceipts: Boolean = true) {

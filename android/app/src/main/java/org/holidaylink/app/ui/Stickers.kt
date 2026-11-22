@@ -11,6 +11,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.material3.MaterialTheme
@@ -98,6 +99,15 @@ private fun normalizeRef(raw: String): String {
     return "hlsticker://$raw"
 }
 
+private const val RAW_STICKER_PREFIX = "hlsticker://raw/"
+
+/** Reference for a bundled starter sticker (a Lottie file in res/raw). */
+fun rawStickerRef(resName: String): String = RAW_STICKER_PREFIX + resName
+
+/** The res/raw name inside a starter-sticker reference, or null for any other reference. */
+fun stickerRawName(ref: String?): String? =
+    ref?.takeIf { it.startsWith(RAW_STICKER_PREFIX) }?.removePrefix(RAW_STICKER_PREFIX)?.takeIf { it.isNotBlank() }
+
 /** Resolve asset path for pack stickers. */
 fun stickerAssetPath(ref: String?): String? {
     val r = normalizeStickerRef(ref) ?: return null
@@ -124,7 +134,14 @@ fun AnimatedSticker(
     size: Dp = 120.dp,
 ) {
     val resolvedAsset = assetPath ?: stickerAssetPath(url)
-    val resolvedRes = resId
+    // Bundled starter stickers are raw Lottie resources, referenced as hlsticker://raw/<name>.
+    val appContext = LocalContext.current
+    val rawRes = remember(url) {
+        stickerRawName(url)?.let { name ->
+            appContext.resources.getIdentifier(name, "raw", appContext.packageName).takeIf { it != 0 }
+        }
+    }
+    val resolvedRes = resId ?: rawRes
     val resolvedUrl = if (resolvedAsset == null && resolvedRes == null) url?.takeUnless { it.startsWith("hlsticker://") } else null
 
     if (resolvedAsset == null && resolvedRes == null && resolvedUrl.isNullOrBlank()) return

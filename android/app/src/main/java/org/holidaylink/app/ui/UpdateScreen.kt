@@ -42,11 +42,9 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.holidaylink.app.BuildConfig
 import org.holidaylink.app.net.AppUpdater
-import java.io.File
 
 /**
- * Settings › App updates: checks for a newer build, downloads the APK with a progress bar and
- * hands it to the system installer — so users never have to reinstall a build by hand.
+ * Settings › App updates: checks for a newer build and opens its download in the browser.
  */
 @Composable
 fun UpdateScreen(onBack: () -> Unit) {
@@ -58,9 +56,6 @@ fun UpdateScreen(onBack: () -> Unit) {
     var update by remember { mutableStateOf<AppUpdater.Update?>(null) }
     var upToDate by remember { mutableStateOf(false) }
     var failed by remember { mutableStateOf(false) }
-    var downloading by remember { mutableStateOf(false) }
-    var progress by remember { mutableIntStateOf(0) }
-    var readyFile by remember { mutableStateOf<File?>(null) }
 
     suspend fun runCheck() {
         checking = true
@@ -73,20 +68,6 @@ fun UpdateScreen(onBack: () -> Unit) {
             }
             .onFailure { failed = true }
         checking = false
-    }
-
-    suspend fun runDownload(target: AppUpdater.Update) {
-        downloading = true
-        failed = false
-        progress = 0
-        val file = AppUpdater.download(context, target) { progress = it }
-        downloading = false
-        if (file == null) {
-            failed = true
-        } else {
-            readyFile = file
-            if (!AppUpdater.canInstall(context)) AppUpdater.requestInstallPermission(context)
-        }
     }
 
     LaunchedEffect(Unit) { runCheck() }
@@ -139,46 +120,13 @@ fun UpdateScreen(onBack: () -> Unit) {
                             Text(found.notes.trim(), style = MaterialTheme.typography.bodyMedium)
                         }
 
-                        if (downloading) {
-                            Spacer(Modifier.height(14.dp))
-                            LinearProgressIndicator(
-                                progress = { progress / 100f },
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                "Downloading… $progress%",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else {
-                            Spacer(Modifier.height(14.dp))
-                            val file = readyFile
-                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                if (file != null) {
-                                    Button(
-                                        onClick = {
-                                            if (AppUpdater.canInstall(context)) {
-                                                AppUpdater.install(context, file)
-                                            } else {
-                                                AppUpdater.requestInstallPermission(context)
-                                            }
-                                        },
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Text(
-                                            if (AppUpdater.canInstall(context)) "Install now"
-                                            else "Allow installing"
-                                        )
-                                    }
-                                } else {
-                                    Button(
-                                        onClick = { scope.launch { runDownload(found) } },
-                                        modifier = Modifier.weight(1f)
-                                    ) { Text("Download update") }
-                                }
-                                OutlinedButton(onClick = { scope.launch { runCheck() } }) { Text("Recheck") }
-                            }
+                        Spacer(Modifier.height(14.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { AppUpdater.openDownload(context, found) },
+                                modifier = Modifier.weight(1f)
+                            ) { Text(tr("Download update")) }
+                            OutlinedButton(onClick = { scope.launch { runCheck() } }) { Text(tr("Recheck")) }
                         }
                     }
                 }
@@ -209,7 +157,7 @@ fun UpdateScreen(onBack: () -> Unit) {
                         color = MaterialTheme.colorScheme.error
                     )
                     Spacer(Modifier.height(12.dp))
-                    Button(onClick = { scope.launch { runCheck() } }) { Text("Try again") }
+                    Button(onClick = { scope.launch { runCheck() } }) { Text(tr("Try again")) }
                 }
 
                 else -> {

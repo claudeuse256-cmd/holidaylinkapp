@@ -66,24 +66,36 @@ private object ChatListLoadState {
     var rows: List<FirestoreChat.ChatRow> = emptyList()
     /** The account [rows] belongs to; another login must not inherit them. */
     var uid: String = ""
+    /** Names/photos of the people in the list, kept for the process so rows never lose them. */
+    val peers = mutableStateMapOf<String, User>()
+    /** Where the list was scrolled to when the tab was left. */
+    var scrollIndex: Int = 0
+    var scrollOffset: Int = 0
 }
 
 /** Recent conversations from Firestore (same docs as the website), realtime. */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun ChatsScreen(
     api: Api,
     currentUserId: String,
     onOpenChat: (ChatItem) -> Unit,
     /** Status row + search bar. Rendered as the first list item so it scrolls away with the chats. */
-    header: (@Composable () -> Unit)? = null
+    header: (@Composable () -> Unit)? = null,
+    /** The search bar: stays pinned at the top while the status strip scrolls away. */
+    pinnedHeader: (@Composable () -> Unit)? = null
 ) {
     val uid = currentUserId.ifBlank { FirestoreChat.myUid() }
     var error by remember { mutableStateOf("") }
     var menuFor by remember { mutableStateOf<ChatItem?>(null) }
     var archivedOpen by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    val peerCache = remember { mutableStateMapOf<String, User>() }
+    // Kept for the whole process (it used to be rebuilt every time the tab was shown, so every
+    // row went back to "loading" and every photo to its initial for a moment).
+    val peerCache = remember(uid) {
+        if (ChatListLoadState.uid.isNotEmpty() && ChatListLoadState.uid != uid) ChatListLoadState.peers.clear()
+        ChatListLoadState.peers
+    }
 
     val rows by remember(uid) { FirestoreChat.chatsFlow(uid) }
         .collectAsState(
@@ -181,13 +193,31 @@ fun ChatsScreen(
 
     // One list for everything: the header is item zero, so it scrolls away with the chats
     // instead of collapsing on a scroll listener, and rows pass behind the floating nav.
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState(
+        initialFirstVisibleItemIndex = ChatListLoadState.scrollIndex,
+        initialFirstVisibleItemScrollOffset = ChatListLoadState.scrollOffset
+    )
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            ChatListLoadState.scrollIndex = listState.firstVisibleItemIndex
+            ChatListLoadState.scrollOffset = listState.firstVisibleItemScrollOffset
+        }
+    }
     LazyColumn(
+        state = listState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = floatingNavBottomPadding()
     ) {
         val headerSlot = header
         if (headerSlot != null) {
             item(key = "chats-header") { headerSlot() }
+        }
+        // The search bar sticks to the top once the status strip above it has scrolled away.
+        val pinnedSlot = pinnedHeader
+        if (pinnedSlot != null) {
+            stickyHeader(key = "chats-search") {
+                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) { pinnedSlot() }
+            }
         }
         when {
             showSkeleton -> item(key = "chats-skeleton") {

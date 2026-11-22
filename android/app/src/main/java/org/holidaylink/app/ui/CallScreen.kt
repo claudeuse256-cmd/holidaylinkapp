@@ -116,13 +116,13 @@ fun CallScreen(
             remoteTrack = track
             val t = track
             val v = remoteView
-            if (t != null && v != null) t.addSink(v)
+            if (t != null && v != null) runCatching { t.addSink(v) }
         }
         manager.onLocal = { track ->
             localTrack = track
             val t = track
             val v = localView
-            if (t != null && v != null) t.addSink(v)
+            if (t != null && v != null) runCatching { t.addSink(v) }
         }
         // The caller's peer (and camera track) is created before this screen composes, so
         // the callbacks above would miss it: pull the current tracks now that they are wired.
@@ -134,8 +134,8 @@ fun CallScreen(
             manager.onLink = previousOnLink
             manager.onRemote = previousOnRemote
             manager.onLocal = previousOnLocal
-            remoteView?.let { v -> remoteTrack?.removeSink(v); v.release() }
-            localView?.let { v -> localTrack?.removeSink(v); v.release() }
+            remoteView?.let { v -> runCatching { remoteTrack?.removeSink(v) }; runCatching { v.release() } }
+            localView?.let { v -> runCatching { localTrack?.removeSink(v) }; runCatching { v.release() } }
             runCatching { ownEgl?.release() }
         }
     }
@@ -145,12 +145,12 @@ fun CallScreen(
     LaunchedEffect(remoteTrack, remoteView) {
         val t = remoteTrack
         val v = remoteView
-        if (t != null && v != null) t.addSink(v)
+        if (t != null && v != null) runCatching { t.addSink(v) }
     }
     LaunchedEffect(localTrack, localView) {
         val t = localTrack
         val v = localView
-        if (t != null && v != null) t.addSink(v)
+        if (t != null && v != null) runCatching { t.addSink(v) }
     }
 
     // The duration counts real talk time: it starts when media actually flows, not the moment
@@ -209,7 +209,7 @@ fun CallScreen(
                             setEnableHardwareScaler(true)
                             setMirror(false)
                             remoteView = this
-                            remoteTrack?.addSink(this)
+                            runCatching { remoteTrack?.addSink(this) }
                         }
                     },
                     modifier = Modifier.fillMaxSize()
@@ -224,7 +224,7 @@ fun CallScreen(
                         setEnableHardwareScaler(true)
                         // Attach straight away: waiting for the LaunchedEffect below left the
                         // caller staring at a black screen while the other phone was ringing.
-                        localTrack?.addSink(this)
+                        runCatching { localTrack?.addSink(this) }
                         localView = this
                     }
                 },

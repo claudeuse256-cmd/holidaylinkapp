@@ -21,7 +21,16 @@ import org.json.JSONObject
  */
 object Cloudinary {
 
-    private val client by lazy { OkHttpClient.Builder().build() }
+    // OkHttp's default is 10 seconds for connect/write/read. A video goes to the server and
+    // from there to Cloudinary, and the server on a free host can need a minute to wake up, so
+    // the defaults timed every real video out before it finished and the upload "never worked".
+    private val client by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(240, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
 
     /**
      * Uploads [bytes] and returns the public HTTPS URL.
