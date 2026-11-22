@@ -1,3 +1,4 @@
+
 package org.holidaylink.app.ui
 
 import androidx.compose.foundation.lazy.grid.items
@@ -131,14 +132,14 @@ fun MediaEditorDialog(
     var preparing by remember { mutableStateOf(false) }
 
     // Editor "tool mode": only one of these is active at a time, and nothing draws or
-    // crops until the user explicitly selects the matching tool — exactly like WhatsApp,
-    // where picking up the pen is a deliberate step, not the default gesture on the photo.
+    // crops until the user explicitly selects the matching tool.
     var tool by remember { mutableStateOf(EditorTool.NONE) }
 
     // Real crop: a fixed guide frame sits over the preview; the image behind it pans and
-    // pinch-zooms while the frame stays put. What's inside the frame when the user is done
-    // is what gets cropped — not a center-crop derived from a zoom slider.
-    var cropAspectRatio by remember(statusMode) { mutableStateOf(if (statusMode) 9f / 16f else 1f) }
+    // pinch-zooms while the frame stays put.
+    var cropAspectRatio by remember(statusMode) {
+        mutableStateOf(if (statusMode) 9f / 16f else 1f)
+    }
     var imageScale by remember { mutableFloatStateOf(1f) }
     var imageOffset by remember { mutableStateOf(Offset.Zero) }
     var sourceSize by remember { mutableStateOf(IntSize.Zero) }
@@ -154,7 +155,6 @@ fun MediaEditorDialog(
     val isImage = kind == "image"
     val isVideo = kind == "video"
 
-    // Video length, read once when the editor opens.
     LaunchedEffect(file, isVideo) {
         if (!isVideo) return@LaunchedEffect
         duration = withContext(Dispatchers.IO) { MediaEditor.videoDurationMs(file) }
@@ -183,9 +183,11 @@ fun MediaEditorDialog(
                 .fillMaxSize()
                 .background(scheme.surface)
         ) {
-            // Title bar
             Row(
-                Modifier.fillMaxWidth().background(if (statusMode) Color(0xFF080D16) else scheme.surface).padding(horizontal = 6.dp, vertical = 6.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .background(if (statusMode) Color(0xFF080D16) else scheme.surface)
+                    .padding(horizontal = 6.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = onCancel) {
@@ -237,7 +239,12 @@ fun MediaEditorDialog(
                                 trimEnd,
                                 cropRect,
                                 finalOverlays,
-                                strokes.map { line -> line.map { p -> (p.x / 10000f).coerceIn(0f, 1f) to (p.y / 10000f).coerceIn(0f, 1f) } }
+                                strokes.map { line ->
+                                    line.map { p ->
+                                        (p.x / 10000f).coerceIn(0f, 1f) to
+                                            (p.y / 10000f).coerceIn(0f, 1f)
+                                    }
+                                }
                             )
                         }
                         .padding(horizontal = 16.dp, vertical = 8.dp)
@@ -246,7 +253,10 @@ fun MediaEditorDialog(
 
             if (statusMode) {
                 Row(
-                    Modifier.fillMaxWidth().background(Color(0xFF101417)).padding(horizontal = 8.dp, vertical = 6.dp),
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF101417))
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -269,7 +279,6 @@ fun MediaEditorDialog(
                 }
             }
 
-            // Preview
             BoxWithConstraints(
                 Modifier
                     .weight(1f)
@@ -293,32 +302,52 @@ fun MediaEditorDialog(
                             }
                         )
 
-                        // Drawing layer: only live when the Draw tool is explicitly selected.
                         Canvas(Modifier.fillMaxSize().pointerInput(tool) {
                             if (tool == EditorTool.DRAW) detectDragGestures(
                                 onDragStart = { point ->
-                                    strokes.add(mutableStateListOf(Offset(point.x / size.width * 10000f, point.y / size.height * 10000f)))
+                                    strokes.add(
+                                        mutableStateListOf(
+                                            Offset(
+                                                point.x / size.width * 10000f,
+                                                point.y / size.height * 10000f
+                                            )
+                                        )
+                                    )
                                 },
                                 onDrag = { change, _ ->
                                     change.consume()
-                                    strokes.lastOrNull()?.add(Offset(change.position.x / size.width * 10000f, change.position.y / size.height * 10000f))
+                                    strokes.lastOrNull()?.add(
+                                        Offset(
+                                            change.position.x / size.width * 10000f,
+                                            change.position.y / size.height * 10000f
+                                        )
+                                    )
                                 }
                             )
                         }) {
                             strokes.forEach { line ->
                                 if (line.size >= 2) {
-                                    val path = Path().apply { moveTo(line.first().x / 10000f * size.width, line.first().y / 10000f * size.height); line.drop(1).forEach { lineTo(it.x / 10000f * size.width, it.y / 10000f * size.height) } }
+                                    val path = Path().apply {
+                                        moveTo(
+                                            line.first().x / 10000f * size.width,
+                                            line.first().y / 10000f * size.height
+                                        )
+                                        line.drop(1).forEach {
+                                            lineTo(
+                                                it.x / 10000f * size.width,
+                                                it.y / 10000f * size.height
+                                            )
+                                        }
+                                    }
                                     drawPath(path, Color.White, style = Stroke(width = 5.dp.toPx()))
                                 }
                             }
                         }
 
-                        // Crop guide frame: fixed on screen while the image moves behind it.
                         if (tool == EditorTool.CROP) {
                             CropGuideOverlay(aspectRatio = cropAspectRatio)
                         }
 
-                        // Placed text/sticker overlays: each draggable and pinch-resizable.
                         overlays.forEach { overlay ->
                             key(overlay.id) {
                                 DraggableOverlayItem(
@@ -354,7 +383,6 @@ fun MediaEditorDialog(
                 LinearProgressIndicator(Modifier.fillMaxWidth())
             }
 
-            // Tools
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -379,21 +407,15 @@ fun MediaEditorDialog(
                     }
                     Spacer(Modifier.height(10.dp))
                 }
+
                 if (isVideo && duration > 0L) {
+                    Text("Trim the clip", style = MaterialTheme.typography.labelLarge, color = scheme.onSurfaceVariant)
                     Text(
-                        "Trim the clip",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = scheme.onSurfaceVariant
-                    )
-                    Text(
-                        "From ${formatMs(trimStart)} to ${formatMs(trimEnd)} " +
-                            "(${formatMs(trimEnd - trimStart)} long)",
+                        "From ${formatMs(trimStart)} to ${formatMs(trimEnd)} (${formatMs(trimEnd - trimStart)} long)",
                         style = MaterialTheme.typography.labelSmall,
                         color = scheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(6.dp))
-                    // WhatsApp-style filmstrip: real frames from the clip with two drag
-                    // handles — not two abstract sliders.
                     TrimFilmstrip(
                         file = file,
                         durationMs = duration,
@@ -405,10 +427,9 @@ fun MediaEditorDialog(
                     }
                     Spacer(Modifier.height(8.dp))
                 }
+
                 if (isImage) {
                     if (!statusMode) {
-                        // Chat attachments: keep the same tools, just without the dedicated
-                        // status toolbar strip — crop/draw/text are reachable here instead.
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedToolLabeled(Icons.Default.Crop, "Crop", active = tool == EditorTool.CROP) {
                                 tool = if (tool == EditorTool.CROP) EditorTool.NONE else EditorTool.CROP
@@ -423,19 +444,28 @@ fun MediaEditorDialog(
                         }
                         Spacer(Modifier.height(8.dp))
                     }
+
                     if (tool == EditorTool.CROP) {
-                        Text("Drag to reposition, pinch to zoom — the frame shows exactly what will be kept.", style = MaterialTheme.typography.labelSmall, color = scheme.onSurfaceVariant)
+                        Text(
+                            "Drag to reposition, pinch to zoom — the frame shows exactly what will be kept.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = scheme.onSurfaceVariant
+                        )
                     } else if (tool == EditorTool.DRAW) {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                             Text("Draw with your finger on the photo", style = MaterialTheme.typography.labelSmall, color = scheme.onSurfaceVariant)
                             TextButton(onClick = { strokes.clear() }) { Text("Clear drawing") }
                         }
                     } else if (overlays.isNotEmpty()) {
-                        Text("Drag text or stickers to move them, pinch with two fingers to resize.", style = MaterialTheme.typography.labelSmall, color = scheme.onSurfaceVariant)
+                        Text(
+                            "Drag text or stickers to move them, pinch with two fingers to resize.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = scheme.onSurfaceVariant
+                        )
                     }
                     Spacer(Modifier.height(8.dp))
                 }
-                // Caption
+
                 Box(
                     Modifier
                         .fillMaxWidth()
@@ -444,11 +474,7 @@ fun MediaEditorDialog(
                         .padding(horizontal = 14.dp, vertical = 10.dp)
                 ) {
                     if (caption.isEmpty()) {
-                        Text(
-                            "Add a caption",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = scheme.onSurfaceVariant
-                        )
+                        Text("Add a caption", style = MaterialTheme.typography.bodyLarge, color = scheme.onSurfaceVariant)
                     }
                     BasicTextField(
                         value = caption,
@@ -464,9 +490,9 @@ fun MediaEditorDialog(
                     if (isVideo) "Videos keep their quality — only the chosen part is sent."
                     else if (isImage) "Photos are compressed for a fast send."
                     else "Documents are sent as they are.",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = scheme.onSurfaceVariant
-                )
+            style = MaterialTheme.typography.labelSmall,
+            color = scheme.onSurfaceVariant
+        )
             }
         }
     }
@@ -493,36 +519,52 @@ fun MediaEditorDialog(
         val packs = remember { StickerCatalog.packs(context) }
         var selectedPack by remember { mutableStateOf(packs.firstOrNull()?.id.orEmpty()) }
         val currentPack = packs.firstOrNull { it.id == selectedPack } ?: packs.firstOrNull()
+
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { stickerPicker = false },
             title = { Text("Animated stickers") },
             text = {
                 Column {
                     if (packs.size > 1) {
-                        androidx.compose.foundation.lazy.LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 8.dp)) {
-                            androidx.compose.foundation.lazy.items(packs, key = { it.id }) { pack ->
+                        androidx.compose.foundation.lazy.LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        ) {
+                            items(packs, key = { pack -> pack.id }) { pack ->
                                 val active = pack.id == currentPack?.id
                                 Column(
                                     Modifier
                                         .clip(RoundedCornerShape(10.dp))
-                                        .background(if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+                                        .background(
+                                            if (active) MaterialTheme.colorScheme.primaryContainer
+                                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                                        )
                                         .clickable { selectedPack = pack.id }
                                         .padding(horizontal = 8.dp, vertical = 6.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     pack.stickers.firstOrNull()?.let { preview ->
-                                        AnimatedSticker(url = preview.ref, assetPath = preview.assetPath, resId = preview.resId, size = 26.dp)
+                                        AnimatedSticker(
+                                            url = preview.ref,
+                                            assetPath = preview.assetPath,
+                                            resId = preview.resId,
+                                            size = 26.dp
+                                        )
                                     }
                                     Text(pack.title, style = MaterialTheme.typography.labelSmall, maxLines = 1)
                                 }
                             }
                         }
                     }
+
                     androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
                         columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(4),
                         modifier = Modifier.height(300.dp)
                     ) {
-                        androidx.compose.foundation.lazy.grid.items(currentPack?.stickers.orEmpty(), key = { it.ref }) { sticker ->
+                        items(
+                            currentPack?.stickers.orEmpty(),
+                            key = { sticker -> sticker.ref }
+                        ) { sticker ->
                             Column(
                                 Modifier.clickable {
                                     addStickerOverlay(sticker.ref)
@@ -530,14 +572,26 @@ fun MediaEditorDialog(
                                 }.padding(4.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                AnimatedSticker(url = sticker.ref, assetPath = sticker.assetPath, resId = sticker.resId, size = 54.dp)
-                                Text(sticker.title, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                AnimatedSticker(
+                                    url = sticker.ref,
+                                    assetPath = sticker.assetPath,
+                                    resId = sticker.resId,
+                                    size = 54.dp
+                                )
+                                Text(
+                                    sticker.title,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                             }
                         }
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { stickerPicker = false }) { Text("Done") } }
+            confirmButton = {
+                TextButton(onClick = { stickerPicker = false }) { Text("Done") }
+            }
         )
     }
 }
@@ -552,7 +606,7 @@ private fun Modifier.centeredAt(cx: Int, cy: Int): Modifier = this.layout { meas
 
 private enum class EditorTool { NONE, CROP, DRAW }
 
-/** A text/sticker overlay while it is still being edited (mutable so drags update it live). */
+/** A text/sticker overlay while it is still being edited. */
 private class EditableOverlay(
     val id: String,
     val kind: String,
@@ -582,7 +636,6 @@ private fun computeCropRect(
     if (sourceSize.width <= 0 || sourceSize.height <= 0 || previewBoxSize.width <= 0 || previewBoxSize.height <= 0) {
         return CropRect()
     }
-    // The crop guide is the largest box of [cropAspectRatio] that fits the preview area.
     val boxW = previewBoxSize.width.toFloat()
     val boxH = previewBoxSize.height.toFloat()
     var guideW = boxW
@@ -592,8 +645,6 @@ private fun computeCropRect(
         guideW = guideH * cropAspectRatio
     }
 
-    // The image is drawn with ContentScale.Fit into the preview box, then panned/scaled by
-    // the user. Work out the on-screen rect of the full (fitted*scale) image.
     val fitScale = min(boxW / sourceSize.width, boxH / sourceSize.height)
     val baseW = sourceSize.width * fitScale
     val baseH = sourceSize.height * fitScale
@@ -605,7 +656,6 @@ private fun computeCropRect(
     val guideLeft = (boxW - guideW) / 2f
     val guideTop = (boxH - guideH) / 2f
 
-    // Where the guide frame falls inside the drawn image, as a 0..1 fraction of that image.
     val left = ((guideLeft - imageLeft) / drawnW).coerceIn(0f, 1f)
     val top = ((guideTop - imageTop) / drawnH).coerceIn(0f, 1f)
     val right = (((guideLeft + guideW) - imageLeft) / drawnW).coerceIn(0f, 1f)
@@ -618,8 +668,6 @@ private fun computeCropRect(
 /** Keeps the panned image from leaving the crop guide empty on any side. */
 private fun clampPanOffset(offset: Offset, scale: Float, boxSize: IntSize): Offset {
     if (boxSize.width <= 0 || boxSize.height <= 0) return offset
-    // Generous bound: at scale 1f no panning is allowed beyond a small margin; the higher the
-    // zoom the more room there is to pan, which matches a frame that must always stay full.
     val maxX = boxSize.width * (scale - 1f) / 2f + boxSize.width * 0.5f
     val maxY = boxSize.height * (scale - 1f) / 2f + boxSize.height * 0.5f
     return Offset(offset.x.coerceIn(-maxX, maxX), offset.y.coerceIn(-maxY, maxY))
@@ -630,7 +678,7 @@ private fun OutlinedTool(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     description: String,
     onClick: () -> Unit
-) {
+){
     Box(
         Modifier
             .size(40.dp)
@@ -678,10 +726,6 @@ private fun StatusEditorTool(icon: androidx.compose.ui.graphics.vector.ImageVect
     }
 }
 
-/**
- * The photo preview, pannable/pinch-zoomable only while a crop (or other pan-needing) tool
- * is active. Reports the decoded source size so the crop math can be done in real pixels.
- */
 @Composable
 private fun EditorImagePreview(
     file: File,
@@ -726,7 +770,6 @@ private fun EditorImagePreview(
     }
 }
 
-/** The fixed crop guide: a frame of [aspectRatio] centered in the preview, dimming outside it. */
 @Composable
 private fun CropGuideOverlay(aspectRatio: Float) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -759,7 +802,6 @@ private fun CropGuideOverlay(aspectRatio: Float) {
     }
 }
 
-/** One placed text or sticker overlay: drag to move, two-finger pinch to scale/rotate. */
 @Composable
 private fun DraggableOverlayItem(
     overlay: EditableOverlay,
@@ -777,9 +819,6 @@ private fun DraggableOverlayItem(
         val centerX = (overlay.x * boxW).toInt()
         val centerY = (overlay.y * boxH).toInt()
 
-        // The draggable content, centered on (centerX, centerY): a custom layout offsets by
-        // minus half its own measured size, so the box's visual center — not its corner —
-        // lands exactly where the overlay is placed.
         Box(
             Modifier
                 .centeredAt(centerX, centerY)
@@ -855,7 +894,6 @@ private fun DraggableOverlayItem(
     }
 }
 
-/** Small dialog for typing/editing a status text overlay before it is placed on the canvas. */
 @Composable
 private fun TextOverlayEditorDialog(
     initialText: String,
@@ -887,8 +925,6 @@ private fun EditorVideoPreview(file: File, trimStartMs: Long, trimEndMs: Long) {
     var videoView by remember { mutableStateOf<android.widget.VideoView?>(null) }
     var playing by remember { mutableStateOf(false) }
 
-    // The preview actually plays, WhatsApp-style: playback loops inside the selected
-    // [trimStart, trimEnd] range so you see exactly what the other side will get.
     DisposableEffect(file) {
         onDispose { runCatching { videoView?.stopPlayback() } }
     }
@@ -928,11 +964,16 @@ private fun EditorVideoPreview(file: File, trimStartMs: Long, trimEndMs: Long) {
             },
             modifier = Modifier.fillMaxSize()
         )
-        // Tap the picture to pause/resume while editing.
         IconButton(
             onClick = {
                 val v = videoView ?: return@IconButton
-                if (v.isPlaying) { v.pause(); playing = false } else { v.start(); playing = true }
+                if (v.isPlaying) {
+                    v.pause()
+                    playing = false
+                } else {
+                    v.start()
+                    playing = true
+                }
             },
             modifier = Modifier
                 .size(64.dp)
@@ -955,10 +996,6 @@ private fun EditorVideoPreview(file: File, trimStartMs: Long, trimEndMs: Long) {
     }
 }
 
-/**
- * The WhatsApp-style trimmer: a strip of real frames pulled from the clip, with two drag
- * handles selecting the part that gets sent (everything outside the handles is dimmed).
- */
 @Composable
 private fun TrimFilmstrip(
     file: File,
@@ -966,7 +1003,7 @@ private fun TrimFilmstrip(
     trimStartMs: Long,
     trimEndMs: Long,
     onChange: (Long, Long) -> Unit
-) {
+){
     val scheme = MaterialTheme.colorScheme
     val frameCount = 8
     val frames by produceState(initialValue = emptyList<android.graphics.Bitmap?>(), file, durationMs) {
@@ -989,7 +1026,7 @@ private fun TrimFilmstrip(
         val endFraction = if (durationMs > 0L) (trimEndMs.toFloat() / durationMs).coerceIn(0f, 1f) else 1f
 
         Row(Modifier.fillMaxSize()) {
-            frames.forEachIndexed { i, bmp ->
+            frames.forEach { bmp ->
                 Box(Modifier.weight(1f).fillMaxHeight()) {
                     if (bmp != null) {
                         Image(
@@ -999,16 +1036,12 @@ private fun TrimFilmstrip(
                             modifier = Modifier.fillMaxSize()
                         )
                     } else {
-                        Box(
-                            Modifier
-                                .fillMaxSize()
-                                .background(scheme.surfaceContainerHighest)
-                        )
+                        Box(Modifier.fillMaxSize().background(scheme.surfaceContainerHighest))
                     }
                 }
             }
         }
-        // Dim what falls outside the selection.
+
         Box(
             Modifier
                 .align(Alignment.CenterStart)
@@ -1023,7 +1056,7 @@ private fun TrimFilmstrip(
                 .fillMaxWidth(1f - endFraction)
                 .background(Color.Black.copy(alpha = 0.55f))
         )
-        // The two drag handles.
+
         TrimHandle(
             fraction = startFraction,
             widthPx = widthPx,
@@ -1047,13 +1080,12 @@ private fun TrimFilmstrip(
     }
 }
 
-/** One draggable trim handle (a slim grip bar at the edge of the selection). */
 @Composable
 private fun androidx.compose.foundation.layout.BoxScope.TrimHandle(
     fraction: Float,
     widthPx: Float,
     onDrag: (Float) -> Unit
-) {
+){
     val density = LocalDensity.current
     val handlePx = with(density) { 20.dp.toPx() }
     Box(
@@ -1061,7 +1093,6 @@ private fun androidx.compose.foundation.layout.BoxScope.TrimHandle(
             .align(Alignment.CenterStart)
             .fillMaxHeight()
             .width(20.dp)
-            // Keep the whole grip inside the strip no matter where the selection sits.
             .offset { IntOffset((fraction * (widthPx - handlePx)).toInt(), 0) }
             .pointerInput(widthPx) {
                 detectDragGestures { change, dragAmount ->
@@ -1073,21 +1104,10 @@ private fun androidx.compose.foundation.layout.BoxScope.TrimHandle(
             .border(1.dp, Color.White.copy(alpha = 0.6f), RoundedCornerShape(6.dp)),
         contentAlignment = Alignment.Center
     ) {
-        // The little grip lines, so the handle reads as draggable.
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier
-                    .width(2.dp)
-                    .height(14.dp)
-                    .background(Color.White.copy(alpha = 0.85f))
-            )
+            Box(Modifier.width(2.dp).height(14.dp).background(Color.White.copy(alpha = 0.85f)))
             Spacer(Modifier.width(4.dp))
-            Box(
-                Modifier
-                    .width(2.dp)
-                    .height(14.dp)
-                    .background(Color.White.copy(alpha = 0.85f))
-            )
+            Box(Modifier.width(2.dp).height(14.dp).background(Color.White.copy(alpha = 0.85f)))
         }
     }
 }
@@ -1100,11 +1120,7 @@ private fun EditorDocumentPreview(file: File, fileName: String, mimeType: String
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Icon(
-            Icons.Default.Description, null,
-            tint = scheme.primary,
-            modifier = Modifier.size(64.dp)
-        )
+        Icon(Icons.Default.Description, null, tint = scheme.primary, modifier = Modifier.size(64.dp))
         Spacer(Modifier.height(12.dp))
         Text(
             fileName,
@@ -1121,13 +1137,11 @@ private fun EditorDocumentPreview(file: File, fileName: String, mimeType: String
     }
 }
 
-/** "1:23" style timestamp for the trim handles. */
 private fun formatMs(ms: Long): String {
     val total = (ms / 1000).coerceAtLeast(0)
     return "%d:%02d".format(total / 60, total % 60)
 }
 
-/** Human readable file size. */
 fun humanSize(bytes: Long): String = when {
     bytes <= 0 -> "0 KB"
     bytes < 1024 -> "$bytes B"
