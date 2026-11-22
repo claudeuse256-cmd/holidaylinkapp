@@ -60,6 +60,22 @@ fun hasContactsPermission(context: Context): Boolean =
     ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
         PackageManager.PERMISSION_GRANTED
 
+/**
+ * The runtime permission(s) needed to read the phone's own photo/video gallery for the
+ * in-app "Add status" grid. Android 13+ splits media access into images/video; older
+ * versions use the single READ_EXTERNAL_STORAGE permission.
+ */
+fun mediaGalleryPermissions(): Array<String> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+} else {
+    arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+}
+
+fun hasMediaGalleryPermission(context: Context): Boolean =
+    mediaGalleryPermissions().all {
+        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+    }
+
 fun openAppSettings(context: Context) {
     try {
         val intent = Intent(

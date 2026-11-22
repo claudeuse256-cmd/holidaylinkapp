@@ -1,19 +1,9 @@
 package org.holidaylink.app.ui
 
-import android.Manifest
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.net.Uri
-import android.os.Handler
-import android.os.Looper
-import android.provider.MediaStore
 import android.widget.VideoView
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.ActivityResult
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -35,9 +25,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -48,12 +35,10 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FileDownload
-import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Message
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -61,10 +46,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.Slider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -102,7 +85,6 @@ import org.holidaylink.app.data.StatusSeen
 import org.holidaylink.app.media.MediaPicker
 import org.holidaylink.app.media.MediaEditor
 import org.holidaylink.app.net.Api
-import org.holidaylink.app.voice.VoiceRecorder
 import org.holidaylink.app.net.safeTimestamp
 import org.holidaylink.app.net.DeviceCache
 import org.holidaylink.app.net.FirebaseBackend
@@ -112,8 +94,10 @@ import org.holidaylink.app.net.Imgbb
 import org.holidaylink.app.net.ApiException
 import org.holidaylink.app.net.Cloudinary
 import org.holidaylink.app.net.Me
-import org.holidaylink.app.net.User
 import org.holidaylink.app.net.StatusUpdate
+
+/** A photo or video picked from the in-app gallery grid, waiting to go through the editor. */
+private data class PendingStatusMedia(val file: File, val kind: String)
 
 /**
  * Status updates: text, photo and video updates that disappear from the feed after 24 hours.
@@ -137,7 +121,12 @@ fun StatusScreen(
     var refreshing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
-    var composerOpen by remember(startWithComposer) { mutableStateOf(startWithComposer) }
+    // "Add status" is a dedicated full-screen page (gallery grid + editor), never the old
+    // cramped dialog. Viewing any status — another person's, or one you already posted —
+    // always opens the full-screen StatusViewer directly instead.
+    var addStatusOpen by remember(startWithComposer) { mutableStateOf(startWithComposer) }
+    var textComposerOpen by remember { mutableStateOf(false) }
+    var pendingEdit by remember { mutableStateOf<PendingStatusMedia?>(null) }
     // Which person's reel entry the list is currently filtered to; null shows everyone.
     var selectedUserId by remember { mutableStateOf<String?>(null) }
     var viewCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
@@ -256,7 +245,7 @@ fun StatusScreen(
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
             }
-            androidx.compose.material3.Button(onClick = { composerOpen = true }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+            androidx.compose.material3.Button(onClick = { addStatusOpen = true }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
                 Icon(Icons.Default.Add, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Post")
             }
             Spacer(Modifier.width(4.dp))
@@ -300,7 +289,7 @@ fun StatusScreen(
                         icon = Icons.Default.Campaign,
                         title = "No status updates",
                         subtitle = "Post a short note or photo. Updates disappear after 24 hours.",
-                        action = { androidx.compose.material3.Button(onClick = { composerOpen = true }) { Text("+ Post status") } }
+                        action = { androidx.compose.material3.Button(onClick = { addStatusOpen = true }) { Text("+ Post status") } }
                     )
                 } else if (selected != null && mine.isEmpty() && others.isEmpty()) {
                     EmptyState(
@@ -321,31 +310,63 @@ fun StatusScreen(
                             contentPadding = PaddingValues(bottom = 28.dp)
                         ) {
                             item(key = "my-status") {
+                                val hasMine = mine.isNotEmpty()
                                 Row(
                                     Modifier
                                         .fillMaxWidth()
                                         .padding(horizontal = 16.dp, vertical = 12.dp)
                                         .clip(MaterialTheme.shapes.medium)
                                         .background(MaterialTheme.colorScheme.surfaceContainer)
-                                        .clickable { composerOpen = true }
+                                        .clickable {
+                                            // WhatsApp behaviour: tapping your own status (when you
+                                            // already have one) opens the full-screen viewer directly;
+                                            // only "Add status" ever opens the management page.
+                                            if (hasMine) openViewer(mine.first()) else addStatusOpen = true
+                                        }
                                         .padding(14.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Box(
-                                        Modifier
-                                            .size(46.dp)
-                                            .clip(CircleShape)
-                                            .background(
-                                                Brush.linearGradient(HolidayLinkGradient),
-                                                CircleShape
-                                            ),
-                                        contentAlignment = Alignment.Center
+                                        Modifier.size(46.dp),
+                                        contentAlignment = Alignment.BottomEnd
                                     ) {
-                                        Icon(
-                                            Icons.Default.Add,
-                                            contentDescription = null,
-                                            tint = androidx.compose.ui.graphics.Color.White
-                                        )
+                                        if (hasMine) {
+                                            Avatar(name = me?.displayName.orEmpty(), photo = mine.first().avatarUrl, size = 46.dp)
+                                        } else {
+                                            Box(
+                                                Modifier
+                                                    .size(46.dp)
+                                                    .clip(CircleShape)
+                                                    .background(
+                                                        Brush.linearGradient(HolidayLinkGradient),
+                                                        CircleShape
+                                                    ),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.Add,
+                                                    contentDescription = null,
+                                                    tint = androidx.compose.ui.graphics.Color.White
+                                                )
+                                            }
+                                        }
+                                        if (hasMine) {
+                                            Box(
+                                                Modifier
+                                                    .size(18.dp)
+                                                    .clip(CircleShape)
+                                                    .background(MaterialTheme.colorScheme.primary, CircleShape)
+                                                    .clickable { addStatusOpen = true },
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.Add,
+                                                    contentDescription = "Add another status",
+                                                    tint = androidx.compose.ui.graphics.Color.White,
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                            }
+                                        }
                                     }
                                     Spacer(Modifier.width(14.dp))
                                     Column(Modifier.weight(1f)) {
@@ -355,7 +376,7 @@ fun StatusScreen(
                                             fontWeight = FontWeight.SemiBold
                                         )
                                         Text(
-                                            "Share how you're doing",
+                                            if (hasMine) "Tap to view · ${mine.size} update${if (mine.size == 1) "" else "s"}" else "Share how you're doing",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
@@ -409,16 +430,120 @@ fun StatusScreen(
         )
     }
 
-    if (composerOpen) {
-        StatusComposer(
-            api = api,
-            onDismiss = { composerOpen = false },
-            onPosted = {
-                composerOpen = false
-                reload++
+    // ---------------------------------------------------------------- Add status (full screen)
+    //
+    // WhatsApp-style flow: a full-screen gallery grid (camera tile + recent photos/videos)
+    // is the only way in; picking a thumbnail (or the camera) goes straight to the editor.
+    // The old cramped AlertDialog composer is gone entirely.
+    if (addStatusOpen) {
+        Dialog(onDismissRequest = { addStatusOpen = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            StatusGalleryPicker(
+                onBack = { addStatusOpen = false },
+                onPickCamera = {
+                    // TODO: wire a real camera capture (ActivityResultContracts.TakePicture /
+                    // TakeVideo) here, the same way WhatsApp's camera tile opens the device
+                    // camera directly. Not part of this pass — falls back to the text composer,
+                    // which still exposes voice/music, so the tile is never a dead end.
+                    addStatusOpen = false
+                    textComposerOpen = true
+                },
+                onPickMedia = { uri, isVideo ->
+                    addStatusOpen = false
+                    scope.launch {
+                        val local = withContext(Dispatchers.IO) {
+                            val ext = if (isVideo) "mp4" else "jpg"
+                            val target = File(context.cacheDir, "status_pick_${System.currentTimeMillis()}.$ext")
+                            runCatching {
+                                context.contentResolver.openInputStream(uri)?.use { input ->
+                                    target.outputStream().use { output -> input.copyTo(output) }
+                                }
+                            }
+                            target.takeIf { it.exists() && it.length() > 0L }
+                        }
+                        if (local != null) {
+                            pendingEdit = PendingStatusMedia(file = local, kind = if (isVideo) "video" else "image")
+                        } else {
+                            error = "That photo or video couldn't be opened."
+                        }
+                    }
+                },
+                onWriteTextStatus = {
+                    addStatusOpen = false
+                    textComposerOpen = true
+                }
+            )
+        }
+    }
+
+    if (textComposerOpen) {
+        Dialog(onDismissRequest = { textComposerOpen = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            StatusTextComposerPage(
+                api = api,
+                onDismiss = { textComposerOpen = false },
+                onPosted = {
+                    textComposerOpen = false
+                    reload++
+                }
+            )
+        }
+    }
+
+    val editing = pendingEdit
+    if (editing != null) {
+        MediaEditorDialog(
+            kind = editing.kind,
+            file = editing.file,
+            fileName = editing.file.name,
+            mimeType = if (editing.kind == "video") "video/mp4" else "image/jpeg",
+            statusMode = true,
+            onAddMusic = { /* music is attached from the text composer's own tools today */ },
+            onCancel = {
+                runCatching { editing.file.delete() }
+                pendingEdit = null
             },
-            onOpenProfile = onOpenProfile,
-            onReply = onReply
+            onSend = { caption, rotation, trimStart, trimEnd, cropRect, overlays, strokes ->
+                pendingEdit = null
+                val stickerIds = overlays.filter { it.kind == "sticker" }.mapNotNull { it.stickerRef }
+                scope.launch {
+                    runCatching {
+                        if (editing.kind == "video") {
+                            postFirestoreStatus(
+                                context = context,
+                                text = caption,
+                                mediaDataUrl = null,
+                                mediaUri = Uri.fromFile(editing.file),
+                                mediaKind = "video",
+                                fileName = editing.file.name,
+                                editedVideoFile = editing.file,
+                                trimStartMs = trimStart,
+                                trimEndMs = trimEnd,
+                                stickerIds = stickerIds
+                            )
+                        } else {
+                            val rendered = withContext(Dispatchers.IO) {
+                                MediaEditor.applyPhotoEdits(editing.file, rotation, cropRect, overlays, strokes)
+                            } ?: editing.file
+                            val bytes = withContext(Dispatchers.IO) { rendered.readBytes() }
+                            val dataUrl = "data:image/jpeg;base64," + android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                            if (rendered != editing.file) runCatching { rendered.delete() }
+                            postFirestoreStatus(
+                                context = context,
+                                text = caption,
+                                mediaDataUrl = dataUrl,
+                                mediaUri = null,
+                                mediaKind = "image",
+                                fileName = editing.file.name,
+                                stickerIds = stickerIds
+                            )
+                        }
+                    }.onSuccess {
+                        reload++
+                    }.onFailure {
+                        error = "We couldn't post that status. Check your internet."
+                    }
+                    runCatching { editing.file.delete() }
+                }
+            }
         )
     }
 
@@ -662,541 +787,6 @@ private fun StatusViewersSheet(status: StatusUpdate, onDismiss: () -> Unit) {
     )
 }
 
-@Composable
-private fun StatusComposer(
-    api: Api,
-    onDismiss: () -> Unit,
-    onPosted: () -> Unit,
-    onOpenProfile: ((String) -> Unit)? = null,
-    onReply: ((StatusUpdate) -> Unit)? = null
-) {
-    var text by remember { mutableStateOf("") }
-    var media by remember { mutableStateOf<String?>(null) }   // base64 photo or voice blob
-    var mediaUri by remember { mutableStateOf<Uri?>(null) }   // picked video or file
-    var mediaKind by remember { mutableStateOf("text") }      // text | image | video | voice | file
-    var posting by remember { mutableStateOf(false) }
-    var previewMode by remember { mutableStateOf(false) }
-    var encoding by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf("") }
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-
-    // Status composer attachments: photo/video/file/voice, plus a tiny emoji palette.
-    var voiceRecording by remember { mutableStateOf(false) }
-    var voiceRecorder by remember { mutableStateOf<VoiceRecorder?>(null) }
-    var voiceMs by remember { mutableLongStateOf(0L) }
-    val voiceHandler = remember { Handler(Looper.getMainLooper()) }
-    var fileUri by remember { mutableStateOf<Uri?>(null) }
-    var fileName by remember { mutableStateOf("") }
-    var musicUri by remember { mutableStateOf<Uri?>(null) }
-    var musicName by remember { mutableStateOf("") }
-    var emojiPicker by remember { mutableStateOf(false) }
-    var stickerPicker by remember { mutableStateOf(false) }
-    val selectedStickerIds = remember { androidx.compose.runtime.mutableStateListOf<String>() }
-    var videoFile by remember { mutableStateOf<File?>(null) }
-    var videoDurationMs by remember { mutableLongStateOf(0L) }
-    var videoTrimStartMs by remember { mutableLongStateOf(0L) }
-    var videoTrimEndMs by remember { mutableLongStateOf(0L) }
-    var statusEditorOpen by remember { mutableStateOf(false) }
-    var statusEditorFile by remember { mutableStateOf<File?>(null) }
-    var statusEditorKind by remember { mutableStateOf("image") }
-    var mentionPicker by remember { mutableStateOf(false) }
-    var mentionSearch by remember { mutableStateOf("") }
-    var mentionUsers by remember { mutableStateOf<List<User>>(emptyList()) }
-    var mentionedUserIds by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
-
-    DisposableEffect(videoFile) {
-        onDispose { runCatching { videoFile?.delete() } }
-    }
-    DisposableEffect(statusEditorFile) {
-        onDispose {
-            if (statusEditorFile != null && statusEditorFile != videoFile) runCatching { statusEditorFile?.delete() }
-        }
-    }
-
-    // Mention suggestions are real people from existing one-to-one chats, not guessed handles.
-    LaunchedEffect(Unit) {
-        val uid = FirebaseBackend.uid.orEmpty()
-        if (uid.isNotBlank()) {
-            runCatching {
-                FirestoreChat.chatsFlow(uid).collect { rows ->
-                    val ids = rows.filter { !it.isGroup }.mapNotNull { it.peerId }.distinct()
-                    mentionUsers = FirestoreChat.resolvePeers(ids).values.sortedBy { it.displayName.lowercase() }
-                }
-            }
-        }
-    }
-
-    val openDoc = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        fileUri = uri
-        fileName = MediaPicker.inspect(context, uri).name ?: "File"
-    }
-    val musicPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        if (uri != null) {
-            musicUri = uri
-            musicName = MediaPicker.inspect(context, uri).name ?: "Audio track"
-        }
-    }
-    val micPermission = rememberLauncherForActivityResult(RequestPermission()) { granted ->
-        if (granted) voiceRecording = true else error = "Microphone permission is needed for voice statuses."
-    }
-
-    val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia()
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        encoding = true
-        scope.launch {
-            val mime = context.contentResolver.getType(uri).orEmpty()
-            if (mime.startsWith("video/")) {
-                val file = MediaPicker.inspect(context, uri)
-                if (file.sizeBytes > 30L * 1024 * 1024) {
-                    error = "Status videos must be 30 MB or smaller."
-                } else {
-                    media = null
-                    mediaUri = uri
-                    mediaKind = "video"
-                    val local = withContext(Dispatchers.IO) {
-                        val target = File(context.cacheDir, "status_edit_${System.currentTimeMillis()}.mp4")
-                        context.contentResolver.openInputStream(uri)?.use { input -> target.outputStream().use { output -> input.copyTo(output) } }
-                        target.takeIf { it.exists() && it.length() > 0L }
-                    }
-                    videoFile = local
-                    videoDurationMs = local?.let { withContext(Dispatchers.IO) { MediaEditor.videoDurationMs(it) } } ?: 0L
-                    videoTrimStartMs = 0L
-                    videoTrimEndMs = videoDurationMs
-                    statusEditorFile = local
-                    statusEditorKind = "video"
-                    statusEditorOpen = local != null
-                    error = if (videoFile == null) "The video couldn't be prepared for editing." else ""
-                }
-            } else {
-                val photoBytes = withContext(Dispatchers.IO) { MediaPicker.imageJpegBytes(context, uri) }
-                if (photoBytes == null) error = "That photo couldn't be read."
-                else {
-                    media = "data:image/jpeg;base64," + android.util.Base64.encodeToString(photoBytes, android.util.Base64.NO_WRAP)
-                    mediaUri = null
-                    mediaKind = "image"
-                    val local = File(context.cacheDir, "status_photo_edit_${System.currentTimeMillis()}.jpg").apply { writeBytes(photoBytes) }
-                    statusEditorFile = local
-                    statusEditorKind = "image"
-                    statusEditorOpen = true
-                    error = ""
-                }
-            }
-            encoding = false
-        }
-    }
-
-    // Record a voice status (max 60 seconds; the blob is stored on the document so it plays offline).
-    LaunchedEffect(voiceRecording) {
-        if (voiceRecording) {
-            voiceRecorder = VoiceRecorder(context)
-            if (voiceRecorder?.start() == true) {
-                voiceMs = 0L
-                voiceHandler.post(object : Runnable {
-                    override fun run() {
-                        if (voiceRecording) {
-                            voiceMs += 1_000
-                            voiceHandler.postDelayed(this, 1_000)
-                        }
-                    }
-                })
-            } else {
-                voiceRecording = false
-                error = "Microphone unavailable."
-            }
-        } else {
-            voiceHandler.removeCallbacksAndMessages(null)
-            val clip = voiceRecorder?.stop()
-            voiceRecorder = null
-            clip?.let {
-                if (it.durationMs > 60_000) {
-                    error = "Voice status too long (max 60 seconds)."
-                    runCatching { it.file.delete() }
-                } else {
-                    val bytes = it.file.readBytes()
-                    media = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                    mediaUri = null
-                    mediaKind = "voice"
-                    voiceMs = it.durationMs
-                    error = ""
-                    runCatching { it.file.delete() }
-                }
-            }
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (previewMode) "Preview status" else "Create status") },
-        text = {
-            Column {
-                if (previewMode) {
-                    // Dedicated review step: users can inspect the post before publishing.
-                    Box(
-                        Modifier.fillMaxWidth().height(230.dp).clip(RoundedCornerShape(18.dp))
-                            .background(Brush.linearGradient(listOf(statusGradientColor(2), statusGradientColor(5)))),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(18.dp)) {
-                            if (mediaKind == "image" && media != null) {
-                                Text("Photo attached", color = Color.White, fontWeight = FontWeight.SemiBold)
-                            } else if (mediaKind == "video") {
-                                Icon(Icons.Default.VideoLibrary, null, tint = Color.White, modifier = Modifier.size(42.dp))
-                                Text("Video status", color = Color.White)
-                            } else if (mediaKind == "voice") {
-                                Icon(Icons.Default.Mic, null, tint = Color.White, modifier = Modifier.size(42.dp))
-                                Text("Voice status · ${formatDuration(voiceMs)}", color = Color.White)
-                            }
-                            if (text.isNotBlank()) Text(text, color = Color.White, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
-                            if (selectedStickerIds.isNotEmpty()) {
-                                Row(horizontalArrangement = Arrangement.Center) {
-                                    selectedStickerIds.take(3).forEach { id -> val ref = statusStickerRef(id); AnimatedSticker(url = ref, assetPath = stickerAssetPath(ref), size = 54.dp) }
-                                }
-                            }
-                            val tagged = text.split(Regex("\\s+")).filter { it.startsWith("@") && it.length > 1 }
-                            if (tagged.isNotEmpty()) Text(tagged.joinToString(" "), color = Color.White.copy(alpha = .85f), style = MaterialTheme.typography.labelMedium)
-                        }
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Text("Review how your update will look before sharing it.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it.take(280) },
-                    label = { Text("What's happening?") },
-                    minLines = 2,
-                    supportingText = { Text("${text.length}/280") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = { mentionPicker = true; mentionSearch = "" }) { Text("@ Mention") }
-                    Text("Choose someone from your chats", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                if (mentionPicker) {
-                    AlertDialog(
-                        onDismissRequest = { mentionPicker = false },
-                        title = { Text("Mention a contact") },
-                        text = {
-                            Column {
-                                OutlinedTextField(
-                                    value = mentionSearch,
-                                    onValueChange = { mentionSearch = it },
-                                    label = { Text("Search chats") },
-                                    singleLine = true,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                                Spacer(Modifier.height(8.dp))
-                                val matches = mentionUsers.filter {
-                                    mentionSearch.isBlank() || it.displayName.contains(mentionSearch, true) || it.username.contains(mentionSearch.trimStart('@'), true)
-                                }
-                                if (matches.isEmpty()) {
-                                    Text("No chat contacts found. Start a chat with someone first.", style = MaterialTheme.typography.bodySmall)
-                                } else {
-                                    LazyColumn(Modifier.height(260.dp)) {
-                                        items(matches, key = { it.id }) { person ->
-                                            Row(
-                                                Modifier.fillMaxWidth().clickable {
-                                                    val handle = person.username.takeIf { it.isNotBlank() } ?: person.id
-                                                    val token = "@$handle"
-                                                    text = (text.trimEnd() + if (text.isBlank()) token else " $token").take(280)
-                                                    mentionedUserIds = mentionedUserIds + (person.id to handle)
-                                                    mentionPicker = false
-                                                }.padding(vertical = 10.dp),
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Avatar(name = person.displayName, photo = person.avatarUrl, size = 38.dp)
-                                                Spacer(Modifier.width(10.dp))
-                                                Column {
-                                                    Text(person.displayName, fontWeight = FontWeight.SemiBold)
-                                                    Text(if (person.username.isBlank()) "HolidayLink contact" else "@${person.username}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        confirmButton = { TextButton(onClick = { mentionPicker = false }) { Text("Done") } }
-                    )
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = { musicPicker.launch(arrayOf("audio/*")) }) { Text(if (musicUri == null) "Add music" else "Change music") }
-                    if (musicName.isNotBlank()) Text(musicName, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                Spacer(Modifier.height(10.dp))
-                if (encoding) {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(6.dp))
-                }
-                val attachedLabel = when {
-                    mediaKind == "voice" -> "Voice · ${formatDuration(voiceMs)}"
-                    mediaKind == "video" -> "Video attached"
-                    mediaKind == "image" -> "Photo attached"
-                    fileUri != null -> "File: $fileName"
-                    else -> ""
-                }
-                StatusAttachments(
-                    onPhoto = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                    onVideo = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) },
-                    onFile = { openDoc.launch(arrayOf("*/*")) },
-                    onVoice = {
-                        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                            voiceRecording = true
-                        } else {
-                            micPermission.launch(Manifest.permission.RECORD_AUDIO)
-                        }
-                    },
-                    onEmoji = { emojiPicker = true },
-                    attached = attachedLabel,
-                    onRemove = { media = null; mediaUri = null; mediaKind = "text"; fileUri = null; fileName = "" },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (mediaKind == "video" && videoDurationMs > 0L) {
-                    Spacer(Modifier.height(10.dp))
-                    Text("Trim video", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                    Text("${formatMs(videoTrimStartMs)} – ${formatMs(videoTrimEndMs)} · ${formatMs((videoTrimEndMs - videoTrimStartMs).coerceAtLeast(0L))}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("Start", style = MaterialTheme.typography.labelSmall)
-                    Slider(
-                        value = videoTrimStartMs.toFloat().coerceIn(0f, videoDurationMs.toFloat()),
-                        onValueChange = { videoTrimStartMs = it.toLong().coerceAtMost((videoTrimEndMs - 500L).coerceAtLeast(0L)) },
-                        valueRange = 0f..videoDurationMs.toFloat()
-                    )
-                    Text("End", style = MaterialTheme.typography.labelSmall)
-                    Slider(
-                        value = videoTrimEndMs.toFloat().coerceIn(0f, videoDurationMs.toFloat()),
-                        onValueChange = { videoTrimEndMs = it.toLong().coerceAtLeast(videoTrimStartMs + 500L).coerceAtMost(videoDurationMs) },
-                        valueRange = 0f..videoDurationMs.toFloat()
-                    )
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = { stickerPicker = true }) { Text("Add animated sticker") }
-                    if (selectedStickerIds.isNotEmpty()) Text("${selectedStickerIds.size} added", style = MaterialTheme.typography.labelSmall)
-                }
-                if (selectedStickerIds.isNotEmpty()) {
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(selectedStickerIds.toList(), key = { it }) { stickerId ->
-                            val ref = statusStickerRef(stickerId)
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                AnimatedSticker(
-                                    url = ref,
-                                    assetPath = stickerAssetPath(ref),
-                                    size = 48.dp
-                                )
-                                TextButton(onClick = { selectedStickerIds.remove(stickerId) }) { Text("Remove") }
-                            }
-                        }
-                    }
-                }
-                if (stickerPicker) {
-                    val packs = remember { StickerCatalog.packs(context) }
-                    var selectedPack by remember { mutableStateOf(packs.firstOrNull()?.id.orEmpty()) }
-                    val currentPack = packs.firstOrNull { it.id == selectedPack } ?: packs.firstOrNull()
-                    AlertDialog(
-                        onDismissRequest = { stickerPicker = false },
-                        title = { Text("Animated stickers") },
-                        text = {
-                            Column {
-                                if (packs.size > 1) {
-                                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 8.dp)) {
-                                        items(packs, key = { it.id }) { pack ->
-                                            val active = pack.id == currentPack?.id
-                                            Column(
-                                                Modifier
-                                                    .clip(RoundedCornerShape(10.dp))
-                                                    .background(if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-                                                    .clickable { selectedPack = pack.id }
-                                                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                                                horizontalAlignment = Alignment.CenterHorizontally
-                                            ) {
-                                                pack.stickers.firstOrNull()?.let { preview ->
-                                                    AnimatedSticker(url = preview.ref, assetPath = preview.assetPath, resId = preview.resId, size = 26.dp)
-                                                }
-                                                Text(pack.title, style = MaterialTheme.typography.labelSmall, maxLines = 1)
-                                            }
-                                        }
-                                    }
-                                }
-                                LazyVerticalGrid(columns = GridCells.Fixed(4), modifier = Modifier.height(300.dp)) {
-                                    gridItems(currentPack?.stickers.orEmpty(), key = { it.ref }) { sticker ->
-                                        val chosen = sticker.ref in selectedStickerIds || sticker.ref.removePrefix("hlsticker://") in selectedStickerIds
-                                        Column(
-                                            Modifier.clickable {
-                                                val value = sticker.ref
-                                                if (value !in selectedStickerIds) selectedStickerIds.add(value)
-                                            }.padding(4.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally
-                                        ) {
-                                            AnimatedSticker(url = sticker.ref, assetPath = sticker.assetPath, resId = sticker.resId, size = 54.dp)
-                                            Text(if (chosen) "Added" else sticker.title, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        confirmButton = { TextButton(onClick = { stickerPicker = false }) { Text("Done") } }
-                    )
-                }
-                if (emojiPicker) {
-                    StatusEmojiPicker(
-                        onEmoji = { emoji ->
-                            text = (text + emoji).take(280)
-                            emojiPicker = false
-                        },
-                        onClose = { emojiPicker = false }
-                    )
-                }
-                if (error.isNotBlank()) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    if (!previewMode) { previewMode = true; return@TextButton }
-                    if (posting) return@TextButton
-                    posting = true
-                    error = ""
-                    scope.launch {
-                        runCatching {
-                            postFirestoreStatus(
-                                context,
-                                text.trim(),
-                                media,
-                                mediaUri ?: fileUri,
-                                mediaKind,
-                                fileName,
-                                voiceMs,
-                                mentionedUserIds,
-                                videoFile,
-                                videoTrimStartMs,
-                                videoTrimEndMs,
-                                selectedStickerIds.toList(),
-                                musicUri
-                            )
-                        }.onSuccess { onPosted() }
-                         .onFailure {
-                             posting = false
-                             error = "We couldn't post that status. Check your internet."
-                         }
-                    }
-                },
-                enabled = (text.isNotBlank() || media != null || mediaUri != null || fileUri != null) &&
-                    !posting && !encoding && !voiceRecording
-            ) { Text(if (posting) "Posting…" else if (previewMode) "Share status" else "Preview status") }
-        },
-        dismissButton = {
-            Row {
-                if (previewMode) TextButton(onClick = { previewMode = false }) { Text("Edit") }
-                else TextButton(onClick = { previewMode = true }, enabled = (text.isNotBlank() || media != null || mediaUri != null || fileUri != null) && !encoding && !voiceRecording) { Text("Preview") }
-                TextButton(onClick = onDismiss) { Text("Cancel") }
-            }
-        }
-    )
-
-    val editingFile = statusEditorFile
-    if (statusEditorOpen && editingFile != null) {
-        MediaEditorDialog(
-            kind = statusEditorKind,
-            file = editingFile,
-            fileName = editingFile.name,
-            mimeType = if (statusEditorKind == "video") "video/mp4" else "image/jpeg",
-            statusMode = true,
-            onAddMusic = { musicPicker.launch(arrayOf("audio/*")) },
-            onAddSticker = { stickerPicker = true },
-            onCancel = { statusEditorOpen = false },
-            onSend = { caption, rotation, trimStart, trimEnd, cropZoom, overlayText, strokes, cropAspectRatio ->
-                statusEditorOpen = false
-                if (caption.isNotBlank()) text = caption.take(280)
-                scope.launch {
-                    if (statusEditorKind == "video") {
-                        videoTrimStartMs = trimStart
-                        videoTrimEndMs = trimEnd
-                    } else {
-                        val rendered = withContext(Dispatchers.IO) {
-                            MediaEditor.applyPhotoEdits(editingFile, rotation, cropZoom, overlayText, strokes, cropAspectRatio)
-                        }
-                        if (rendered != null) {
-                            val bytes = withContext(Dispatchers.IO) { rendered.readBytes() }
-                            media = "data:image/jpeg;base64," + android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                            runCatching { rendered.delete() }
-                        } else {
-                            error = "Photo edits could not be applied. The original photo will be used."
-                        }
-                    }
-                }
-            }
-        )
-    }
-}
-
-// (attached label computed inline in StatusComposer)
-
-/** Photo / video / file / voice / emoji row: every action has a label so nothing is hidden. */
-@Composable
-private fun StatusAttachments(
-    onPhoto: () -> Unit,
-    onVideo: () -> Unit,
-    onFile: () -> Unit,
-    onVoice: () -> Unit,
-    onEmoji: () -> Unit,
-    attached: String,
-    onRemove: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = modifier) {
-        AttachmentButton(Icons.Default.Image, "Photo", onPhoto)
-        AttachmentButton(Icons.Default.VideoLibrary, "Video", onVideo)
-        AttachmentButton(Icons.Default.Description, "File", onFile)
-        AttachmentButton(Icons.Default.Mic, "Voice", onVoice)
-        AttachmentButton(Icons.Default.SmartToy, "Emoji", onEmoji)
-        Spacer(Modifier.weight(1f))
-        if (attached.isNotBlank()) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(attached, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-                Spacer(Modifier.width(6.dp))
-                IconButton(onClick = onRemove) {
-                    Icon(Icons.Default.Close, "Remove attachment", Modifier.size(18.dp))
-                }
-            }
-        } else {
-            Text("Add a photo, video, file, voice or emoji", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-}
-
-@Composable
-private fun AttachmentButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        IconButton(onClick = onClick) { Icon(icon, null, Modifier.size(20.dp)) }
-        Text(label, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), maxLines = 1)
-    }
-}
-
-/** Small emoji palette that inserts into the status text. */
-@Composable
-private fun StatusEmojiPicker(onEmoji: (String) -> Unit, onClose: () -> Unit) {
-    val emojis = listOf("😀", "😂", "😍", "😎", "🥳", "😭", "😡", "👍", "❤️", "🎉", "🔥", "💯", "🙏", "🤔", "😱", "🎂", "🎄", "🌹", "☀️", "❄️")
-    Column(Modifier.width(320.dp).padding(10.dp)) {
-        LazyVerticalGrid(columns = GridCells.Fixed(8)) {
-            gridItems(emojis, key = { it }) { emoji ->
-                Box(
-                    Modifier.size(40.dp).clickable(onClick = { onEmoji(emoji) })
-                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, CircleShape),
-                    contentAlignment = Alignment.Center
-                ) { Text(emoji, fontSize = 20.sp) }
-            }
-        }
-        Row(horizontalArrangement = Arrangement.End) {
-            TextButton(onClick = onClose) { Text("Close") }
-        }
-    }
-}
 
 /** Firestore statuses: same docs as the website (24h expiry, imgbb photos). */
 private suspend fun loadFirestoreStatuses(
@@ -1240,7 +830,7 @@ private suspend fun loadFirestoreStatuses(
 }
 
 /** Post text/photo/video/file/voice status with 24-hour expiry. */
-private suspend fun postFirestoreStatus(
+internal suspend fun postFirestoreStatus(
     context: android.content.Context,
     text: String,
     mediaDataUrl: String?,
@@ -1280,8 +870,21 @@ private suspend fun postFirestoreStatus(
             }
         if (finalText.isBlank()) finalText = name
     } else if (mediaKind == "video" && mediaUri != null) {
-        val picked = MediaPicker.inspect(context, mediaUri)
-        if (picked.sizeBytes > 30L * 1024 * 1024) throw ApiException("Status videos must be 30 MB or smaller.")
+        // When the caller already has a local file (editedVideoFile — e.g. the gallery-grid
+        // "Add status" flow, which copies the picked video to cacheDir before editing), reading
+        // size/name through the content resolver is unreliable for a file:// URI and is also
+        // redundant: inspect the file directly instead of round-tripping through MediaPicker.
+        val pickedName: String?
+        val pickedSizeBytes: Long
+        if (editedVideoFile != null) {
+            pickedName = editedVideoFile.name
+            pickedSizeBytes = editedVideoFile.length()
+        } else {
+            val picked = MediaPicker.inspect(context, mediaUri)
+            pickedName = picked.name
+            pickedSizeBytes = picked.sizeBytes
+        }
+        if (pickedSizeBytes > 30L * 1024 * 1024) throw ApiException("Status videos must be 30 MB or smaller.")
         val source = editedVideoFile ?: withContext(Dispatchers.IO) {
             File(context.cacheDir, "status_source_${System.currentTimeMillis()}.mp4").also { target ->
                 context.contentResolver.openInputStream(mediaUri)?.use { input -> target.outputStream().use { output -> input.copyTo(output) } }
@@ -1294,7 +897,7 @@ private suspend fun postFirestoreStatus(
         } else source
         if (uploadFile.length() > 30L * 1024 * 1024) throw ApiException("Edited status videos must be 30 MB or smaller.")
         val bytes = withContext(Dispatchers.IO) { uploadFile.readBytes() }
-        val name = picked.name ?: "status.mp4"
+        val name = pickedName ?: "status.mp4"
         val mime = "video/mp4"
         mediaUrl = runCatching { Cloudinary.upload(context, bytes, name, mime) }
             .getOrElse {

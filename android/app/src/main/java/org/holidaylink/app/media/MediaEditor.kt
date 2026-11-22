@@ -8,6 +8,39 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
+ * A crop window, normalized to the 0..1 size of the (already rotated) source image.
+ * This is what the user framed inside the fixed crop guide in the editor — a real crop,
+ * not a center-crop derived from a zoom factor.
+ */
+data class CropRect(
+    val left: Float = 0f,
+    val top: Float = 0f,
+    val right: Float = 1f,
+    val bottom: Float = 1f
+) {
+    fun isIdentity(): Boolean = left <= 0.0001f && top <= 0.0001f && right >= 0.9999f && bottom >= 0.9999f
+}
+
+/**
+ * A text or sticker placed on the photo, positioned the way WhatsApp's editor does it:
+ * dragged and pinch/handle-resized by the user rather than pinned to a fixed spot.
+ *
+ * [x]/[y] are the overlay's center, normalized 0..1 against the final (cropped) image.
+ * [scale] is relative to the overlay's natural on-canvas size (1f = as placed).
+ */
+data class PlacedOverlay(
+    val id: String,
+    val kind: String, // "text" | "sticker"
+    val text: String = "",
+    val colorArgb: Int = android.graphics.Color.WHITE,
+    val stickerRef: String? = null,
+    val x: Float = 0.5f,
+    val y: Float = 0.5f,
+    val scale: Float = 1f,
+    val rotationDeg: Float = 0f
+)
+
+/**
  * Small editing helpers used by the "edit before sending" screen.
  *
  * Everything here works on a copy of the file the user picked, never on the original:
@@ -69,36 +102,44 @@ object MediaEditor {
         }
     }
 
-    /** Apply a center crop/zoom, rotation, freehand marks and text to a new JPEG copy. */
+    /**
+     * Rotates, crops to a real user-framed [cropRect] (not a center-crop derived from a zoom
+     * factor), then bakes freehand marks and any placed text overlays onto a new JPEG copy.
+     *
+     * [cropRect] is normalized against the rotated source image. Sticker overlays are not
+     * baked in here — they stay animated (Lottie) and are drawn live by the viewer at their
+     * stored [PlacedOverlay] position, exactly like the editor preview.
+     */
     fun applyPhotoEdits(
         file: File,
         degrees: Int,
-        cropZoom: Float,
-        overlayText: String,
-        strokes: List<List<Pair<Float, Float>>>,
-        cropAspectRatio: Float = 1f
+        cropRect: CropRect,
+        overlays: List<PlacedOverlay>,
+        strokes: List<List<Pair<Float, Float>>>
     ): File? {
         val source = preview(file, 2048) ?: return null
         return try {
             val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
             val rotated = Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
             if (rotated !== source) source.recycle()
-            val zoom = cropZoom.coerceIn(1f, 2.5f)
-            var cropW = (rotated.width / zoom).toInt().coerceAtLeast(1)
-            var cropH = (rotated.height / zoom).toInt().coerceAtLeast(1)
-            val targetRatio = cropAspectRatio.takeIf { it.isFinite() && it > 0f } ?: (cropW.toFloat() / cropH)
-            if (cropW.toFloat() / cropH > targetRatio) {
-                cropW = (cropH * targetRatio).toInt().coerceAtLeast(1)
+
+            val left = (cropRect.left.coerceIn(0f, 1f) * rotated.width).toInt()
+            val top = (cropRect.top.coerceIn(0f, 1f) * rotated.height).toInt()
+            val right = (cropRect.right.coerceIn(0f, 1f) * rotated.width).toInt()
+            val bottom = (cropRect.bottom.coerceIn(0f, 1f) * rotated.height).toInt()
+            val cropW = (right - left).coerceAtLeast(1).coerceAtMost(rotated.width - left)
+            val cropH = (bottom - top).coerceAtLeast(1).coerceAtMost(rotated.height - top)
+            val cropped = if (cropRect.isIdentity()) {
+                rotated
             } else {
-                cropH = (cropW / targetRatio).toInt().coerceAtLeast(1)
+                Bitmap.createBitmap(rotated, left.coerceIn(0, rotated.width - 1), top.coerceIn(0, rotated.height - 1), cropW, cropH)
             }
-            val left = ((rotated.width - cropW) / 2).coerceAtLeast(0)
-            val top = ((rotated.height - cropH) / 2).coerceAtLeast(0)
-            val cropped = Bitmap.createBitmap(rotated, left, top, cropW, cropH)
             if (cropped !== rotated) rotated.recycle()
+
             val output = cropped.copy(Bitmap.Config.ARGB_8888, true)
-            cropped.recycle()
+            if (cropped !== output) cropped.recycle()
             val canvas = android.graphics.Canvas(output)
+
             val linePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
                 color = android.graphics.Color.WHITE; style = android.graphics.Paint.Style.STROKE
                 strokeWidth = (output.width * 0.008f).coerceAtLeast(4f)
@@ -113,17 +154,28 @@ object MediaEditor {
                     canvas.drawPath(path, linePaint)
                 }
             }
-            if (overlayText.isNotBlank()) {
+
+            // Text overlays are placed exactly where the user dragged/resized them in the
+            // editor, not pinned to a fixed bottom-center spot.
+            overlays.filter { it.kind == "text" && it.text.isNotBlank() }.forEach { overlay ->
                 val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                    color = android.graphics.Color.WHITE; textAlign = android.graphics.Paint.Align.CENTER
-                    textSize = (output.width * 0.075f).coerceIn(28f, 88f); typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.BOLD)
+                    color = overlay.colorArgb
+                    textAlign = android.graphics.Paint.Align.CENTER
+                    textSize = ((output.width * 0.075f) * overlay.scale).coerceIn(14f, output.width * 0.4f)
+                    typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.BOLD)
                     setShadowLayer(7f, 2f, 3f, android.graphics.Color.BLACK)
                 }
-                val lines = overlayText.take(120).split("\n").take(3)
+                val lines = overlay.text.take(120).split("\n").take(3)
                 val lineHeight = paint.textSize * 1.15f
-                val baseY = output.height * 0.86f - (lines.size - 1) * lineHeight
-                lines.forEachIndexed { i, line -> canvas.drawText(line, output.width / 2f, baseY + i * lineHeight, paint) }
+                val centerX = overlay.x.coerceIn(0f, 1f) * output.width
+                val centerY = overlay.y.coerceIn(0f, 1f) * output.height
+                val baseY = centerY - (lines.size - 1) * lineHeight / 2f
+                canvas.save()
+                canvas.rotate(overlay.rotationDeg, centerX, centerY)
+                lines.forEachIndexed { i, line -> canvas.drawText(line, centerX, baseY + i * lineHeight, paint) }
+                canvas.restore()
             }
+
             val out = File(file.parentFile, "edited-${System.currentTimeMillis()}.jpg")
             out.outputStream().use { output.compress(Bitmap.CompressFormat.JPEG, 92, it) }
             output.recycle()
