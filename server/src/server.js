@@ -356,6 +356,22 @@ async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
   // the right conversation opens. When the app is alive the messaging service takes over
   // and draws it, which keeps the per-account label ("Account: ...") that the system block
   // cannot know about.
+  // FCM data must be string -> string and may not use the reserved names `from`,
+  // `notification`, `message_type` or anything starting with `google` / `gcm`. A single such
+  // key makes Firebase reject the whole message, so they are dropped here for every caller.
+  const cleanData = {};
+  Object.keys(data).forEach((key) => {
+    const lower = key.toLowerCase();
+    if (lower === 'from' || lower === 'notification' || lower === 'message_type'
+      || lower.startsWith('google') || lower.startsWith('gcm')) {
+      console.warn(`[push] dropped reserved data key "${key}"`);
+      return;
+    }
+    if (data[key] === undefined || data[key] === null) return;
+    cleanData[key] = String(data[key]);
+  });
+  data = cleanData;
+
   const chatId = String(data.chatId || '');
   const tag = chatId ? `chat-${chatId}` : `call-${String(data.callId || '')}`;
   const channelId = data.type === 'call' ? 'hl_calls' : 'hl_messages';
@@ -396,10 +412,12 @@ async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
   result.responses.forEach((r, i) => {
     if (r.success) return;
     const code = r.error && r.error.code;
+    // Only these two mean "this token is gone". invalid-argument means the MESSAGE was
+    // malformed, so deleting the token for it wiped every user's tokens (and every later
+    // push then said "no registered device tokens").
     if (
       code === 'messaging/registration-token-not-registered'
       || code === 'messaging/invalid-registration-token'
-      || code === 'messaging/invalid-argument'
     ) {
       dead.push(tokens[i]);
     }
@@ -414,7 +432,10 @@ async function pushToUser(uid, data, ttlSeconds, skipIfActive) {
     console.warn(
       `[push] ${uid}: sent ${result.successCount}/${tokens.length}, ` +
       `failed ${result.failureCount}` +
-      (first && first.error ? ` (first: ${first.error.code})` : '')
+      (first && first.error
+        ? ` (first: ${first.error.code} - ${String(first.error.message || '').slice(0, 300)})`
+        : '') +
+      (dead.length ? `; removed ${dead.length} dead token(s)` : '')
     );
   } else {
     console.log(`[push] ${uid}: delivered to ${result.successCount}/${tokens.length} device(s)`);
@@ -540,7 +561,9 @@ app.post('/push/send', async (req, res) => {
     body,
     chatId: chatId || '',
     callId: callId || '',
-    from: sender.uid
+    // NOT `from`: that is a reserved word in FCM data messages and makes Firebase reject
+    // every push with messaging/invalid-argument.
+    senderId: sender.uid
   };
   if (idOverride) data.id = idOverride;
 
