@@ -113,10 +113,15 @@ private fun UpdateDialog(update: AppUpdater.Update, mandatory: Boolean, onLater:
             shape = if (mandatory) RoundedCornerShape(0.dp) else RoundedCornerShape(24.dp),
             color = MaterialTheme.colorScheme.surface
         ) {
+            val pageScroll = rememberScrollState()
             Column(
-                Modifier.padding(22.dp),
+                // The required-update screen scrolls as a whole (buttons stay at the top of it);
+                // the closable pop-up keeps a scrollable notes box instead.
+                Modifier
+                    .then(if (mandatory) Modifier.fillMaxSize().verticalScroll(pageScroll) else Modifier)
+                    .padding(22.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = if (mandatory) Arrangement.Center else Arrangement.Top
+                verticalArrangement = Arrangement.Top
             ) {
                 Icon(
                     Icons.Default.CloudDownload, contentDescription = null,
@@ -202,8 +207,12 @@ private fun UpdateDialog(update: AppUpdater.Update, mandatory: Boolean, onLater:
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(4.dp))
-                    Column(Modifier.fillMaxWidth().heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
-                        Text(notes, style = MaterialTheme.typography.bodySmall)
+                    if (mandatory) {
+                        Text(notes, style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth())
+                    } else {
+                        Column(Modifier.fillMaxWidth().heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
+                            Text(notes, style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
                 Spacer(Modifier.height(10.dp))

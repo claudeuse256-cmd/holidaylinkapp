@@ -3,6 +3,7 @@
 package org.holidaylink.app
 
 import org.holidaylink.app.ui.tr
+import org.holidaylink.app.ui.segmentedStatusRing
 import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
@@ -274,7 +275,7 @@ private sealed interface Destination {
     data object Calls : Destination
     data class WebFeature(val title: String, val url: String) : Destination
     data object FeatureHub : Destination
-    data class Status(val startWithComposer: Boolean = false) : Destination
+    data class Status(val startWithComposer: Boolean = false, val userId: String? = null) : Destination
     data class ScheduledMessages(val chatId: String, val chatLabel: String) : Destination
     data object Store : Destination
     data object Subscription : Destination
@@ -504,11 +505,21 @@ private fun SignedInApp(
     // A call only starts once the microphone (and camera for video) is granted. Before
     // this, a denied permission made CallManager.start throw and the tap did nothing.
     var pendingCall by remember { mutableStateOf<Pair<User, String>?>(null) }
+    // The call screen is shown at once ("Calling…") while the connection is being prepared.
+    var dialing by remember { mutableStateOf<Pair<User, String>?>(null) }
+    var dialCancelled by remember { mutableStateOf(false) }
     fun launchCall(user: User, kind: String) {
+        dialing = user to kind
+        dialCancelled = false
         scope.launch {
             runCatching { callManager.start(user.id, kind) }
-                .onSuccess { activeCall = Triple(it.id, kind, user); incomingCall = false }
+                .onSuccess {
+                    dialing = null
+                    if (dialCancelled) runCatching { callManager.end() }
+                    else { activeCall = Triple(it.id, kind, user); incomingCall = false }
+                }
                 .onFailure { e ->
+                    dialing = null
                     Toast.makeText(
                         context,
                         (e as? ApiException)?.message ?: e.message ?: "Couldn't start the call.",
@@ -677,14 +688,16 @@ private fun SignedInApp(
                             // Reading it here and now: no alert, and any old alert disappears.
                             Notifier.clearChat(context, row.id)
                         } else {
+                            // The other person (direct chats only): their name and picture.
+                            val peerUser = if (!row.isGroup && !row.peerId.isNullOrBlank()) {
+                                runCatching { FirestoreChat.resolvePeer(row.peerId.orEmpty()) }.getOrNull()
+                            } else null
                             val who = row.title.takeIf { it.isNotBlank() }
-                                ?: runCatching {
-                                    FirestoreChat.resolvePeer(row.peerId.orEmpty()).displayName
-                                }.getOrNull()
+                                ?: peerUser?.displayName
                                 ?: "New message"
                             Notifier.message(
                                 context, Notifier.idFor(row.id), who, row.lastBody ?: "New message", row.id,
-                                photoUrl = row.peer?.avatarUrl
+                                photoUrl = peerUser?.avatarUrl
                             )
                         }
                     }
@@ -745,6 +758,16 @@ private fun SignedInApp(
     }
 
     BackHandler(enabled = stack.size > 1) { pop() }
+
+    val dialingNow = dialing
+    if (dialingNow != null && activeCall == null) {
+        org.holidaylink.app.ui.DialingScreen(
+            user = dialingNow.first,
+            kind = dialingNow.second,
+            onCancel = { dialCancelled = true; dialing = null }
+        )
+        return
+    }
 
     val ongoingCall = activeCall
     if (ongoingCall != null && !callMinimized) {
@@ -817,7 +840,8 @@ private fun SignedInApp(
                     onOpenProfile = { push(Destination.PersonProfile(it)) },
                     onOpenGroupInfo = { push(Destination.GroupInfo(it)) },
                     onStartCall = { user, kind -> beginCall(user, kind) },
-                    initialStatusReply = current.statusReply
+                    initialStatusReply = current.statusReply,
+                    onOpenStatus = { push(Destination.Status(false, it)) }
                 )
             }
         }
@@ -935,6 +959,7 @@ private fun SignedInApp(
             api = api,
             me = me,
             startWithComposer = current.startWithComposer,
+            initialUserId = current.userId,
             onBack = pop,
             onReply = { status ->
                 val uid = FirebaseBackend.uid.orEmpty()
@@ -1340,14 +1365,12 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
         }
         itemsIndexed(people) { _, person ->
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onOpenStatus() }) {
-                val ringState = org.holidaylink.app.ui.StatusRings.of(person.first)
+                // One arc per status (green = new, grey = seen), like WhatsApp.
                 Box(
-                    Modifier.size(52.dp).clip(CircleShape)
-                        .background(if (ringState == org.holidaylink.app.ui.StatusRings.Ring.SEEN) Color(0xFF9AA0A6) else Color(0xFF25D366))
-                        .padding(3.dp),
+                    Modifier.size(54.dp).segmentedStatusRing(person.first).padding(5.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Avatar(person.second, photo = person.third, size = 46.dp)
+                    Avatar(person.second, photo = person.third, size = 44.dp)
                 }
                 Spacer(Modifier.height(4.dp)); Text(person.second.take(10), color = scheme.onBackground, fontSize = 11.sp, maxLines = 1)
             }

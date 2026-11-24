@@ -164,6 +164,7 @@ import org.holidaylink.app.ui.AnimatedSticker
 import org.holidaylink.app.ui.StickerCatalog
 import org.holidaylink.app.ui.StickerItem
 import org.holidaylink.app.net.ChatSounds
+import androidx.compose.ui.graphics.graphicsLayer
 import org.holidaylink.app.net.FirestoreGroups
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.material.icons.filled.Schedule
@@ -186,12 +187,20 @@ fun ChatScreen(
     onOpenProfile: (User) -> Unit,
     onOpenGroupInfo: (ChatItem) -> Unit,
     onStartCall: (User, String) -> Unit,
-    initialStatusReply: StatusUpdate? = null
+    initialStatusReply: StatusUpdate? = null,
+    onOpenStatus: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
-    val listState = rememberLazyListState()
+    // Start the list AT the newest message (from the copy of the thread kept this session)
+    // instead of at the top and then scrolling down in front of the user.
+    val cachedCountAtOpen = remember(chat.id) {
+        DeviceCache.memory<List<FirestoreChat.ChatMessage>>("messages.${chat.id}")?.size ?: 0
+    }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = (cachedCountAtOpen - 1).coerceAtLeast(0))
+    // False only until the very first jump to the newest message has happened (nothing cached).
+    var positioned by remember(chat.id) { mutableStateOf(cachedCountAtOpen > 0) }
     // True when the newest message is already on screen; drives the "jump to latest" button.
     val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
     val uid = currentUserId.ifBlank { FirestoreChat.myUid() }
@@ -429,7 +438,15 @@ fun ChatScreen(
         // The typing bubble is a real list item, so the newest row is one further down when
         // it is on screen.
         val total = shownMessages.size + outbox.size + (if (peerTyping) 1 else 0)
-        if (total > 0) listState.animateScrollToItem(total - 1)
+        if (total > 0) {
+            if (!positioned) {
+                // First time on screen: jump, never animate.
+                listState.scrollToItem(total - 1)
+                positioned = true
+            } else {
+                listState.animateScrollToItem(total - 1)
+            }
+        }
         if (messages.isNotEmpty()) {
             if (pendingTexts.isNotEmpty()) {
                 val echoed = messages.filter { it.senderId == uid }.map { it.text }.toSet()
@@ -890,7 +907,23 @@ fun ChatScreen(
                         },
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Avatar(name = title, photo = peerUser?.avatarUrl ?: chat.peer?.avatarUrl, size = 38.dp, statusUserId = chat.peer?.id)
+                        Avatar(
+                            name = title,
+                            photo = peerUser?.avatarUrl ?: chat.peer?.avatarUrl,
+                            size = 38.dp,
+                            statusUserId = chat.peer?.id,
+                            // Someone with a status: their picture opens it, like WhatsApp.
+                            onClick = {
+                                val peerId = chat.peer?.id
+                                if (chat.kind == "direct" && peerId != null && StatusRings.of(peerId) != StatusRings.Ring.NONE) {
+                                    onOpenStatus(peerId)
+                                } else if (chat.kind != "direct") {
+                                    onOpenGroupInfo(chat)
+                                } else {
+                                    peerUser?.let(onOpenProfile)
+                                }
+                            }
+                        )
                         Spacer(Modifier.width(10.dp))
                         Column {
                             Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1)
@@ -1068,7 +1101,8 @@ fun ChatScreen(
             } else {
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize(),
+                    // Hidden for the single frame before the first jump to the newest message.
+                    modifier = Modifier.fillMaxSize().graphicsLayer { alpha = if (positioned) 1f else 0f },
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
@@ -1637,10 +1671,8 @@ private fun FsMessageBubble(
     /** Live description of the message this one replies to (overrides the stored text). */
     replyText: String? = null
 ) {
-    val bubbleColor = if (mine) MaterialTheme.colorScheme.primaryContainer
-    else MaterialTheme.colorScheme.surfaceContainerHigh
-    val textColor = if (mine) MaterialTheme.colorScheme.onPrimaryContainer
-    else MaterialTheme.colorScheme.onSurface
+    // Bubble colours follow the chat theme picked in Settings › Appearance.
+    val (bubbleColor, textColor) = ChatThemes.bubbleColors(ChatThemes.byId(AppSettings.state.chatTheme), mine)
     // The full-screen in-app video player, opened by tapping a video bubble.
     var playingVideo by remember { mutableStateOf<java.io.File?>(null) }
 
@@ -1787,7 +1819,7 @@ private fun FsMessageBubble(
                     )
                     Spacer(Modifier.height(6.dp))
                     if (message.text.isNotBlank()) {
-                        Text(linkify(message.text, MaterialTheme.colorScheme.primary), style = MaterialTheme.typography.bodyMedium, color = textColor)
+                        Text(linkify(message.text, if (mine) textColor else MaterialTheme.colorScheme.primary), style = MaterialTheme.typography.bodyMedium, color = textColor)
                     }
                 } else {
                     message.imageUrl?.let { url ->
@@ -1821,7 +1853,7 @@ private fun FsMessageBubble(
                         Spacer(Modifier.height(6.dp))
                     }
                     if (message.text.isNotBlank()) {
-                        Text(linkify(message.text, MaterialTheme.colorScheme.primary), style = MaterialTheme.typography.bodyMedium, color = textColor)
+                        Text(linkify(message.text, if (mine) textColor else MaterialTheme.colorScheme.primary), style = MaterialTheme.typography.bodyMedium, color = textColor)
                     }
                 }
             }

@@ -60,6 +60,8 @@ data class SettingsSnapshot(
     val wallpaperCropY: Float = 0f,
     /** Id of the screen transition the user picked (see org.holidaylink.app.ui.NavTransition). */
     val transitionStyle: String = "none",
+    /** Colours of the message bubbles: a preset id or "custom:RRGGBB" (see ui/ChatThemes). */
+    val chatTheme: String = "default",
     /** Chats that must be unlocked biometrically every time they are opened. */
     val lockedChats: Map<String, Boolean> = emptyMap(),
     val scheduledMessages: List<ScheduledMessage> = emptyList(),
@@ -147,6 +149,7 @@ object AppSettings {
         const val WALLPAPER_CROP_X = "set.wallpaperCropX"
         const val WALLPAPER_CROP_Y = "set.wallpaperCropY"
         const val TRANSITION = "set.transition"
+        const val CHAT_THEME = "set.chatTheme"
         const val LOCKED_CHATS = "set.lockedChats"
         const val SCHEDULED = "set.scheduled"
         const val DL_PHOTOS = "set.dlPhotos"
@@ -198,6 +201,7 @@ object AppSettings {
             wallpaperCropX = p.getFloat(K.WALLPAPER_CROP_X, 0f).coerceIn(-1f, 1f),
             wallpaperCropY = p.getFloat(K.WALLPAPER_CROP_Y, 0f).coerceIn(-1f, 1f),
             transitionStyle = p.getString(K.TRANSITION, "none") ?: "none",
+            chatTheme = p.getString(K.CHAT_THEME, "default") ?: "default",
             lockedChats = decodeMuted(p.getString(K.LOCKED_CHATS, "").orEmpty()),
             scheduledMessages = decodeScheduled(p.getString(K.SCHEDULED, "").orEmpty()),
             autoDownloadPhotos = enumOrDefault(p.getString(K.DL_PHOTOS, null), AutoDownload.WIFI_ONLY),
@@ -458,6 +462,11 @@ object AppSettings {
 
     fun setTransitionStyle(value: String) {
         prefs.edit().putString(K.TRANSITION, value).apply()
+        commit()
+    }
+
+    fun setChatTheme(value: String) {
+        prefs.edit().putString(K.CHAT_THEME, value).apply()
         commit()
     }
 

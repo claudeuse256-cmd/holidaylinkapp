@@ -82,3 +82,21 @@ compiler message — most likely small import/type slips.
   fixed message id `sched_<id>` so phone and server can never send it twice, wrong-day bug in the date picker
   fixed, a past time is no longer silently moved to "tomorrow 9:00". The Render free plan sleeps when idle:
   also set up a free pinger (UptimeRobot / cron-job.org) on `https://<your-service>/health` every 5 min.
+
+---
+# Third pass (24 Nov 2026) — not compiled either
+
+- **Build fix**: `MainActivity` used `row.peer` (does not exist on ChatRow); now resolves the peer by `peerId`.
+- **Calling**: the call screen ("Calling…" with Cancel) appears the instant you tap (`DialingScreen`), while the
+  connection is prepared in the background.
+- **Opening a chat**: the list starts AT the newest message (initial index from the session cache) and the first
+  jump is instant; no visible scroll.
+- **Status**: tapping the other person's picture in a chat opens their status when they have one (back returns
+  to the chat). The status viewer now has a real reply box (type + send, quotes the status, pauses while typing)
+  above the emoji reactions, padded for the keyboard and navigation bar.
+- **Status ring on the chats header** is split into one arc per status (green new, grey seen); avatars
+  elsewhere keep a single ring.
+- **Required-update screen** scrolls as a whole, download button on top; **links** without https
+  (holidaylink.app, example.com/x) are detected (TLD list in `Linkify.kt`).
+- **Chat theme** (Settings › Appearance › Chat theme): 9 ready themes + custom colour slider with live preview;
+  applies to the message bubbles (`ChatThemes.kt`, `AppSettings.chatTheme`).

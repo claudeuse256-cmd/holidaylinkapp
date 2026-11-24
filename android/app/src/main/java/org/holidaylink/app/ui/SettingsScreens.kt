@@ -1289,6 +1289,13 @@ fun AppearanceScreen(onBack: () -> Unit) {
                 )
             }
 
+            SettingsSection("Chat theme") {
+                ChatThemePicker(settings.chatTheme) { id ->
+                    AppSettings.setChatTheme(id)
+                    scope.launch { snackbar.showSnackbar("Chat theme updated.") }
+                }
+            }
+
             SettingsSection("Chat wallpaper") {
                 SettingsNavRow(
                     title = "Chat backgrounds",

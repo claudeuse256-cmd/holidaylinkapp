@@ -1,5 +1,9 @@
 package org.holidaylink.app.ui
 
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.ui.focus.onFocusChanged
 import android.content.Intent
 import android.media.MediaPlayer
 import android.net.Uri
@@ -114,7 +118,9 @@ fun StatusScreen(
     /** Open a direct chat with the status author when someone replies to a status. */
     onReply: ((StatusUpdate) -> Unit)? = null,
     /** Open a mentioned profile from a status update. */
-    onOpenProfile: ((String) -> Unit)? = null
+    onOpenProfile: ((String) -> Unit)? = null,
+    /** Open this person's status straight away (tapping their picture in a chat). */
+    initialUserId: String? = null
 ) {
     var statuses by remember { mutableStateOf(DeviceCache.memory<List<StatusUpdate>>("statuses") ?: emptyList()) }
     var loading by remember { mutableStateOf(statuses.isEmpty()) }
@@ -233,6 +239,19 @@ fun StatusScreen(
         viewerStart = person.indexOfFirst { it.id == tapped.id }.coerceAtLeast(0)
         viewerMine = tapped.userId == me?.id
         viewerOpen = true
+    }
+
+    // Arrived by tapping someone's picture: play their status at once, starting on the first
+    // one you have not seen, and go back to where you came from when it is closed.
+    var autoOpened by remember(initialUserId) { mutableStateOf(false) }
+    LaunchedEffect(statuses, initialUserId) {
+        if (initialUserId != null && !autoOpened) {
+            val theirs = statuses.filter { it.userId == initialUserId }.sortedBy { it.createdAt }
+            if (theirs.isNotEmpty()) {
+                autoOpened = true
+                openViewer(theirs.firstOrNull { it.id !in seenIds } ?: theirs.first())
+            }
+        }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -596,7 +615,10 @@ fun StatusScreen(
             },
             onDelete = { confirmDelete = it },
             onViewers = { viewersFor = it },
-            onDismiss = { viewerOpen = false },
+            onDismiss = {
+                viewerOpen = false
+                if (autoOpened) onBack()
+            },
             onReply = { status -> onReply?.invoke(status) },
             onOpenProfile = onOpenProfile
         )
@@ -1437,11 +1459,66 @@ private fun StatusViewer(
                             }) { Text(reaction, fontSize = 21.sp) }
                         }
                     }
-                    TextButton(onClick = { onReply(current) }, modifier = Modifier.padding(horizontal = 20.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Message, null, Modifier.size(18.dp), tint = Color.White)
-                            Spacer(Modifier.width(6.dp))
-                            Text(tr("Reply"), style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
+                    // A real reply box, like WhatsApp: type, send, and it lands in your chat with
+                    // this person quoting the status. The status pauses while you type.
+                    var replyText by remember(current.id) { mutableStateOf("") }
+                    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .navigationBarsPadding()
+                            .imePadding()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = replyText,
+                            onValueChange = { replyText = it },
+                            modifier = Modifier.weight(1f).onFocusChanged { paused = it.isFocused },
+                            placeholder = { Text("Reply to ${current.userName}…", color = Color.White.copy(alpha = 0.65f)) },
+                            singleLine = true,
+                            shape = RoundedCornerShape(28.dp),
+                            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Color.White,
+                                unfocusedBorderColor = Color.White.copy(alpha = 0.55f),
+                                cursorColor = Color.White,
+                                focusedContainerColor = Color.Black.copy(alpha = 0.35f),
+                                unfocusedContainerColor = Color.Black.copy(alpha = 0.35f)
+                            )
+                        )
+                        IconButton(
+                            enabled = replyText.isNotBlank(),
+                            onClick = {
+                                val text = replyText.trim()
+                                if (text.isEmpty()) return@IconButton
+                                replyText = ""
+                                focusManager.clearFocus()
+                                scope.launch {
+                                    runCatching {
+                                        val chatId = FirestoreChat.startDirect(current.userId)
+                                        FirestoreChat.send(
+                                            chatId = chatId,
+                                            text = text,
+                                            kind = "text",
+                                            replyToId = current.id,
+                                            replyToBody = current.body?.take(100) ?: "Photo or video status",
+                                            replyToName = "Status reply"
+                                        )
+                                    }.onSuccess {
+                                        android.widget.Toast.makeText(context, "Reply sent", android.widget.Toast.LENGTH_SHORT).show()
+                                    }.onFailure {
+                                        android.widget.Toast.makeText(context, "Couldn't send the reply", android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Send,
+                                "Send reply",
+                                tint = if (replyText.isBlank()) Color.White.copy(alpha = 0.4f) else Color.White
+                            )
                         }
                     }
                 } else {
