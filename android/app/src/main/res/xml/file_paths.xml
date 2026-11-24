@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Paths the app is allowed to hand to other apps through its FileProvider. -->
+<paths>
+    <!-- In-app updater downloads -->
+    <cache-path name="updates" path="updates/" />
+    <!-- Photos taken with the in-app camera -->
+    <cache-path name="camera" path="camera/" />
+    <!-- Chat media cached on first download (videos, PDFs, documents) -->
+    <cache-path name="media" path="media/" />
+</paths>
