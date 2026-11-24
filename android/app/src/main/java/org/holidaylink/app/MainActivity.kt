@@ -677,14 +677,16 @@ private fun SignedInApp(
                             // Reading it here and now: no alert, and any old alert disappears.
                             Notifier.clearChat(context, row.id)
                         } else {
+                            // The other person (direct chats only): their name and picture.
+                            val peerUser = if (!row.isGroup && !row.peerId.isNullOrBlank()) {
+                                runCatching { FirestoreChat.resolvePeer(row.peerId.orEmpty()) }.getOrNull()
+                            } else null
                             val who = row.title.takeIf { it.isNotBlank() }
-                                ?: runCatching {
-                                    FirestoreChat.resolvePeer(row.peerId.orEmpty()).displayName
-                                }.getOrNull()
+                                ?: peerUser?.displayName
                                 ?: "New message"
                             Notifier.message(
                                 context, Notifier.idFor(row.id), who, row.lastBody ?: "New message", row.id,
-                                photoUrl = row.peer?.avatarUrl
+                                photoUrl = peerUser?.avatarUrl
                             )
                         }
                     }
