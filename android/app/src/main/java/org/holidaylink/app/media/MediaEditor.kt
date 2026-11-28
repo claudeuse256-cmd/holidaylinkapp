@@ -149,8 +149,8 @@ object MediaEditor {
             strokes.forEach { points ->
                 if (points.size >= 2) {
                     val path = android.graphics.Path()
-                    path.moveTo(points.first().first.coerceIn(0f,1f)*output.width, points.first().second.coerceIn(0f,1f)*output.height)
-                    points.drop(1).forEach { path.lineTo(it.first.coerceIn(0f,1f)*output.width, it.second.coerceIn(0f,1f)*output.height) }
+                    path.moveTo(points.first().first*output.width, points.first().second*output.height)
+                    points.drop(1).forEach { path.lineTo(it.first*output.width, it.second*output.height) }
                     canvas.drawPath(path, linePaint)
                 }
             }
@@ -167,8 +167,8 @@ object MediaEditor {
                 }
                 val lines = overlay.text.take(120).split("\n").take(3)
                 val lineHeight = paint.textSize * 1.15f
-                val centerX = overlay.x.coerceIn(0f, 1f) * output.width
-                val centerY = overlay.y.coerceIn(0f, 1f) * output.height
+                val centerX = overlay.x * output.width
+                val centerY = overlay.y * output.height
                 val baseY = centerY - (lines.size - 1) * lineHeight / 2f
                 canvas.save()
                 canvas.rotate(overlay.rotationDeg, centerX, centerY)
@@ -256,7 +256,7 @@ object MediaEditor {
                 out.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
             )
             val trackMap = HashMap<Int, Int>()
-            var maxInputSize = 1L shl 20
+            var maxInputSize = 1L shl 22
             for (i in 0 until extractor.trackCount) {
                 val format = extractor.getTrackFormat(i)
                 val mime = format.getString(android.media.MediaFormat.KEY_MIME) ?: continue
@@ -275,24 +275,38 @@ object MediaEditor {
                 muxer.release()
                 return null
             }
+            // A phone video is usually stored sideways with a "rotate by 90" note. Copying the
+            // samples without that note produced clips that played on their side.
+            val rotation = runCatching {
+                val retriever = android.media.MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(file.absolutePath)
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                        ?.toIntOrNull() ?: 0
+                } finally {
+                    retriever.release()
+                }
+            }.getOrDefault(0)
+            if (rotation != 0) runCatching { muxer.setOrientationHint(rotation) }
             muxer.start()
             val buffer = java.nio.ByteBuffer.allocateDirect(maxInputSize.toInt())
             val info = android.media.MediaCodec.BufferInfo()
             val startUs = startMs * 1000
             val endUs = endMs * 1000
-            extractor.seekTo(startUs, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            // Start at the key frame at or just before the chosen start. Cutting between key
+            // frames (what the old code did) leaves frames that cannot be decoded, so the clip
+            // began with garbage/black and the sound drifted against the picture. Every sample
+            // from that key frame on is kept, all shifted by the same amount.
+            extractor.seekTo(startUs, android.media.MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            val baseUs = extractor.sampleTime.takeIf { it >= 0 } ?: startUs
             while (true) {
                 val size = extractor.readSampleData(buffer, 0)
                 if (size < 0) break
                 val time = extractor.sampleTime
-                if (time < startUs) {
-                    extractor.advance()
-                    continue
-                }
                 if (time > endUs) break
                 info.offset = 0
                 info.size = size
-                info.presentationTimeUs = (time - startUs).coerceAtLeast(0)
+                info.presentationTimeUs = (time - baseUs).coerceAtLeast(0)
                 info.flags = extractor.sampleFlags
                 val outTrack = trackMap[extractor.sampleTrackIndex]
                 if (outTrack != null) muxer.writeSampleData(outTrack, buffer, info)

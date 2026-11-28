@@ -1,5 +1,20 @@
 package org.holidaylink.app.ui
 
+import androidx.compose.runtime.produceState
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -103,6 +118,62 @@ import org.holidaylink.app.net.StatusUpdate
 /** A photo or video picked from the in-app gallery grid, waiting to go through the editor. */
 private data class PendingStatusMedia(val file: File, val kind: String)
 
+/** One person's active updates, for the WhatsApp-style list. */
+private data class StatusPerson(
+    val userId: String,
+    val name: String,
+    val avatar: String?,
+    val updates: List<StatusUpdate>,
+    val allSeen: Boolean
+)
+
+/** "Today, 7:12 AM" / "Yesterday, 10:03 PM" / "24 Nov, 9:15 AM". */
+private fun statusTimeLabel(iso: String): String {
+    val instant = runCatching { java.time.Instant.parse(iso) }.getOrNull() ?: return iso.take(16)
+    val zone = java.time.ZoneId.systemDefault()
+    val moment = instant.atZone(zone)
+    val today = java.time.LocalDate.now(zone)
+    val clock = java.time.format.DateTimeFormatter.ofPattern("h:mm a", java.util.Locale.getDefault())
+    return when (moment.toLocalDate()) {
+        today -> "Today, ${moment.format(clock)}"
+        today.minusDays(1) -> "Yesterday, ${moment.format(clock)}"
+        else -> moment.format(java.time.format.DateTimeFormatter.ofPattern("d MMM, h:mm a", java.util.Locale.getDefault()))
+    }
+}
+
+@Composable
+private fun StatusSectionTitle(title: String) {
+    Text(
+        title,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+    )
+}
+
+/** Avatar with a ring made of one arc per update, name, and when the latest one was posted. */
+@Composable
+private fun StatusPersonRow(person: StatusPerson, meId: String?, onClick: () -> Unit) {
+    val mentionsMe = meId != null && person.updates.any { meId in it.mentionUserIds }
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(58.dp).segmentedStatusRing(person.userId).padding(5.dp), contentAlignment = Alignment.Center) {
+            Avatar(name = person.name, photo = person.avatar, size = 48.dp)
+        }
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(person.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Text(
+                (if (mentionsMe) "Mentioned you · " else "") + statusTimeLabel(person.updates.last().createdAt),
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (mentionsMe) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
 /**
  * Status updates: text, photo and video updates that disappear from the feed after 24 hours.
  *
@@ -120,7 +191,11 @@ fun StatusScreen(
     /** Open a mentioned profile from a status update. */
     onOpenProfile: ((String) -> Unit)? = null,
     /** Open this person's status straight away (tapping their picture in a chat). */
-    initialUserId: String? = null
+    initialUserId: String? = null,
+    /** Something shared from another app: opens straight in the editor / text box. */
+    sharedUri: android.net.Uri? = null,
+    sharedIsVideo: Boolean = false,
+    sharedText: String? = null
 ) {
     var statuses by remember { mutableStateOf(DeviceCache.memory<List<StatusUpdate>>("statuses") ?: emptyList()) }
     var loading by remember { mutableStateOf(statuses.isEmpty()) }
@@ -241,6 +316,25 @@ fun StatusScreen(
         viewerOpen = true
     }
 
+    // Shared from another app (gallery, files, TikTok...): go straight to the editor or text box.
+    LaunchedEffect(sharedUri, sharedText) {
+        if (sharedUri != null) {
+            val local = withContext(Dispatchers.IO) {
+                val target = File(context.cacheDir, "status_share_${System.currentTimeMillis()}." + if (sharedIsVideo) "mp4" else "jpg")
+                runCatching {
+                    context.contentResolver.openInputStream(sharedUri)?.use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                    }
+                }
+                target.takeIf { it.exists() && it.length() > 0L }
+            }
+            if (local != null) pendingEdit = PendingStatusMedia(file = local, kind = if (sharedIsVideo) "video" else "image")
+            else error = "That file couldn't be opened."
+        } else if (!sharedText.isNullOrBlank()) {
+            textComposerOpen = true
+        }
+    }
+
     // Arrived by tapping someone's picture: play their status at once, starting on the first
     // one you have not seen, and go back to where you came from when it is closed.
     var autoOpened by remember(initialUserId) { mutableStateOf(false) }
@@ -254,211 +348,271 @@ fun StatusScreen(
         }
     }
 
-    Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(start = 6.dp, end = 4.dp, top = 4.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // This page is always pushed on top of the chats, so it always gets a way back.
-            IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
-            }
-            Text(
-                "Status",
-                style = MaterialTheme.typography.headlineSmall,
-                modifier = Modifier.weight(1f)
+    // ------------------------------------------------------------ WhatsApp-style status page
+    var showAllViewed by remember { mutableStateOf(false) }
+    var myUpdatesOpen by remember { mutableStateOf(false) }
+    val people = remember(others, seenIds) {
+        others.groupBy { it.userId }.map { (userId, list) ->
+            val sorted = list.sortedBy { it.createdAt }
+            StatusPerson(
+                userId = userId,
+                name = sorted.last().userName,
+                avatar = sorted.last().avatarUrl,
+                updates = sorted,
+                allSeen = sorted.all { it.id in seenIds }
             )
-            if (loading) {
-                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.width(8.dp))
-            }
-            androidx.compose.material3.Button(onClick = { addStatusOpen = true }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
-                Icon(Icons.Default.Add, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Post")
-            }
-            Spacer(Modifier.width(4.dp))
-            RefreshButton { reload++ }
+        }.sortedByDescending { it.updates.last().createdAt }
+    }
+    val unseenPeople = people.filter { !it.allSeen }
+    val seenPeople = people.filter { it.allSeen }
+    val mySorted = remember(mine) { mine.sortedBy { it.createdAt } }
+
+    // Camera tile: a real photo straight from the camera, then the same editor as any picture.
+    var cameraFile by remember { mutableStateOf<File?>(null) }
+    val cameraLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.TakePicture()
+    ) { ok ->
+        val file = cameraFile
+        cameraFile = null
+        if (ok && file != null && file.length() > 0L) {
+            pendingEdit = PendingStatusMedia(file = file, kind = "image")
+        } else if (file != null) {
+            runCatching { file.delete() }
         }
+    }
+    fun launchStatusCamera() {
+        runCatching {
+            val dir = File(context.cacheDir, "camera").apply { mkdirs() }
+            val file = File(dir, "status-cam-${System.currentTimeMillis()}.jpg")
+            val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            cameraFile = file
+            cameraLauncher.launch(uri)
+        }.onFailure { android.widget.Toast.makeText(context, "The camera could not be opened", android.widget.Toast.LENGTH_SHORT).show() }
+    }
+    val cameraPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) launchStatusCamera()
+        else android.widget.Toast.makeText(context, "Allow the camera to take a status photo", android.widget.Toast.LENGTH_SHORT).show()
+    }
+    val startCamera = {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) launchStatusCamera() else cameraPermission.launch(android.Manifest.permission.CAMERA)
+    }
 
-        StatusUploadBanner()
-
-        when {
-            loading -> LoadingState(label = "Loading status…")
-            error.isNotBlank() && statuses.isEmpty() -> ErrorState(error) { reload++ }
-
-            else -> Column(Modifier.fillMaxSize()) {
-                StatusReel(
-                    statuses = statuses,
-                    currentUserId = me?.id,
-                    selectedId = selected,
-                    seenIds = seenIds,
-                    onPick = { picked ->
-                        // WhatsApp behaviour: tapping a person opens their reel full-screen.
-                        openViewer(picked)
-                    }
-                )
-
-                if (selected != null) {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 18.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            statuses.firstOrNull { it.userId == selected }?.userName.orEmpty(),
-                            style = MaterialTheme.typography.titleSmall,
-                            modifier = Modifier.weight(1f)
-                        )
-                        TextButton(onClick = { selectedUserId = null }) { Text("See all") }
-                    }
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 6.dp, end = 4.dp, top = 4.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // This page is always pushed on top of the chats, so it always gets a way back.
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                 }
+                Text(
+                    tr("Status"),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                if (loading) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                }
+                RefreshButton { reload++ }
+            }
 
-                if (statuses.isEmpty()) {
-                    EmptyState(
-                        icon = Icons.Default.Campaign,
-                        title = "No status updates",
-                        subtitle = "Post a short note or photo. Updates disappear after 24 hours.",
-                        action = { androidx.compose.material3.Button(onClick = { addStatusOpen = true }) { Text("+ Post status") } }
-                    )
-                } else if (selected != null && mine.isEmpty() && others.isEmpty()) {
-                    EmptyState(
-                        icon = Icons.Default.Campaign,
-                        title = "Nothing new",
-                        subtitle = "This person has no active status updates right now."
-                    )
-                } else {
-                    PullToRefreshContainer(
-                        refreshing = refreshing,
-                        onRefresh = { reload++ },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                    ) {
-                        LazyColumn(
-                            modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(bottom = 28.dp)
+            StatusUploadBanner()
+
+            when {
+                loading && statuses.isEmpty() -> LoadingState(label = "Loading status…")
+                error.isNotBlank() && statuses.isEmpty() -> ErrorState(error) { reload++ }
+
+                else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 190.dp)) {
+                    // ---- My status
+                    item(key = "my-status") {
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (mySorted.isNotEmpty()) openViewer(mySorted.first()) else addStatusOpen = true
+                                }
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            item(key = "my-status") {
-                                val hasMine = mine.isNotEmpty()
-                                Row(
+                            Box(Modifier.size(58.dp), contentAlignment = Alignment.BottomEnd) {
+                                Box(
                                     Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 16.dp, vertical = 12.dp)
-                                        .clip(MaterialTheme.shapes.medium)
-                                        .background(MaterialTheme.colorScheme.surfaceContainer)
-                                        .clickable {
-                                            // WhatsApp behaviour: tapping your own status (when you
-                                            // already have one) opens the full-screen viewer directly;
-                                            // only "Add status" ever opens the management page.
-                                            if (hasMine) openViewer(mine.first()) else addStatusOpen = true
-                                        }
-                                        .padding(14.dp),
+                                        .size(58.dp)
+                                        .then(if (mySorted.isNotEmpty()) Modifier.segmentedStatusRing(me?.id) else Modifier)
+                                        .padding(if (mySorted.isNotEmpty()) 5.dp else 0.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Avatar(
+                                        name = me?.displayName ?: "Me",
+                                        photo = mySorted.lastOrNull()?.avatarUrl ?: me?.avatarUrl,
+                                        size = if (mySorted.isNotEmpty()) 48.dp else 58.dp
+                                    )
+                                }
+                                Box(
+                                    Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF25D366))
+                                        .border(2.dp, MaterialTheme.colorScheme.background, CircleShape)
+                                        .clickable { addStatusOpen = true },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(Icons.Default.Add, "Add status", tint = Color.White, modifier = Modifier.size(15.dp))
+                                }
+                            }
+                            Spacer(Modifier.width(14.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("My status", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (mySorted.isNotEmpty()) statusTimeLabel(mySorted.last().createdAt)
+                                    else "Tap to add status update",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            if (mySorted.isNotEmpty()) {
+                                IconButton(onClick = { myUpdatesOpen = true }) {
+                                    Icon(Icons.Default.MoreVert, "My updates")
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- Recent updates (new)
+                    if (unseenPeople.isNotEmpty()) {
+                        item(key = "recent-title") { StatusSectionTitle("Recent updates") }
+                        items(unseenPeople, key = { "recent-" + it.userId }) { person ->
+                            StatusPersonRow(person, me?.id) {
+                                openViewer(person.updates.firstOrNull { it.id !in seenIds } ?: person.updates.first())
+                            }
+                        }
+                    }
+
+                    // ---- Viewed updates
+                    if (seenPeople.isNotEmpty()) {
+                        item(key = "viewed-title") { StatusSectionTitle("Viewed updates") }
+                        val shownSeen = if (showAllViewed || seenPeople.size <= 4) seenPeople else seenPeople.take(4)
+                        items(shownSeen, key = { "viewed-" + it.userId }) { person ->
+                            StatusPersonRow(person, me?.id) { openViewer(person.updates.first()) }
+                        }
+                        if (!showAllViewed && seenPeople.size > 4) {
+                            item(key = "viewed-more") {
+                                Row(
+                                    Modifier.fillMaxWidth().clickable { showAllViewed = true }
+                                        .padding(horizontal = 16.dp, vertical = 14.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Box(
-                                        Modifier.size(46.dp),
-                                        contentAlignment = Alignment.BottomEnd
-                                    ) {
-                                        if (hasMine) {
-                                            Avatar(name = me?.displayName.orEmpty(), photo = mine.first().avatarUrl, size = 46.dp)
-                                        } else {
-                                            Box(
-                                                Modifier
-                                                    .size(46.dp)
-                                                    .clip(CircleShape)
-                                                    .background(
-                                                        Brush.linearGradient(HolidayLinkGradient),
-                                                        CircleShape
-                                                    ),
-                                                contentAlignment = Alignment.Center
-                                            ) {
-                                                Icon(
-                                                    Icons.Default.Add,
-                                                    contentDescription = null,
-                                                    tint = androidx.compose.ui.graphics.Color.White
-                                                )
-                                            }
-                                        }
-                                        if (hasMine) {
-                                            Box(
-                                                Modifier
-                                                    .size(18.dp)
-                                                    .clip(CircleShape)
-                                                    .background(MaterialTheme.colorScheme.primary, CircleShape)
-                                                    .clickable { addStatusOpen = true },
-                                                contentAlignment = Alignment.Center
-                                            ) {
-                                                Icon(
-                                                    Icons.Default.Add,
-                                                    contentDescription = "Add another status",
-                                                    tint = androidx.compose.ui.graphics.Color.White,
-                                                    modifier = Modifier.size(13.dp)
-                                                )
-                                            }
-                                        }
-                                    }
-                                    Spacer(Modifier.width(14.dp))
-                                    Column(Modifier.weight(1f)) {
-                                        Text(
-                                            "Your status",
-                                            style = MaterialTheme.typography.bodyLarge,
-                                            fontWeight = FontWeight.SemiBold
-                                        )
-                                        Text(
-                                            if (hasMine) "Tap to view · ${mine.size} update${if (mine.size == 1) "" else "s"}" else "Share how you're doing",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
+                                    Icon(Icons.Default.KeyboardArrowDown, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(58.dp))
+                                    Text("View ${seenPeople.size - 4} more", style = MaterialTheme.typography.bodyLarge)
                                 }
                             }
+                        }
+                    }
 
-                            if (mine.isNotEmpty()) {
-                                item(key = "hdr-mine") { SectionHeader("My updates", mine.size) }
-                                items(mine, key = { it.id }) {
-                                    StatusRow(
-                                        status = it,
-                                        mine = true,
-                                        viewCount = viewCounts[it.id] ?: 0,
-                                        onOpen = { openViewer(it) },
-                                        onDelete = { confirmDelete = it },
-                                        onViewers = { viewersFor = it }
-                                    )
-                                }
-                            }
-
-                            if (others.isNotEmpty()) {
-                                item(key = "hdr-friends") {
-                                    SectionHeader("Friends", others.size)
-                                }
-                                items(others, key = { it.id }) {
-                                    StatusRow(
-                                        status = it,
-                                        mine = false,
-                                        viewCount = 0,
-                                        onOpen = { openViewer(it) },
-                                        onDelete = {},
-                                        onViewers = {},
-                                        onReply = { onReply?.invoke(it) },
-                                        onOpenProfile = onOpenProfile
-                                    )
-                                }
-                            }
+                    if (people.isEmpty()) {
+                        item(key = "no-updates") {
+                            Text(
+                                "No recent updates. When your contacts share a status it appears here.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 24.dp)
+                            )
                         }
                     }
                 }
             }
         }
 
-        Text(
-            "Status updates are governed by the \"Who can see my status updates\" rule in " +
-                "Settings, and the server enforces it.",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
-        )
+        // Pencil = text status, camera = photo/video status, like WhatsApp.
+        Column(
+            Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 18.dp, bottom = 22.dp),
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            androidx.compose.material3.SmallFloatingActionButton(onClick = { textComposerOpen = true }) {
+                Icon(Icons.Default.Edit, "Text status")
+            }
+            androidx.compose.material3.FloatingActionButton(
+                onClick = { addStatusOpen = true },
+                containerColor = Color(0xFF25D366),
+                contentColor = Color.White
+            ) {
+                Icon(Icons.Default.CameraAlt, "Add status")
+            }
+        }
+    }
+
+    // My updates: every status you posted, with views, and a way to delete.
+    if (myUpdatesOpen) {
+        androidx.compose.material3.ModalBottomSheet(onDismissRequest = { myUpdatesOpen = false }) {
+            Column(Modifier.padding(bottom = 24.dp)) {
+                Text(
+                    "My status updates",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
+                )
+                mySorted.forEach { update ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { myUpdatesOpen = false; openViewer(update) }
+                            .padding(horizontal = 20.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            Modifier.size(48.dp).clip(RoundedCornerShape(10.dp))
+                                .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val thumb = update.mediaUrl
+                            if (update.kind == "image" && !thumb.isNullOrBlank()) {
+                                RemoteImage(url = thumb, modifier = Modifier.fillMaxSize(), contentScale = androidx.compose.ui.layout.ContentScale.Crop)
+                            } else {
+                                Icon(
+                                    when (update.kind) {
+                                        "video" -> Icons.Default.PlayArrow
+                                        "voice" -> Icons.Default.Mic
+                                        else -> Icons.Default.Edit
+                                    },
+                                    null
+                                )
+                            }
+                        }
+                        Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                update.body?.takeIf { it.isNotBlank() } ?: when (update.kind) {
+                                    "video" -> "Video"
+                                    "image" -> "Photo"
+                                    "voice" -> "Voice"
+                                    else -> "Status"
+                                },
+                                maxLines = 1,
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                            Text(
+                                statusTimeLabel(update.createdAt) + " · " + (viewCounts[update.id] ?: 0) + " views",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(onClick = { viewersFor = update }) { Icon(Icons.Default.Visibility, "Viewers") }
+                        IconButton(onClick = { myUpdatesOpen = false; confirmDelete = update }) { Icon(Icons.Default.Delete, "Delete") }
+                    }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- Add status (full screen)
@@ -471,12 +625,8 @@ fun StatusScreen(
             StatusGalleryPicker(
                 onBack = { addStatusOpen = false },
                 onPickCamera = {
-                    // TODO: wire a real camera capture (ActivityResultContracts.TakePicture /
-                    // TakeVideo) here, the same way WhatsApp's camera tile opens the device
-                    // camera directly. Not part of this pass — falls back to the text composer,
-                    // which still exposes voice/music, so the tile is never a dead end.
                     addStatusOpen = false
-                    textComposerOpen = true
+                    startCamera()
                 },
                 onPickMedia = { uri, isVideo ->
                     addStatusOpen = false
@@ -509,6 +659,7 @@ fun StatusScreen(
     if (textComposerOpen) {
         Dialog(onDismissRequest = { textComposerOpen = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             StatusTextComposerPage(
+                initialText = sharedText.orEmpty(),
                 api = api,
                 onDismiss = { textComposerOpen = false },
                 onPosted = {
@@ -837,6 +988,14 @@ private suspend fun loadFirestoreStatuses(
         .limit(200).get(source).await()
     val docs = snap.documents.sortedByDescending { it.safeTimestamp("createdAt")?.seconds ?: 0 }
     val authors = mutableMapOf<String, Pair<String, String?>>()
+    // Every author we do not know yet is looked up together (cache first), not one at a time.
+    val unknownAuthors = docs.mapNotNull { it.getString("userId") }
+        .filter { it.isNotBlank() && statusAuthorCache[it] == null }.distinct()
+    if (unknownAuthors.isNotEmpty()) {
+        runCatching { FirestoreChat.resolvePeers(unknownAuthors) }.getOrNull()?.forEach { (id, person) ->
+            statusAuthorCache[id] = (person.displayName.takeIf { it.isNotBlank() } ?: "HolidayLink user") to person.avatarUrl
+        }
+    }
     return docs.mapNotNull { d ->
         val userId = d.getString("userId").orEmpty()
         if (userId.isBlank()) return@mapNotNull null
@@ -900,7 +1059,7 @@ internal suspend fun postFirestoreStatus(
         durationMs = voiceDurationMs
     } else if (mediaKind == "file" && mediaUri != null) {
         val file = MediaPicker.inspect(context, mediaUri)
-        if (file.sizeBytes > MediaPicker.maxAttachmentBytes) throw ApiException("That file is too large (max 20 MB).")
+        if (file.sizeBytes > MediaPicker.maxAttachmentBytes) throw ApiException("That file is too large (max 200 MB).")
         val bytes = context.contentResolver.openInputStream(mediaUri)?.use { it.readBytes() }
             ?: throw ApiException("That file couldn't be read.")
         val name = fileName.ifBlank { file.name ?: "File" }
@@ -980,6 +1139,21 @@ internal suspend fun postFirestoreStatus(
     val now = com.google.firebase.Timestamp.now()
     // @usernames mentioned in the body are stored so viewers can tap them.
     val mentions = org.holidaylink.app.net.StatusMentionParser.handles(finalText)
+    // Anyone typed as @name (in a text status OR a photo/video caption) is looked up by
+    // username, so mentioning works the same everywhere and not only through the picker.
+    val allMentionIds: Map<String, String> = run {
+        val result = LinkedHashMap<String, String>(mentionedUserIds)
+        val known = result.values.map { it.lowercase() }.toSet()
+        mentions.filter { it.lowercase() !in known }.take(10).forEach { handle ->
+            val found = runCatching {
+                val users = FirebaseBackend.db.collection("users")
+                users.whereEqualTo("username", handle).limit(1).get().await().documents.firstOrNull()
+                    ?: users.whereEqualTo("username", handle.lowercase()).limit(1).get().await().documents.firstOrNull()
+            }.getOrNull()
+            if (found != null && found.id != uid) result[found.id] = handle
+        }
+        result
+    }
     val statusRef = FirebaseBackend.db.collection("statuses").document()
     statusRef.set(
         mapOf(
@@ -996,8 +1170,8 @@ internal suspend fun postFirestoreStatus(
             "audioBlob" to audioBlob,
             "durationMs" to durationMs,
             "mentions" to mentions,
-            "mentionUserIds" to mentionedUserIds.keys.toList(),
-            "mentionHandles" to mentionedUserIds.values.toList(),
+            "mentionUserIds" to allMentionIds.keys.toList(),
+            "mentionHandles" to allMentionIds.values.toList(),
             "stickerIds" to stickerIds,
             "musicUrl" to musicUrl,
             "createdAt" to now,
@@ -1007,7 +1181,7 @@ internal suspend fun postFirestoreStatus(
 
     // Deliver each mention into the recipient's direct chat and notification inbox.
     val senderName = FirebaseBackend.loadProfile(uid)?.name?.ifBlank { "Someone" } ?: "Someone"
-    mentionedUserIds.forEach { (recipientId, handle) ->
+    allMentionIds.forEach { (recipientId, handle) ->
         if (recipientId == uid) return@forEach
         runCatching {
             val chatId = FirestoreChat.startDirect(recipientId)
@@ -1413,6 +1587,14 @@ private fun StatusViewer(
 
                 if (mine) {
                     val count = viewCounts[current.id] ?: 0
+                    // How many people liked this status (the heart on their side).
+                    val likes by produceState(0, current.id) {
+                        value = runCatching {
+                            FirebaseBackend.db.collection("statuses").document(current.id)
+                                .collection("status_reactions").whereEqualTo("emoji", "❤️")
+                                .get().await().size()
+                        }.getOrDefault(0)
+                    }
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -1421,7 +1603,8 @@ private fun StatusViewer(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            if (count > 0) "Seen by $count · tap to see who" else "Not seen yet",
+                            (if (count > 0) "Seen by $count · tap to see who" else "Not seen yet") +
+                                (if (likes > 0) "   ❤ $likes" else ""),
                             color = Color.White.copy(alpha = 0.85f),
                             style = MaterialTheme.typography.labelMedium
                         )
@@ -1471,6 +1654,59 @@ private fun StatusViewer(
                             .padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        // Like button, on the LEFT of the reply box.
+                        var liked by remember(current.id) { mutableStateOf(false) }
+                        LaunchedEffect(current.id) {
+                            val me = FirebaseBackend.uid ?: return@LaunchedEffect
+                            liked = runCatching {
+                                FirebaseBackend.db.collection("statuses").document(current.id)
+                                    .collection("status_reactions").document(me).get().await()
+                                    .getString("emoji") == "❤️"
+                            }.getOrDefault(false)
+                        }
+                        IconButton(
+                            onClick = {
+                                val me = FirebaseBackend.uid.orEmpty()
+                                if (me.isBlank()) return@IconButton
+                                val nowLiked = !liked
+                                liked = nowLiked
+                                scope.launch {
+                                    runCatching {
+                                        val ref = FirebaseBackend.db.collection("statuses").document(current.id)
+                                            .collection("status_reactions").document(me)
+                                        if (nowLiked) {
+                                            ref.set(mapOf("userId" to me, "emoji" to "❤️", "createdAt" to com.google.firebase.Timestamp.now())).await()
+                                            val chatId = FirestoreChat.startDirect(current.userId)
+                                            FirestoreChat.send(
+                                                chatId = chatId,
+                                                text = "Liked your status ❤️",
+                                                kind = "text",
+                                                replyToId = current.id,
+                                                replyToBody = current.body?.take(100) ?: "Photo or video status",
+                                                replyToName = "Status like"
+                                            )
+                                            FirebaseBackend.db.collection("notifications").add(
+                                                mapOf(
+                                                    "userId" to current.userId, "type" to "status_reaction",
+                                                    "title" to "Status liked", "message" to "Someone liked your status",
+                                                    "read" to false, "timestamp" to com.google.firebase.Timestamp.now(),
+                                                    "conversationId" to chatId, "senderId" to me,
+                                                    "data" to mapOf("statusId" to current.id, "conversationId" to chatId, "senderId" to me)
+                                                )
+                                            ).await()
+                                        } else {
+                                            ref.delete().await()
+                                        }
+                                    }.onFailure { liked = !nowLiked }
+                                }
+                            }
+                        ) {
+                            Icon(
+                                if (liked) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                if (liked) "Unlike" else "Like",
+                                tint = if (liked) Color(0xFFFF4D6D) else Color.White
+                            )
+                        }
                         androidx.compose.material3.OutlinedTextField(
                             value = replyText,
                             onValueChange = { replyText = it },

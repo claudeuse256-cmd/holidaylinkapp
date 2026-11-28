@@ -93,10 +93,11 @@ import java.io.File
 data class GalleryItem(
     val uri: Uri,
     val isVideo: Boolean,
-    val dateAddedSec: Long
+    val dateAddedSec: Long,
+    val durationMs: Long = 0L
 )
 
-private fun queryRecentMedia(context: Context, limit: Int = 120): List<GalleryItem> {
+private fun queryRecentMedia(context: Context, limit: Int = 4000): List<GalleryItem> {
     val resolver = context.contentResolver
     val items = mutableListOf<GalleryItem>()
 
@@ -130,7 +131,8 @@ private fun queryRecentMedia(context: Context, limit: Int = 120): List<GalleryIt
 
     val videoProjection = arrayOf(
         MediaStore.Video.Media._ID,
-        MediaStore.Video.Media.DATE_ADDED
+        MediaStore.Video.Media.DATE_ADDED,
+        MediaStore.Video.Media.DURATION
     )
 
     runCatching {
@@ -143,15 +145,17 @@ private fun queryRecentMedia(context: Context, limit: Int = 120): List<GalleryIt
         )?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
             val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+            val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
 
             while (cursor.moveToNext() && items.size < limit * 2) {
                 val id = cursor.getLong(idCol)
                 val date = cursor.getLong(dateCol)
+                val durationMs = cursor.getLong(durationCol)
                 val uri = ContentUris.withAppendedId(
                     MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     id
                 )
-                items.add(GalleryItem(uri, true, date))
+                items.add(GalleryItem(uri, true, date, durationMs))
             }
         }
     }
@@ -383,14 +387,26 @@ private fun GalleryThumbnail(
         }
 
         if (media.isVideo) {
+            // Length of the video in the corner, like WhatsApp's gallery.
+            val seconds = (media.durationMs / 1000).coerceAtLeast(0)
+            Text(
+                "%d:%02d".format(seconds / 60, seconds % 60),
+                color = Color.White,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(4.dp)
+                    .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+            )
             Icon(
                 Icons.Default.PlayCircle,
                 "Video",
                 tint = Color.White,
                 modifier = Modifier
-                    .align(Alignment.BottomEnd)
+                    .align(Alignment.TopEnd)
                     .padding(4.dp)
-                    .size(20.dp)
+                    .size(18.dp)
             )
         }
     }
@@ -400,9 +416,10 @@ private fun GalleryThumbnail(
 fun StatusTextComposerPage(
     api: Api,
     onDismiss: () -> Unit,
-    onPosted: () -> Unit
+    onPosted: () -> Unit,
+    initialText: String = ""
 ){
-    var text by remember { mutableStateOf("") }
+    var text by remember { mutableStateOf(initialText.take(280)) }
     var posting by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
 
@@ -583,6 +600,41 @@ fun StatusTextComposerPage(
                 supportingText = { Text("${text.length}/280") },
                 modifier = Modifier.fillMaxWidth()
             )
+
+            // Typing "@" suggests people right under the box (WhatsApp-style); tap to insert.
+            val mentionQuery = Regex("(?:^|\\s)@([A-Za-z0-9_]{0,32})$").find(text)?.groupValues?.get(1)
+            if (mentionQuery != null) {
+                val suggestions = mentionUsers.filter {
+                    mentionQuery.isEmpty() ||
+                        it.displayName.contains(mentionQuery, ignoreCase = true) ||
+                        it.username.contains(mentionQuery, ignoreCase = true)
+                }.take(10)
+                if (suggestions.isNotEmpty()) {
+                    androidx.compose.foundation.lazy.LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+                    ) {
+                        items(suggestions, key = { it.id }) { person ->
+                            Row(
+                                Modifier
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                    .clickable {
+                                        val handle = person.username.takeIf { it.isNotBlank() } ?: person.id
+                                        text = (text.dropLast(mentionQuery.length + 1) + "@$handle ").take(280)
+                                        mentionedUserIds = mentionedUserIds + (person.id to handle)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Avatar(name = person.displayName, photo = person.avatarUrl, size = 24.dp)
+                                Spacer(Modifier.width(6.dp))
+                                Text(person.displayName, style = MaterialTheme.typography.labelLarge)
+                            }
+                        }
+                    }
+                }
+            }
 
             Spacer(Modifier.height(10.dp))
 

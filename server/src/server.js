@@ -4,7 +4,11 @@ import express from 'express';
 import cors from 'cors';
 import admin from 'firebase-admin';
 import nodemailer from 'nodemailer';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 /**
  * HolidayLink OTP service (v3).
@@ -777,77 +781,136 @@ function cloudinaryConfigured() {
   return Boolean(CLOUDINARY_UPLOAD_PRESET) || Boolean(CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
 }
 
-app.post(
-  '/media/upload',
-  express.raw({ type: '*/*', limit: '32mb' }),
-  async (req, res) => {
-    if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
-    const user = await verifyBearer(req);
-    if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
-    if (!cloudinaryConfigured()) {
-      return res.status(503).json({
-        error: 'CLOUDINARY_NOT_CONFIGURED',
-        message: 'Video and document uploads are not configured on the server yet.'
-      });
-    }
+// Largest single attachment (video, audio, document). It is streamed to a temporary file and
+// sent to Cloudinary in chunks, so it never has to fit in this server's memory.
+const MEDIA_MAX_BYTES = 200 * 1024 * 1024;
+const CLOUDINARY_CHUNK_BYTES = 20 * 1024 * 1024;
 
-    const bytes = Buffer.isBuffer(req.body) ? req.body : null;
-    if (!bytes || bytes.length === 0) {
-      return res.status(400).json({ error: 'EMPTY_UPLOAD', message: 'The file was empty.' });
-    }
-    if (bytes.length > 31 * 1024 * 1024) {
-      return res.status(413).json({ error: 'TOO_LARGE', message: 'That file is too large to upload.' });
-    }
-
-    const rawName = String(req.header('X-Filename') || 'upload').replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'upload';
-    const mimeType = String(req.header('X-Content-Type') || 'application/octet-stream').slice(0, 120);
-
-    try {
-      const form = new FormData();
-      form.append('file', new Blob([bytes], { type: mimeType }), rawName);
-
-      if (CLOUDINARY_UPLOAD_PRESET) {
-        form.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-      } else {
-        const timestamp = Math.floor(Date.now() / 1000);
-        const folder = CLOUDINARY_FOLDER;
-        const toSign = `folder=${folder}&timestamp=${timestamp}`;
-        const signature = crypto.createHash('sha1').update(toSign + CLOUDINARY_API_SECRET).digest('hex');
-        form.append('api_key', CLOUDINARY_API_KEY);
-        form.append('timestamp', String(timestamp));
-        form.append('folder', folder);
-        form.append('signature', signature);
+/** Writes the request body to a temp file, refusing anything over [maxBytes]. */
+async function saveBodyToTemp(req, maxBytes) {
+  const file = path.join(os.tmpdir(), `hl-upload-${crypto.randomUUID()}`);
+  let size = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      size += chunk.length;
+      if (size > maxBytes) {
+        return callback(Object.assign(new Error('TOO_LARGE'), { code: 'TOO_LARGE' }));
       }
+      callback(null, chunk);
+    }
+  });
+  try {
+    await pipeline(req, counter, fs.createWriteStream(file));
+  } catch (err) {
+    fs.unlink(file, () => {});
+    throw err;
+  }
+  return { file, size };
+}
 
-      const upload = await fetch(
-        `https://api.cloudinary.com/v1_1/${encodeURIComponent(CLOUDINARY_CLOUD_NAME)}/auto/upload`,
-        { method: 'POST', body: form }
-      );
-      const payload = await upload.json().catch(() => ({}));
-      if (!upload.ok || !payload.secure_url) {
-        console.error('[cloudinary] upload failed', upload.status, payload?.error?.message || payload);
-        return res.status(502).json({
-          error: 'UPLOAD_FAILED',
-          message: 'The file could not be uploaded. Please try again.'
+/** Sends a file to Cloudinary (in 20 MB chunks when it is large) and returns its https URL. */
+async function uploadFileToCloudinary(file, total, name, mimeType) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const authFields = () => {
+    if (CLOUDINARY_UPLOAD_PRESET) return [['upload_preset', CLOUDINARY_UPLOAD_PRESET]];
+    const folder = CLOUDINARY_FOLDER;
+    const toSign = `folder=${folder}&timestamp=${timestamp}`;
+    const signature = crypto.createHash('sha1').update(toSign + CLOUDINARY_API_SECRET).digest('hex');
+    return [
+      ['api_key', CLOUDINARY_API_KEY],
+      ['timestamp', String(timestamp)],
+      ['folder', folder],
+      ['signature', signature]
+    ];
+  };
+  const endpoint = `https://api.cloudinary.com/v1_1/${encodeURIComponent(CLOUDINARY_CLOUD_NAME)}/auto/upload`;
+  const chunked = total > CLOUDINARY_CHUNK_BYTES;
+  const uploadId = crypto.randomUUID();
+  const handle = await fs.promises.open(file, 'r');
+  try {
+    let start = 0;
+    let payload = {};
+    while (start < total) {
+      const end = Math.min(start + CLOUDINARY_CHUNK_BYTES, total) - 1;
+      const length = end - start + 1;
+      const buffer = Buffer.alloc(length);
+      let filled = 0;
+      while (filled < length) {
+        const { bytesRead } = await handle.read(buffer, filled, length - filled, start + filled);
+        if (bytesRead === 0) break;
+        filled += bytesRead;
+      }
+      const form = new FormData();
+      form.append('file', new Blob([buffer.subarray(0, filled)], { type: mimeType }), name);
+      authFields().forEach(([key, value]) => form.append(key, value));
+      const headers = chunked
+        ? { 'X-Unique-Upload-Id': uploadId, 'Content-Range': `bytes ${start}-${end}/${total}` }
+        : {};
+      const response = await fetch(endpoint, { method: 'POST', body: form, headers });
+      payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = String(payload?.error?.message || '');
+        console.error('[cloudinary] upload failed', response.status, message || payload);
+        throw Object.assign(new Error(message || 'UPLOAD_FAILED'), {
+          code: /size|large|limit/i.test(message) ? 'CLOUDINARY_LIMIT' : 'UPLOAD_FAILED'
         });
       }
-      return res.json({
-        ok: true,
-        url: payload.secure_url,
-        secureUrl: payload.secure_url,
-        publicId: payload.public_id || null,
-        resourceType: payload.resource_type || null,
-        bytes: payload.bytes || bytes.length
-      });
-    } catch (err) {
-      console.error('[cloudinary] upload error', err?.message || err);
-      return res.status(502).json({
-        error: 'UPLOAD_FAILED',
-        message: 'The file could not be uploaded. Please try again.'
+      start = end + 1;
+    }
+    if (!payload.secure_url) throw Object.assign(new Error('NO_URL'), { code: 'UPLOAD_FAILED' });
+    return payload;
+  } finally {
+    await handle.close();
+  }
+}
+
+app.post('/media/upload', async (req, res) => {
+  if (!serviceAccount) return res.status(503).json({ error: 'UNAVAILABLE' });
+  const user = await verifyBearer(req);
+  if (!user) return res.status(401).json({ error: 'UNAUTHENTICATED' });
+  if (!cloudinaryConfigured()) {
+    return res.status(503).json({
+      error: 'CLOUDINARY_NOT_CONFIGURED',
+      message: 'Video and document uploads are not configured on the server yet.'
+    });
+  }
+
+  const rawName = String(req.header('X-Filename') || 'upload').replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'upload';
+  const mimeType = String(req.header('X-Content-Type') || 'application/octet-stream').slice(0, 120);
+  let saved = null;
+  try {
+    saved = await saveBodyToTemp(req, MEDIA_MAX_BYTES);
+    if (saved.size === 0) {
+      return res.status(400).json({ error: 'EMPTY_UPLOAD', message: 'The file was empty.' });
+    }
+    const payload = await uploadFileToCloudinary(saved.file, saved.size, rawName, mimeType);
+    return res.json({
+      ok: true,
+      url: payload.secure_url,
+      secureUrl: payload.secure_url,
+      publicId: payload.public_id || null,
+      resourceType: payload.resource_type || null,
+      bytes: payload.bytes || saved.size
+    });
+  } catch (err) {
+    if (err?.code === 'TOO_LARGE') {
+      return res.status(413).json({ error: 'TOO_LARGE', message: 'That file is too large to upload (200 MB maximum).' });
+    }
+    if (err?.code === 'CLOUDINARY_LIMIT') {
+      return res.status(413).json({
+        error: 'CLOUDINARY_LIMIT',
+        message: 'Your Cloudinary plan does not accept a file this big. Try a smaller video.'
       });
     }
+    console.error('[cloudinary] upload error', err?.message || err);
+    return res.status(502).json({
+      error: 'UPLOAD_FAILED',
+      message: 'The file could not be uploaded. Please try again.'
+    });
+  } finally {
+    if (saved) fs.unlink(saved.file, () => {});
   }
-);
+});
 
 // ---------------------------------------------------------------- in-app account switching
 

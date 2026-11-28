@@ -186,7 +186,12 @@ fun ChatLockScreen(chatLabel: String, onUnlocked: () -> Unit, onCancel: () -> Un
 }
 
 private val scheduleDayFormat = SimpleDateFormat("EEE d MMM", Locale.getDefault())
-private val scheduleTimeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+// Follows the phone's 12/24-hour setting. It used to be a fixed "09:10", so someone meaning
+// 9:10 PM picked a morning time that had already passed and the message "would not schedule".
+private var scheduleIs24h = false
+
+private fun scheduleTimeText(date: java.util.Date): String =
+    SimpleDateFormat(if (scheduleIs24h) "HH:mm" else "h:mm a", Locale.getDefault()).format(date)
 
 /** Human-readable "when" for a scheduled message. */
 fun formatScheduledAt(atMs: Long): String {
@@ -200,7 +205,7 @@ fun formatScheduledAt(atMs: Long): String {
             calendar.get(Calendar.DAY_OF_YEAR) == tomorrow.get(Calendar.DAY_OF_YEAR) -> "Tomorrow"
         else -> scheduleDayFormat.format(calendar.time)
     }
-    return "$day at ${scheduleTimeFormat.format(calendar.time)}"
+    return "$day at ${scheduleTimeText(calendar.time)}"
 }
 
 /** Next sensible default: tomorrow at 09:00, so scheduling never lands in the past. */
@@ -218,6 +223,7 @@ fun ScheduledMessagesScreen(chatId: String, chatLabel: String, onBack: () -> Uni
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
+    scheduleIs24h = android.text.format.DateFormat.is24HourFormat(context)
     val settings = AppSettings.state
     val queued = settings.scheduledMessages.filter { it.chatId == chatId && it.atMs > System.currentTimeMillis() }.sortedBy { it.atMs }
 
@@ -236,7 +242,7 @@ fun ScheduledMessagesScreen(chatId: String, chatLabel: String, onBack: () -> Uni
         ) {
             SettingsSection("Write one") {
                 Text(
-                    "Your message is queued on HolidayLink's server and can send while this app is closed, provided the server is online.",
+                    "Your message is sent at the time you choose, even if the app is closed. You get a notice one minute before it goes out.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
@@ -261,7 +267,7 @@ fun ScheduledMessagesScreen(chatId: String, chatLabel: String, onBack: () -> Uni
                     ) { showDate = true }
                     OutlinedButtonRow(
                         icon = Icons.Default.AccessTime,
-                        label = scheduleTimeFormat.format(calendar.time),
+                        label = scheduleTimeText(calendar.time),
                         modifier = Modifier.weight(1f)
                     ) { showTime = true }
                 }
@@ -271,7 +277,11 @@ fun ScheduledMessagesScreen(chatId: String, chatLabel: String, onBack: () -> Uni
                         if (text.isBlank()) return@Button
                         // Never silently move the time the user chose: tell them instead.
                         if (atMs <= System.currentTimeMillis() + 30_000L) {
-                            scope.launch { snackbar.showSnackbar("Pick a time at least a minute from now.") }
+                            scope.launch {
+                                snackbar.showSnackbar(
+                                    "${formatScheduledAt(atMs)} has already passed. Pick a later time (check AM / PM) or another day."
+                                )
+                            }
                             return@Button
                         }
                         val item = AppSettings.addScheduled(chatId, chatLabel, text.trim(), atMs)
@@ -416,7 +426,7 @@ fun ScheduledMessagesScreen(chatId: String, chatLabel: String, onBack: () -> Uni
         val state = rememberTimePickerState(
             initialHour = calendar.get(Calendar.HOUR_OF_DAY),
             initialMinute = calendar.get(Calendar.MINUTE),
-            is24Hour = true
+            is24Hour = scheduleIs24h
         )
         AlertDialog(
             onDismissRequest = { showTime = false },

@@ -1,5 +1,6 @@
 package org.holidaylink.app.ui
 
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -83,9 +84,13 @@ fun ChatsScreen(
     /** Status row + search bar. Rendered as the first list item so it scrolls away with the chats. */
     header: (@Composable () -> Unit)? = null,
     /** The search bar: stays pinned at the top while the status strip scrolls away. */
-    pinnedHeader: (@Composable () -> Unit)? = null
+    pinnedHeader: (@Composable () -> Unit)? = null,
+    /** Tapping someone's picture: their status when they have one. */
+    onOpenStatus: (String) -> Unit = {}
 ) {
     val uid = currentUserId.ifBlank { FirestoreChat.myUid() }
+    // Picture shown full size when the person has no status (name, address).
+    var photoPreview by remember { mutableStateOf<Pair<String, String?>?>(null) }
     var error by remember { mutableStateOf("") }
     var menuFor by remember { mutableStateOf<ChatItem?>(null) }
     var archivedOpen by remember { mutableStateOf(false) }
@@ -169,7 +174,8 @@ fun ChatsScreen(
             row.id, kind, title, peer,
             row.lastBody, row.lastAt?.toDate()?.toInstant()?.toString(),
             row.unread, AppSettings.isChatPinned(row.id), AppSettings.isChatArchived(row.id), typingShown,
-            peerResolved
+            peerResolved,
+            groupPhoto = row.photo
         )
     }
 
@@ -189,7 +195,19 @@ fun ChatsScreen(
             .thenBy { it.id }
     )
     val archivedCount = all.count { it.archived }
-    val visible = all.filter { it.archived == archivedOpen }
+    // Archived chats live on their own page (see below); the main list never mixes them in.
+    val visible = all.filter { !it.archived }
+
+    // Tapping a picture: the person's status if they have one, otherwise their picture.
+    fun avatarTapped(chat: ChatItem) {
+        val peerId = chat.peer?.id
+        if (peerId != null && StatusRings.of(peerId) != StatusRings.Ring.NONE) {
+            onOpenStatus(peerId)
+        } else {
+            val name = chat.peer?.displayName?.takeIf { it.isNotBlank() } ?: chat.title ?: "Contact"
+            photoPreview = name to (chat.peer?.avatarUrl ?: chat.groupPhoto)
+        }
+    }
 
     // One list for everything: the header is item zero, so it scrolls away with the chats
     // instead of collapsing on a scroll listener, and rows pass behind the floating nav.
@@ -203,6 +221,7 @@ fun ChatsScreen(
             ChatListLoadState.scrollOffset = listState.firstVisibleItemScrollOffset
         }
     }
+    Box(Modifier.fillMaxSize()) {
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize(),
@@ -240,7 +259,7 @@ fun ChatsScreen(
                     item(key = "archived-toggle") {
                         Row(
                             Modifier.fillMaxWidth()
-                                .clickable { archivedOpen = !archivedOpen }
+                                .clickable { archivedOpen = true }
                                 .padding(horizontal = 16.dp, vertical = 12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -252,15 +271,15 @@ fun ChatsScreen(
                             )
                             Spacer(Modifier.width(14.dp))
                             Text(
-                                if (archivedOpen) "Back to all chats" else "Archived ($archivedCount)",
+                                "Archived",
                                 style = MaterialTheme.typography.bodyLarge,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.weight(1f)
                             )
-                            Icon(
-                                if (archivedOpen) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            Text(
+                                "$archivedCount",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.primary
                             )
                         }
                     }
@@ -271,11 +290,61 @@ fun ChatsScreen(
                         currentUserId = uid,
                         muted = AppSettings.isChatMuted(chat.id),
                         onClick = { onOpenChat(chat) },
-                        onLongPress = { menuFor = chat }
+                        onLongPress = { menuFor = chat },
+                        onAvatarClick = { avatarTapped(chat) }
                     )
                 }
             }
         }
+    }
+
+    // The Archived page: its own screen with a back button. When nothing is archived (or the
+    // last chat was just unarchived) it shows a clean empty page instead of a dead end.
+    if (archivedOpen) {
+        androidx.activity.compose.BackHandler { archivedOpen = false }
+        val archivedRows = all.filter { it.archived }
+        Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                androidx.compose.material3.IconButton(onClick = { archivedOpen = false }) {
+                    Icon(androidx.compose.material.icons.Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                }
+                Text(
+                    "Archived chats",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (archivedRows.isEmpty()) {
+                EmptyState(
+                    icon = Icons.Default.Archive,
+                    title = "No archived chats",
+                    subtitle = "Chats you archive are kept here.",
+                    modifier = Modifier.weight(1f)
+                )
+            } else {
+                LazyColumn(Modifier.weight(1f), contentPadding = floatingNavBottomPadding()) {
+                    items(archivedRows, key = { it.id }) { chat ->
+                        ChatRow(
+                            chat = chat,
+                            currentUserId = uid,
+                            muted = AppSettings.isChatMuted(chat.id),
+                            onClick = { onOpenChat(chat) },
+                            onLongPress = { menuFor = chat },
+                            onAvatarClick = { avatarTapped(chat) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+    }
+
+    // Picture preview for people without a status.
+    photoPreview?.let { (name, url) ->
+        ProfilePhotoPreview(name = name, photoUrl = url, onDismiss = { photoPreview = null })
     }
 
     // WhatsApp-style long-press actions: pin, mute, mark as read.
@@ -352,7 +421,8 @@ private fun ChatRow(
     currentUserId: String,
     muted: Boolean,
     onClick: () -> Unit,
-    onLongPress: () -> Unit
+    onLongPress: () -> Unit,
+    onAvatarClick: (() -> Unit)? = null
 ) {
     // A 1-1 chat must never borrow the word "Group" (or show an empty line) while its
     // peer name is still resolving. "Contact" is only a true fallback once the peer lookup
@@ -382,10 +452,11 @@ private fun ChatRow(
         } else {
             Avatar(
                 name = title,
-                photo = chat.peer?.avatarUrl,
+                photo = chat.peer?.avatarUrl ?: chat.groupPhoto,
                 online = chat.peer?.online,
                 size = 52.dp,
-                statusUserId = chat.peer?.id
+                statusUserId = chat.peer?.id,
+                onClick = onAvatarClick
             )
         }
         Spacer(Modifier.width(14.dp))

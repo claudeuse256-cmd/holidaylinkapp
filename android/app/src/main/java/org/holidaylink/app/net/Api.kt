@@ -123,7 +123,9 @@ data class ChatItem(
      * loading placeholder, never the literal fallback name, or every chat flashes "Contact" for
      * a frame on every load.
      */
-    val peerResolved: Boolean = true
+    val peerResolved: Boolean = true,
+    /** The group's picture, so lists and headers show it and not just the first letter. */
+    val groupPhoto: String? = null
 )
 
 data class Reaction(val emoji: String, val count: Int, val mine: Boolean)

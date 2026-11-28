@@ -31,7 +31,7 @@ object MediaPicker {
     const val jpegQuality = 78
 
     /** Hard ceiling for a single attachment, enforced on both sides. */
-    const val maxAttachmentBytes = 20L * 1024 * 1024
+    const val maxAttachmentBytes = 200L * 1024 * 1024
 
     fun inspect(context: Context, uri: Uri): PickedFile {
         var name: String? = null

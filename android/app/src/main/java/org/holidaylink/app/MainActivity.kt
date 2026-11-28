@@ -196,6 +196,7 @@ class MainActivity : FragmentActivity() {
         // A crash report from a previous run no longer replaces the app: crashes are still
         // recorded privately (see CrashGuard) for support, but they never block opening.
         NotificationRouter.consume(intent)
+        org.holidaylink.app.ui.IncomingShare.consume(intent)
         setContent { HolidayLinkApp(this) }
     }
 
@@ -220,6 +221,7 @@ class MainActivity : FragmentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         NotificationRouter.consume(intent)
+        org.holidaylink.app.ui.IncomingShare.consume(intent)
     }
 }
 
@@ -242,6 +244,11 @@ private object NotificationRouter {
 
     fun clear() {
         pendingChatId = null
+    }
+
+    /** Open this conversation (used after sharing something into it). */
+    fun open(chatId: String) {
+        pendingChatId = chatId
     }
 }
 
@@ -275,7 +282,14 @@ private sealed interface Destination {
     data object Calls : Destination
     data class WebFeature(val title: String, val url: String) : Destination
     data object FeatureHub : Destination
-    data class Status(val startWithComposer: Boolean = false, val userId: String? = null) : Destination
+    data class Status(
+        val startWithComposer: Boolean = false,
+        val userId: String? = null,
+        /** Something shared into HolidayLink from another app, to post as a status. */
+        val sharedUri: android.net.Uri? = null,
+        val sharedIsVideo: Boolean = false,
+        val sharedText: String? = null
+    ) : Destination
     data class ScheduledMessages(val chatId: String, val chatLabel: String) : Destination
     data object Store : Destination
     data object Subscription : Destination
@@ -631,7 +645,11 @@ private fun SignedInApp(
                 try {
                     val ordered = snap.documents
                         .sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
-                    if (!primed) {
+                    // Your most recent chats become "direct share" targets in the system share sheet.
+                org.holidaylink.app.ui.OutboxStore.launch {
+                    runCatching { org.holidaylink.app.ui.ShareShortcuts.publish(context.applicationContext, rows) }
+                }
+                if (!primed) {
                         // First snapshot is the existing backlog: learn it, don't buzz for it.
                         ordered.forEach { seen.add(it.id) }
                         primed = true
@@ -673,6 +691,13 @@ private fun SignedInApp(
         // A Firestore/flow error must not escape into the composition and crash the app.
         runCatching {
             FirestoreChat.chatsFlow(userId).collect { rows ->
+                rows.forEach { row ->
+                    row.peerId?.let { peer ->
+                        if (org.holidaylink.app.ui.UnreadCounts.byPeer[peer] != row.unread) {
+                            org.holidaylink.app.ui.UnreadCounts.byPeer[peer] = row.unread
+                        }
+                    }
+                }
                 if (!primed) {
                     rows.forEach { lastUnread[it.id] = it.unread }
                     primed = true
@@ -759,6 +784,25 @@ private fun SignedInApp(
 
     BackHandler(enabled = stack.size > 1) { pop() }
 
+    // Another app shared something to HolidayLink: choose where it goes.
+    if (org.holidaylink.app.ui.IncomingShare.hasContent) {
+        org.holidaylink.app.ui.ShareToScreen(
+            onOpenChat = { chatId -> NotificationRouter.open(chatId) },
+            onShareToStatus = {
+                val first = org.holidaylink.app.ui.IncomingShare.items.firstOrNull()
+                val destination = Destination.Status(
+                    sharedUri = first?.uri,
+                    sharedIsVideo = first?.mime?.startsWith("video/") == true,
+                    sharedText = org.holidaylink.app.ui.IncomingShare.text
+                )
+                org.holidaylink.app.ui.IncomingShare.clear()
+                push(destination)
+            },
+            onCancel = { org.holidaylink.app.ui.IncomingShare.clear() }
+        )
+        return
+    }
+
     val dialingNow = dialing
     if (dialingNow != null && activeCall == null) {
         org.holidaylink.app.ui.DialingScreen(
@@ -815,6 +859,7 @@ private fun SignedInApp(
             },
             onOpenProfileTab = { push(Destination.MyProfile) },
             onOpenStatus = { push(Destination.Status(false)) },
+            onOpenUserStatus = { push(Destination.Status(false, it)) },
             onPostStatus = { push(Destination.Status(true)) },
             onNewGroup = { push(Destination.NewGroup) },
             onNewChannel = { push(Destination.NewChannel) },
@@ -960,6 +1005,9 @@ private fun SignedInApp(
             me = me,
             startWithComposer = current.startWithComposer,
             initialUserId = current.userId,
+            sharedUri = current.sharedUri,
+            sharedIsVideo = current.sharedIsVideo,
+            sharedText = current.sharedText,
             onBack = pop,
             onReply = { status ->
                 val uid = FirebaseBackend.uid.orEmpty()
@@ -1129,6 +1177,8 @@ private fun TabShell(
     onOpenFeature: (HolidayFeature) -> Unit,
     onOpenProfileTab: () -> Unit,
     onOpenStatus: () -> Unit = {},
+    /** Open ONE person's status (tapping their picture in the chat list). */
+    onOpenUserStatus: (String) -> Unit = {},
     onPostStatus: () -> Unit = {},
     onNewGroup: () -> Unit = {},
     onNewChannel: () -> Unit = {},
@@ -1201,6 +1251,7 @@ private fun TabShell(
                         api = api,
                         currentUserId = me?.id.orEmpty(),
                         onOpenChat = onOpenChat,
+                        onOpenStatus = onOpenUserStatus,
                         // The status row and search bar live inside the list now, so they
                         // scroll away with the chats instead of collapsing on their own.
                         header = {
@@ -1315,10 +1366,14 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
         if (people.isNotEmpty() && System.currentTimeMillis() - StatusStripCache.at < 45_000L) {
             return@LaunchedEffect
         }
-        runCatching {
-            val now = com.google.firebase.Timestamp.now()
-            val snap = FirebaseBackend.db.collection("statuses")
-                .whereGreaterThan("expiresAt", now).orderBy("expiresAt").limit(60).get().await()
+        // Painted from the phone's own cache first (instant on every reopen, even offline), then
+        // refreshed from the server; people are looked up together, not one by one.
+        suspend fun build(snap: com.google.firebase.firestore.QuerySnapshot) {
+            val unknown = snap.documents.mapNotNull { it.getString("userId") }
+                .filter { it.isNotBlank() && StatusStripCache.profiles[it] == null }.distinct()
+            val resolved = if (unknown.isEmpty()) emptyMap() else {
+                runCatching { FirestoreChat.resolvePeers(unknown) }.getOrDefault(emptyMap())
+            }
             val seen = linkedMapOf<String, Triple<String, String, String?>>()
             snap.documents.forEach { d ->
                 val userId = d.getString("userId").orEmpty()
@@ -1327,10 +1382,10 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
                 if (known != null) {
                     seen[userId] = Triple(userId, known.first, known.second)
                 } else {
-                    val p = runCatching { FirebaseBackend.loadProfile(userId) }.getOrNull()
-                    val name = p?.name?.takeIf { it.isNotBlank() } ?: "HolidayLink user"
-                    if (p != null) StatusStripCache.profiles[userId] = name to p.profilePic
-                    seen[userId] = Triple(userId, name, p?.profilePic)
+                    val p = resolved[userId]
+                    val name = p?.displayName?.takeIf { it.isNotBlank() } ?: "HolidayLink user"
+                    if (p != null) StatusStripCache.profiles[userId] = name to p.avatarUrl
+                    seen[userId] = Triple(userId, name, p?.avatarUrl)
                 }
             }
             // Green / grey rings around profile pictures (new vs already seen statuses).
@@ -1344,6 +1399,15 @@ private fun GlassStatusRow(api: Api, me: Me?, onOpenStatus: () -> Unit, onPostSt
             people = seen.values.take(12)
             StatusStripCache.people = people
             StatusStripCache.at = System.currentTimeMillis()
+        }
+        runCatching {
+            val now = com.google.firebase.Timestamp.now()
+            val query = FirebaseBackend.db.collection("statuses")
+                .whereGreaterThan("expiresAt", now).orderBy("expiresAt").limit(60)
+            if (people.isEmpty()) {
+                runCatching { build(query.get(com.google.firebase.firestore.Source.CACHE).await()) }
+            }
+            build(query.get().await())
         }
     }
     LazyRow(

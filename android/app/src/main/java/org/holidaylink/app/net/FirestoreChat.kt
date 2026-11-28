@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.async
 
 /**
  * Firestore chats: same docs the website reads/writes (room.html).
@@ -45,7 +46,9 @@ object FirestoreChat {
         val lastBody: String?,
         val lastAt: Timestamp?,
         val unread: Int,
-        val peerTyping: Boolean = false
+        val peerTyping: Boolean = false,
+        /** The group's picture (groups only). */
+        val photo: String? = null
     )
 
     /**
@@ -135,7 +138,11 @@ object FirestoreChat {
                             lastBody = d.getString("lastText"),
                             lastAt = d.safeTimestamp("lastAt") ?: d.safeTimestamp("updatedAt"),
                             unread = (d.getLong("unread_$uid") ?: 0).toInt(),
-                            peerTyping = someoneTyping(rowData, uid)
+                            peerTyping = someoneTyping(rowData, uid),
+                            photo = if (isGroup) {
+                                (rowData["groupPic"] as? String ?: rowData["groupPhoto"] as? String ?: rowData["photoURL"] as? String)
+                                    ?.takeIf { it.isNotBlank() }
+                            } else null
                         )
                     }?.sortedWith(
                         // Two chats can share a whole second; the nanoseconds decide the tie
@@ -152,7 +159,11 @@ object FirestoreChat {
     }
 
     suspend fun resolvePeer(peerId: String): User {
-        val doc = db.collection("users").document(peerId).get().await()
+        // Phone cache first (instant), the server only when this person was never seen before.
+        val cached = runCatching {
+            db.collection("users").document(peerId).get(Source.CACHE).await()
+        }.getOrNull()?.takeIf { it.exists() }
+        val doc = cached ?: db.collection("users").document(peerId).get().await()
         return userFrom(peerId, doc.data.orEmpty())
     }
 
@@ -165,15 +176,25 @@ object FirestoreChat {
     suspend fun resolvePeers(ids: List<String>): Map<String, User> {
         val wanted = ids.filter { it.isNotBlank() }.distinct()
         if (wanted.isEmpty()) return emptyMap()
-        val out = HashMap<String, User>()
-        wanted.chunked(10).forEach { chunk ->
-            runCatching {
-                db.collection("users")
-                    .whereIn(com.google.firebase.firestore.FieldPath.documentId(), chunk)
-                    .get().await()
-            }.getOrNull()?.documents?.forEach { d ->
-                out[d.id] = userFrom(d.id, d.data.orEmpty())
-            }
+        val out = java.util.concurrent.ConcurrentHashMap<String, User>()
+        // All groups of ten at the same time (it used to be one after the other), and each group
+        // from the phone's own cache first: the people shown last time appear without waiting for
+        // the network, which is what made lists feel slow to open. The server is only asked when
+        // the cache does not already have everyone.
+        kotlinx.coroutines.coroutineScope {
+            wanted.chunked(10).map { chunk ->
+                async {
+                    val query = db.collection("users")
+                        .whereIn(com.google.firebase.firestore.FieldPath.documentId(), chunk)
+                    val cached = runCatching { query.get(Source.CACHE).await().documents }.getOrNull().orEmpty()
+                    val docs = if (cached.size >= chunk.size) {
+                        cached
+                    } else {
+                        runCatching { query.get().await().documents }.getOrNull() ?: cached
+                    }
+                    docs.forEach { d -> out[d.id] = userFrom(d.id, d.data.orEmpty()) }
+                }
+            }.forEach { it.await() }
         }
         return out
     }
@@ -338,7 +359,9 @@ object FirestoreChat {
         replyToName: String? = null,
         audioBlob: String? = null,
         /** Fixed id for the stored message (used by scheduled messages so a retry cannot duplicate it). */
-        messageId: String? = null
+        messageId: String? = null,
+        /** Called when the SERVER has confirmed the message (used for the "sent" sound). */
+        onConfirmed: (() -> Unit)? = null
     ): String {
         val uid = myUid()
         val now = Timestamp.now()
@@ -391,7 +414,10 @@ object FirestoreChat {
         val commit = batch.commit()
         // Nudge the other side's phones once the server really has the message. Best effort
         // only: the message itself is already on its way through Firestore.
-        commit.addOnSuccessListener { runCatching { PushNotify.message(chatId, preview, msgRef.id) } }
+        commit.addOnSuccessListener {
+            runCatching { PushNotify.message(chatId, preview, msgRef.id) }
+            runCatching { onConfirmed?.invoke() }
+        }
         // Give the server a moment to answer so a refused write (rules, bad chat) still shows
         // up as "not sent". Offline, the answer never comes: the write stays queued and the
         // message shows with a clock instead of being lost.

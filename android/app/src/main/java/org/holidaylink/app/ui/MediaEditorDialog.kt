@@ -137,6 +137,7 @@ fun MediaEditorDialog(
 
     // Real crop: a fixed guide frame sits over the preview; the image behind it pans and
     // pinch-zooms while the frame stays put.
+    val editorDensity = LocalDensity.current
     var cropAspectRatio by remember(statusMode) {
         mutableStateOf(if (statusMode) 9f / 16f else 1f)
     }
@@ -217,8 +218,22 @@ fun MediaEditorDialog(
                                 previewBoxSize = previewBoxSize,
                                 imageScale = imageScale,
                                 imageOffset = imageOffset,
-                                cropAspectRatio = cropAspectRatio
+                                cropAspectRatio = cropAspectRatio,
+                                rotation = rotation
                             )
+                            // Drawings and text are placed in the PREVIEW BOX while editing, but the
+                            // sent picture is only the crop window inside that box. Convert each
+                            // position to the crop window (and the text size to its width), or
+                            // everything lands in the wrong place once the picture is cropped.
+                            val boxW = previewBoxSize.width.toFloat().coerceAtLeast(1f)
+                            val boxH = previewBoxSize.height.toFloat().coerceAtLeast(1f)
+                            val guide = guideRect(boxW, boxH, cropAspectRatio)
+                            val toGuide = isImage && guide[2] > 1f && guide[3] > 1f
+                            val mapX = { nx: Float -> if (toGuide) (nx * boxW - guide[0]) / guide[2] else nx }
+                            val mapY = { ny: Float -> if (toGuide) (ny * boxH - guide[1]) / guide[3] else ny }
+                            val sizeFactor = if (toGuide) {
+                                with(editorDensity) { 24.sp.toPx() } / (guide[2] * 0.075f)
+                            } else 1f
                             val finalOverlays = overlays.map {
                                 PlacedOverlay(
                                     id = it.id,
@@ -226,9 +241,9 @@ fun MediaEditorDialog(
                                     text = it.text,
                                     colorArgb = it.colorArgb,
                                     stickerRef = it.stickerRef,
-                                    x = it.x,
-                                    y = it.y,
-                                    scale = it.scale,
+                                    x = mapX(it.x),
+                                    y = mapY(it.y),
+                                    scale = it.scale * sizeFactor,
                                     rotationDeg = it.rotationDeg
                                 )
                             }
@@ -240,10 +255,7 @@ fun MediaEditorDialog(
                                 cropRect,
                                 finalOverlays,
                                 strokes.map { line ->
-                                    line.map { p ->
-                                        (p.x / 10000f).coerceIn(0f, 1f) to
-                                            (p.y / 10000f).coerceIn(0f, 1f)
-                                    }
+                                    line.map { p -> mapX(p.x / 10000f) to mapY(p.y / 10000f) }
                                 }
                             )
                         }
@@ -625,13 +637,25 @@ private class EditableOverlay(
     var rotationDeg by mutableFloatStateOf(rotationDeg)
 }
 
+/** The crop window inside the preview box, in box pixels: left, top, width, height. */
+private fun guideRect(boxW: Float, boxH: Float, aspect: Float): FloatArray {
+    var guideW = boxW
+    var guideH = guideW / aspect
+    if (guideH > boxH) {
+        guideH = boxH
+        guideW = guideH * aspect
+    }
+    return floatArrayOf((boxW - guideW) / 2f, (boxH - guideH) / 2f, guideW, guideH)
+}
+
 /** Converts the user's pan/zoom of the source image into a normalized crop rectangle. */
 private fun computeCropRect(
     sourceSize: IntSize,
     previewBoxSize: IntSize,
     imageScale: Float,
     imageOffset: Offset,
-    cropAspectRatio: Float
+    cropAspectRatio: Float,
+    rotation: Int = 0
 ): CropRect {
     if (sourceSize.width <= 0 || sourceSize.height <= 0 || previewBoxSize.width <= 0 || previewBoxSize.height <= 0) {
         return CropRect()
@@ -648,8 +672,11 @@ private fun computeCropRect(
     val fitScale = min(boxW / sourceSize.width, boxH / sourceSize.height)
     val baseW = sourceSize.width * fitScale
     val baseH = sourceSize.height * fitScale
-    val drawnW = baseW * imageScale
-    val drawnH = baseH * imageScale
+    // A picture turned a quarter turn occupies width x height swapped on screen, and the crop is
+    // taken from the already-rotated picture.
+    val quarterTurn = rotation % 180 != 0
+    val drawnW = (if (quarterTurn) baseH else baseW) * imageScale
+    val drawnH = (if (quarterTurn) baseW else baseH) * imageScale
     val imageLeft = (boxW - drawnW) / 2f + imageOffset.x
     val imageTop = (boxH - drawnH) / 2f + imageOffset.y
 
@@ -928,10 +955,18 @@ private fun EditorVideoPreview(file: File, trimStartMs: Long, trimEndMs: Long) {
     DisposableEffect(file) {
         onDispose { runCatching { videoView?.stopPlayback() } }
     }
+    // Follow the left handle: while it is dragged the preview shows that frame.
+    LaunchedEffect(trimStartMs) {
+        delay(120)
+        runCatching { if (trimEndMs > trimStartMs) videoView?.seekTo(trimStartMs.toInt()) }
+    }
     LaunchedEffect(trimStartMs, trimEndMs, playing) {
         while (playing) {
             delay(120)
             runCatching {
+                // Until the video length is known the end is 0: never loop on that, it kept
+                // seeking back to the start so the preview stuttered at the first frame.
+                if (trimEndMs <= trimStartMs) return@runCatching
                 val v = videoView ?: return@runCatching
                 if (!v.isPlaying) return@runCatching
                 val pos = v.currentPosition.toLong()

@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.holidaylink.app.config.AppConfig
 import org.json.JSONObject
@@ -44,6 +45,38 @@ object Cloudinary {
         fileName: String,
         mimeType: String,
         onProgress: (Int) -> Unit = {}
+    ): String {
+        val mediaType = runCatching { mimeType.toMediaType() }
+            .getOrElse { "application/octet-stream".toMediaType() }
+        return send(context, bytes.toRequestBody(mediaType).withProgress(onProgress), fileName, mimeType)
+    }
+
+    /**
+     * Same as [upload] but reads the file from disk while sending, so even a 200 MB video uses
+     * almost no memory on the phone.
+     */
+    suspend fun uploadFile(
+        context: Context,
+        file: java.io.File,
+        fileName: String,
+        mimeType: String,
+        onProgress: (Int) -> Unit = {}
+    ): String {
+        val mediaType = runCatching { mimeType.toMediaType() }
+            .getOrElse { "application/octet-stream".toMediaType() }
+        return send(
+            context,
+            file.asRequestBody(mediaType).withProgress(onProgress),
+            fileName,
+            mimeType
+        )
+    }
+
+    private suspend fun send(
+        context: Context,
+        body: okhttp3.RequestBody,
+        fileName: String,
+        mimeType: String
     ): String = withContext(Dispatchers.IO) {
         val token = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
             ?.getIdToken(false)?.await()?.token
@@ -57,15 +90,13 @@ object Cloudinary {
             .trim()
             .take(120)
             .ifBlank { "upload" }
-        val mediaType = runCatching { mimeType.toMediaType() }
-            .getOrElse { "application/octet-stream".toMediaType() }
 
         val request = Request.Builder()
             .url("$base/media/upload")
             .addHeader("Authorization", "Bearer $token")
             .addHeader("X-Filename", safeName)
             .addHeader("X-Content-Type", mimeType)
-            .post(bytes.toRequestBody(mediaType).withProgress(onProgress))
+            .post(body)
             .build()
 
         client.newCall(request).execute().use { response ->

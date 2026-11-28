@@ -100,3 +100,42 @@ compiler message — most likely small import/type slips.
   (holidaylink.app, example.com/x) are detected (TLD list in `Linkify.kt`).
 - **Chat theme** (Settings › Appearance › Chat theme): 9 ready themes + custom colour slider with live preview;
   applies to the message bubbles (`ChatThemes.kt`, `AppSettings.chatTheme`).
+
+---
+# Fourth pass (25 Nov 2026) — not compiled either
+
+**Chats / users**
+- Unread counters in the Users directory (`UnreadCounts`), same green badge as Chats.
+- Tapping a picture in the Chats list opens that person's status if they have one, otherwise the picture full size
+  (`ProfilePhotoPreview`). Group pictures now show in the Chats list, the chat header and (via `ChatRow.photo`).
+- Archive is its own page with a back button and a clean empty state (no more dead end after unarchiving the last chat).
+- Read state: a conversation is marked read when opened AND when left, on the app-wide scope (it used to be dropped
+  when the screen closed, so the badge came back).
+- Group messages show a small picture before the sender's name; tapping opens their profile (with Message).
+
+**Messaging / media**
+- Audio files picked from storage play inside the chat (`isAudioFileName` -> `VoicePlayer`), no browser.
+- Reply preview for a voice note is "Voice message (0:13)" without the mic icon.
+- The "sent" sound plays only after the SERVER confirms (`FirestoreChat.send(onConfirmed = …)`), not on tap.
+- A picture no longer shows twice for a moment: the stored message id is assigned before sending and hidden behind the bubble.
+- Attachments up to 200 MB: streamed from disk on the phone (`Cloudinary.uploadFile`) and streamed to disk + chunked
+  to Cloudinary on the server (`/media/upload`). NOTE: Cloudinary's own plan limit still applies (free plans refuse
+  big videos); the app then falls back to Firebase Storage if it is enabled, or shows the reason.
+- Image editor: drawings and text were saved in preview-box coordinates but applied to the cropped picture, so they
+  moved after cropping; now converted to the crop window. Rotated pictures are cropped with the right geometry.
+- Video editor: trimming now starts on a key frame, keeps rotation (`setOrientationHint`) and keeps sound in sync;
+  the preview no longer stutters before the length is known and follows the left trim handle.
+- Scheduled messages: the time now follows the phone's 12/24 h setting ("9:10 PM", not "09:10"); a passed time says so.
+
+**Status** (`StatusScreen.kt`) rebuilt like WhatsApp: My status row (green + badge), Recent updates, Viewed updates
+("View N more"), pencil + camera buttons, no placeholder cards. My updates sheet (views, delete). Gallery now lists
+the whole phone (was 120) with video lengths; the Camera tile takes a real photo. Viewer: like (heart) on the LEFT of
+the reply box, likes counted for the owner. Mentions: typing @ suggests people; @names in photo/video captions are
+resolved at posting; the list shows "Mentioned you".
+
+**Sharing into HolidayLink** from gallery, files, TikTok, browsers: share sheet entry (`ACTION_SEND`/`SEND_MULTIPLE`),
+"Share to…" picker with My status + chats, and your recent chats are published as direct-share shortcuts so they sit at
+the top of the system share sheet. (Android decides the final order; nothing can force "first".)
+
+**Speed**: people/peer lookups are cache-first and parallel (`resolvePeers`), the status strip paints from the phone's
+cache before the network answers.

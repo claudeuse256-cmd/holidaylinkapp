@@ -106,23 +106,23 @@ object OutboxStore {
                 val original = File(path)
                 if (!original.isFile) throw ApiException("The file is no longer available.")
                 val prepared = withContext(Dispatchers.IO) { prepareFile(ctx, original, item) }
-                val bytes = withContext(Dispatchers.IO) { prepared.readBytes() }
                 val url: String
                 if (item.kind == "image") {
                     val jpeg = withContext(Dispatchers.IO) {
-                        val scaled = MediaEditor.jpegBytes(prepared) ?: bytes
+                        val scaled = MediaEditor.jpegBytes(prepared) ?: prepared.readBytes()
                         MediaEditor.rotateJpeg(scaled, item.rotation) ?: scaled
                     }
                     url = Imgbb.uploadJpeg(jpeg) { p -> update(chatId, item.localId) { it.copy(progress = p) } }
                     withContext(Dispatchers.IO) { MediaCache.seed(ctx, url, jpeg, "jpg") }
                 } else {
-                    if (bytes.size > MediaPicker.maxAttachmentBytes) {
-                        throw ApiException("That file is too large (max 20 MB).")
+                    if (prepared.length() > MediaPicker.maxAttachmentBytes) {
+                        throw ApiException("That file is too large (max 200 MB).")
                     }
                     val name = item.fileName ?: "File"
                     val mime = item.mimeType.ifBlank { Cloudinary.mimeOf(name) }
+                    // Streamed from the file: a 200 MB video must never be read into memory.
                     url = runCatching {
-                        Cloudinary.upload(ctx, bytes, name, mime) { p ->
+                        Cloudinary.uploadFile(ctx, prepared, name, mime) { p ->
                             update(chatId, item.localId) { it.copy(progress = p) }
                         }
                     }.getOrElse { first ->
@@ -132,7 +132,7 @@ object OutboxStore {
                             val ext = name.substringAfterLast('.', "").takeIf { it.isNotBlank() } ?: "bin"
                             val ref = com.google.firebase.storage.FirebaseStorage.getInstance()
                                 .getReference("chat_media/$chatId/${UUID.randomUUID()}.$ext")
-                            ref.putBytes(bytes).await()
+                            ref.putFile(android.net.Uri.fromFile(prepared)).await()
                             ref.downloadUrl.await().toString()
                         }.getOrElse { throw first }
                     }
@@ -140,7 +140,11 @@ object OutboxStore {
                         MediaCache.seed(ctx, url, prepared, if (item.kind == "video") "mp4" else "bin")
                     }
                 }
-                update(chatId, item.localId) { it.copy(stage = OutgoingStage.SENDING, progress = 100) }
+                // The stored message gets its id NOW and the item remembers it, so the copy that
+                // Firestore shows locally is hidden behind this bubble from the first instant
+                // (a picture used to appear twice for a moment: this bubble AND the stored one).
+                val messageId = UUID.randomUUID().toString()
+                update(chatId, item.localId) { it.copy(stage = OutgoingStage.SENDING, progress = 100, serverId = messageId) }
                 val serverId = FirestoreChat.send(
                     chatId,
                     item.text,
@@ -149,7 +153,9 @@ object OutboxStore {
                     fileName = if (item.kind == "image") null else item.fileName,
                     kind = if (item.kind == "image") "image" else if (item.kind == "video") "video" else "file",
                     viewOnce = item.viewOnce,
-                    ttlSeconds = item.ttlSeconds
+                    ttlSeconds = item.ttlSeconds,
+                    messageId = messageId,
+                    onConfirmed = { org.holidaylink.app.net.ChatSounds.playSend(ctx) }
                 )
                 update(chatId, item.localId) {
                     it.copy(stage = OutgoingStage.SENT, serverId = serverId, error = null, autoRetry = false)

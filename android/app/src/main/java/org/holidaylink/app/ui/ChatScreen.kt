@@ -191,6 +191,7 @@ fun ChatScreen(
     onOpenStatus: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
+    val appContext = context.applicationContext
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     // Start the list AT the newest message (from the copy of the thread kept this session)
@@ -475,6 +476,21 @@ fun ChatScreen(
         }
     }
 
+    // Opening AND leaving a conversation both count everything as read. The write runs on the
+    // app-wide scope: a screen scope is cancelled as you leave, which used to drop it and
+    // bring the unread badge back in the chat list.
+    androidx.compose.runtime.DisposableEffect(chat.id) {
+        OutboxStore.launch {
+            runCatching {
+                FirestoreChat.markRead(chat.id, AppSettings.state.readReceipts && (peerUser?.readReceipts ?: true))
+            }
+        }
+        onDispose {
+            val receipts = AppSettings.state.readReceipts && (peerUser?.readReceipts ?: true)
+            OutboxStore.launch { runCatching { FirestoreChat.markRead(chat.id, receipts) } }
+        }
+    }
+
     // Groups show who wrote each message, with the admin / custom tag next to the name.
     val isGroupChat = chat.kind != "direct"
     val groupFlow = remember(chat.id) {
@@ -483,12 +499,16 @@ fun ChatScreen(
     val groupInfo by groupFlow.collectAsState(initial = null)
     if (isGroupChat) {
         LaunchedEffect(chat.id, rawMessages.size) {
-            rawMessages.map { it.senderId }.distinct()
+            val missing = rawMessages.map { it.senderId }.distinct()
                 .filter { it != uid && it !in SenderNameCache.names }
-                .forEach { id ->
-                    val name = runCatching { FirebaseBackend.loadProfile(id)?.name }.getOrNull()
-                    SenderNameCache.names[id] = name?.takeIf { it.isNotBlank() } ?: "Member"
+            if (missing.isNotEmpty()) {
+                val found = runCatching { FirestoreChat.resolvePeers(missing) }.getOrDefault(emptyMap())
+                missing.forEach { id ->
+                    val person = found[id]
+                    if (person != null) SenderNameCache.users[id] = person
+                    SenderNameCache.names[id] = person?.displayName?.takeIf { it.isNotBlank() } ?: "Member"
                 }
+            }
         }
     }
 
@@ -602,7 +622,9 @@ fun ChatScreen(
                     ttlSeconds = 0,
                     replyToId = replyToId,
                     replyToBody = replyToBody,
-                    replyToName = null
+                    replyToName = null,
+                    // The "sent" sound only plays once the server has the message.
+                    onConfirmed = { ChatSounds.playSend(appContext) }
                 )
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -650,7 +672,6 @@ fun ChatScreen(
         // connection returns, even if the app is closed in between.
         draft = ""
         replyingTo = null
-        ChatSounds.playSend(context)
         deliverText(
             UUID.randomUUID().toString(),
             body,
@@ -716,7 +737,6 @@ fun ChatScreen(
             ttlSeconds = ttl
         )
         OutboxStore.add(chat.id, item)
-        ChatSounds.playSend(context)
         OutboxStore.deliver(chat.id, item)
     }
 
@@ -814,7 +834,6 @@ fun ChatScreen(
         }
         val reply = replyingTo
         uploading = true
-        ChatSounds.playSend(context)
         scope.launch {
             try {
                 val bytes = clip.file.readBytes()
@@ -829,7 +848,8 @@ fun ChatScreen(
                     viewOnce = voiceListenOnce,
                     ttlSeconds = selfDestructSecs,
                     replyToId = reply?.id,
-                    replyToBody = reply?.let(::replyPreviewOf)
+                    replyToBody = reply?.let(::replyPreviewOf),
+                    onConfirmed = { ChatSounds.playSend(appContext) }
                 )
                 replyingTo = null
             } catch (e: Exception) {
@@ -909,7 +929,7 @@ fun ChatScreen(
                     ) {
                         Avatar(
                             name = title,
-                            photo = peerUser?.avatarUrl ?: chat.peer?.avatarUrl,
+                            photo = peerUser?.avatarUrl ?: chat.peer?.avatarUrl ?: groupInfo?.photo ?: chat.groupPhoto,
                             size = 38.dp,
                             statusUserId = chat.peer?.id,
                             // Someone with a status: their picture opens it, like WhatsApp.
@@ -1134,6 +1154,12 @@ fun ChatScreen(
                             pending = message.senderId == uid && !message.read && message.text in pendingTexts,
                             senderName = if (isGroupChat && message.senderId != uid) {
                                 SenderNameCache.names[message.senderId] ?: "…"
+                            } else null,
+                            senderPhoto = if (isGroupChat && message.senderId != uid) {
+                                SenderNameCache.users[message.senderId]?.avatarUrl
+                            } else null,
+                            onSenderClick = if (isGroupChat && message.senderId != uid) {
+                                { SenderNameCache.users[message.senderId]?.let(onOpenProfile) }
                             } else null,
                             senderTag = if (isGroupChat && message.senderId != uid) {
                                 groupInfo?.let { info ->
@@ -1460,19 +1486,17 @@ fun ChatScreen(
             onEmoji = { emoji -> draft += emoji },
             onSticker = { stickerRef ->
                 showStickers = false
-                ChatSounds.playSend(context)
-                scope.launch {
-                    runCatching { FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = stickerRef) }
+                        scope.launch {
+                    runCatching { FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = stickerRef, onConfirmed = { ChatSounds.playSend(appContext) }) }
                         .onFailure { snackbar.showSnackbar("Sticker not sent. Check your connection and try again.") }
                 }
             },
             onCustomSticker = { file ->
                 showStickers = false
-                ChatSounds.playSend(context)
-                scope.launch {
+                        scope.launch {
                     runCatching {
                         val url = CustomStickers.urlFor(file)
-                        FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = url)
+                        FirestoreChat.send(chat.id, "", kind = "sticker", imageUrl = url, onConfirmed = { ChatSounds.playSend(appContext) })
                     }.onFailure {
                         snackbar.showSnackbar((it as? ApiException)?.message ?: "Sticker not sent. Check your connection and try again.")
                     }
@@ -1668,6 +1692,9 @@ private fun FsMessageBubble(
     /** Group chats: who wrote this (null in direct chats and for your own messages). */
     senderName: String? = null,
     senderTag: String? = null,
+    /** Group chats: the sender's small picture, and what tapping their name/picture does. */
+    senderPhoto: String? = null,
+    onSenderClick: (() -> Unit)? = null,
     /** Live description of the message this one replies to (overrides the stored text). */
     replyText: String? = null
 ) {
@@ -1745,7 +1772,15 @@ private fun FsMessageBubble(
         ) {
             Column {
                 if (senderName != null) {
-                    Row(Modifier.padding(bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        Modifier
+                            .padding(bottom = 2.dp)
+                            .then(if (onSenderClick != null) Modifier.clickable { onSenderClick() } else Modifier),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Very small picture before the name, like WhatsApp groups.
+                        Avatar(name = senderName, photo = senderPhoto, size = 18.dp)
+                        Spacer(Modifier.width(6.dp))
                         Text(
                             senderName,
                             style = MaterialTheme.typography.labelMedium,
@@ -1843,6 +1878,10 @@ private fun FsMessageBubble(
                                 name = message.fileName ?: "Video",
                                 onOpen = { file -> playingVideo = file }
                             )
+                        } else if (isAudioFileName(message.fileName)) {
+                            // Songs/recordings picked from storage play right here in the chat
+                            // instead of being handed to a browser.
+                            VoicePlayer(url, message.fileName ?: "Audio")
                         } else {
                             FsFileRow(
                                 name = message.fileName ?: "File",
@@ -2422,17 +2461,26 @@ internal fun replyPreviewOf(m: FirestoreChat.ChatMessage): String {
     val caption = m.text.trim()
     return when {
         m.type == "sticker" -> "Sticker"
-        m.audioBlob != null -> "🎤 Voice message"
+        m.audioBlob != null -> "Voice message (${formatDuration(m.durationMs ?: 0L)})"
         m.imageUrl != null -> if (caption.isNotEmpty()) "📷 $caption" else "📷 Photo"
         m.fileUrl != null && m.type == "video" -> if (caption.isNotEmpty()) "🎞 $caption" else "🎞 Video"
+        m.fileUrl != null && isAudioFileName(m.fileName) -> "Audio · " + (m.fileName ?: "audio")
         m.fileUrl != null -> "📄 " + (m.fileName ?: "File")
         else -> caption
     }.take(120)
 }
 
+/** True for audio files (mp3, m4a, aac, wav, ogg, opus, flac, amr...) by their name. */
+internal fun isAudioFileName(name: String?): Boolean {
+    val ext = name?.substringAfterLast('.', "")?.lowercase().orEmpty()
+    return ext in setOf("mp3", "m4a", "aac", "wav", "ogg", "opus", "flac", "amr", "3ga", "oga", "wma", "mid")
+}
+
 /** Names of the people who wrote in group chats, kept for the process. */
 private object SenderNameCache {
     val names = mutableStateMapOf<String, String>()
+    /** The people themselves, for their small picture and for opening their profile. */
+    val users = mutableStateMapOf<String, org.holidaylink.app.net.User>()
 }
 
 private val senderColors = listOf(

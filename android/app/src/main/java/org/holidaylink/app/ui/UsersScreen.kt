@@ -202,7 +202,7 @@ fun UsersScreen(
             }
             else -> items(filtered, key = { it.id }) { u ->
                 WhatsAppUserRow(user = u, isContact = contactIds.contains(u.id), isFriend = friendIds.contains(u.id),
-                    mutual = mutualCount[u.id] ?: 0, onOpen = { onOpenProfile(u) }, onMessage = { onOpenChat(u) })
+                    mutual = mutualCount[u.id] ?: 0, onOpen = { onOpenProfile(u) }, onMessage = { onOpenChat(u) }, unread = UnreadCounts.byPeer[u.id] ?: 0)
             }
         }
     }
@@ -214,7 +214,8 @@ private object PeopleLoadState { var loadedOnce = false }
 @Composable
 private fun WhatsAppUserRow(
     user: User, isContact: Boolean, isFriend: Boolean, mutual: Int,
-    onOpen: () -> Unit, onMessage: () -> Unit
+    onOpen: () -> Unit, onMessage: () -> Unit,
+    unread: Int = 0
 ) {
     Row(Modifier.fillMaxWidth().clickable { onOpen() }.padding(horizontal = 14.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
         Avatar(name = user.displayName, photo = user.avatarUrl, size = 44.dp, online = user.online, statusUserId = user.id)
@@ -237,6 +238,8 @@ private fun WhatsAppUserRow(
             }
             Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
+        // The same green counter as in Chats: how many messages from this person are waiting.
+        CountBadge(unread)
         IconButton(onClick = onMessage) { Icon(Icons.Default.Chat, "Message", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp)) }
     }
 }
