@@ -30,22 +30,26 @@ jobs:
           echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "/usr/local/lib/android/sdk/cmdline-tools/16.0/bin" >> "$GITHUB_PATH"
 
-      - name: Install Android SDK packages
+            - name: Install Android SDK packages
         run: |
-          SDKMANAGER=""
-          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          elif [ -x "$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager" ]; then
-            SDKMANAGER="$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager"
-          else
-            echo "sdkmanager not found"
-            find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f -print
+          SDKMANAGER="/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="/usr/local/lib/android/sdk/cmdline-tools/16.0/bin/sdkmanager"
+          fi
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found"
+            find /usr/local/lib/android/sdk/cmdline-tools -name sdkmanager -type f
             exit 1
           fi
 
-          yes | "$SDKMAN" --licenses >/dev/null || true
-          "$SDKMAN" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          echo "Using SDK Manager: $SDKMANAGER"
 
+          yes | "$SDKMAN" --licenses || true
+
+          "$SDKMAN" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          
       - name: Install Gradle
         run: |
           wget -q https://services.gradle.org/distributions/gradle-8.9-bin.zip
