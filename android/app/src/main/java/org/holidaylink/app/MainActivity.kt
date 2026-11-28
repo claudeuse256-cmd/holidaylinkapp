@@ -645,10 +645,6 @@ private fun SignedInApp(
                 try {
                     val ordered = snap.documents
                         .sortedByDescending { it.safeTimestamp("timestamp")?.seconds ?: 0L }
-                    // Your most recent chats become "direct share" targets in the system share sheet.
-                org.holidaylink.app.ui.OutboxStore.launch {
-                    runCatching { org.holidaylink.app.ui.ShareShortcuts.publish(context.applicationContext, rows) }
-                }
                 if (!primed) {
                         // First snapshot is the existing backlog: learn it, don't buzz for it.
                         ordered.forEach { seen.add(it.id) }
@@ -691,6 +687,7 @@ private fun SignedInApp(
         // A Firestore/flow error must not escape into the composition and crash the app.
         runCatching {
             FirestoreChat.chatsFlow(userId).collect { rows ->
+                runCatching { org.holidaylink.app.ui.ShareShortcuts.publish(context.applicationContext, rows) }
                 rows.forEach { row ->
                     row.peerId?.let { peer ->
                         if (org.holidaylink.app.ui.UnreadCounts.byPeer[peer] != row.unread) {
