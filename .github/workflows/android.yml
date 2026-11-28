@@ -44,9 +44,9 @@ jobs:
 
           echo "Using SDK Manager: $SDKMANAGER"
 
-          yes | "$SDKMAN" --licenses >/dev/null 2>&1 || true
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
 
-          "$SDKMAN" \
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
