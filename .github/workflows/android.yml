@@ -1,5 +1,4 @@
-
-name: Build HolidayLink APK
+name: Build HolidayLink APK and AAB
 
 on:
   push:
@@ -44,8 +43,8 @@ jobs:
             exit 1
           fi
 
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | "$SDKMAN" --licenses >/dev/null || true
+          "$SDKMAN" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Install Gradle
         run: |
@@ -67,7 +66,7 @@ jobs:
             echo "${{ secrets.HL_KEYSTORE_BASE64 }}" | base64 -d > android/holidaylink.jks
             echo "HAS_RELEASE_KEYSTORE=true" >> "$GITHUB_ENV"
           else
-            echo "::warning::HL_KEYSTORE_BASE64 is not set; signing with a throw-away debug key. Play Protect and update installs work best with ONE permanent key - see README."
+            echo "::warning::HL_KEYSTORE_BASE64 is not set; signing with a throw-away debug key. Play Store releases require your permanent signing key."
             echo "HAS_RELEASE_KEYSTORE=false" >> "$GITHUB_ENV"
           fi
 
@@ -81,30 +80,48 @@ jobs:
           echo "HL_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
           echo "Building with API URL: $API_URL"
 
-      - name: Build APK
+      - name: Build APK and AAB
         working-directory: android
         run: |
-          gradle assembleRelease --no-daemon "-PHL_API_BASE_URL=${HL_API_BASE_URL}" "-PHL_VERSION_CODE=${VERSION_CODE}" "-PHL_VERSION_NAME=${VERSION_NAME}"
+          gradle assembleRelease bundleRelease --no-daemon \
+            "-PHL_API_BASE_URL=${HL_API_BASE_URL}" \
+            "-PHL_VERSION_CODE=${VERSION_CODE}" \
+            "-PHL_VERSION_NAME=${VERSION_NAME}"
 
-      - name: Upload APK
+      - name: Rename APK
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk \
+            "android/app/build/outputs/apk/release/HolidayLink-${VERSION_NAME}.apk"
+
+      - name: Rename AAB
+        run: |
+          cp android/app/build/outputs/bundle/release/app-release.aab \
+            "android/app/build/outputs/bundle/release/HolidayLink-${VERSION_NAME}.aab"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HolidayLink-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          name: HolidayLink-APK
+          path: android/app/build/outputs/apk/release/HolidayLink-${{ env.VERSION_NAME }}.apk
           retention-days: 14
 
-      - name: Name release APK
-        run: |
-          cp android/app/build/outputs/apk/release/app-release.apk "android/app/build/outputs/apk/release/HolidayLink-${VERSION_NAME}.apk"
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HolidayLink-AAB
+          path: android/app/build/outputs/bundle/release/HolidayLink-${{ env.VERSION_NAME }}.aab
+          retention-days: 14
 
-      - name: Publish latest Actions APK as a GitHub Release asset
+      - name: Publish APK and AAB as GitHub Release assets
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ env.VERSION_CODE }}
           name: ${{ env.VERSION_NAME }}
           body_path: UPDATE_NOTES.md
-          files: android/app/build/outputs/apk/release/HolidayLink-${{ env.VERSION_NAME }}.apk
+          files: |
+            android/app/build/outputs/apk/release/HolidayLink-${{ env.VERSION_NAME }}.apk
+            android/app/build/outputs/bundle/release/HolidayLink-${{ env.VERSION_NAME }}.aab
           make_latest: true
           fail_on_unmatched_files: true
         env:
