@@ -30,27 +30,28 @@ jobs:
           echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "/usr/local/lib/android/sdk/cmdline-tools/16.0/bin" >> "$GITHUB_PATH"
 
-            - name: Install Android SDK packages
+      - name: Install Android SDK packages
+        shell: bash
         run: |
-          SDKMANAGER="/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"
+          SDK_ROOT="/usr/local/lib/android/sdk"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1)"
 
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="/usr/local/lib/android/sdk/cmdline-tools/16.0/bin/sdkmanager"
-          fi
-
-          if [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found"
-            find /usr/local/lib/android/sdk/cmdline-tools -name sdkmanager -type f
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found or not executable"
+            find "$SDK_ROOT/cmdline-tools" -maxdepth 4 -type f || true
             exit 1
           fi
 
           echo "Using SDK Manager: $SDKMANAGER"
 
-          yes | "$SDKMAN" --licenses || true
+          yes | "$SDKMAN" --licenses >/dev/null 2>&1 || true
 
-          "$SDKMAN" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-          
-      - name: Install Gradle
+          "$SDKMAN" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Install Gradle 8.9
         run: |
           wget -q https://services.gradle.org/distributions/gradle-8.9-bin.zip
           unzip -q gradle-8.9-bin.zip
@@ -60,8 +61,10 @@ jobs:
         run: |
           CODE=$((10000 + GITHUB_RUN_NUMBER))
           NAME="2.4.7+build.${GITHUB_RUN_NUMBER}"
+
           echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
           echo "VERSION_NAME=$NAME" >> "$GITHUB_ENV"
+
           echo "Building HolidayLink $NAME ($CODE)"
 
       - name: Restore signing keystore
@@ -70,7 +73,7 @@ jobs:
             echo "${{ secrets.HL_KEYSTORE_BASE64 }}" | base64 -d > android/holidaylink.jks
             echo "HAS_RELEASE_KEYSTORE=true" >> "$GITHUB_ENV"
           else
-            echo "::warning::HL_KEYSTORE_BASE64 is not set; signing with a throw-away debug key. Play Store releases require your permanent signing key."
+            echo "::warning::HL_KEYSTORE_BASE64 is not set; using fallback signing configuration."
             echo "HAS_RELEASE_KEYSTORE=false" >> "$GITHUB_ENV"
           fi
 
@@ -81,6 +84,7 @@ jobs:
           else
             API_URL="https://holidaylink-server.onrender.com"
           fi
+
           echo "HL_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
           echo "Building with API URL: $API_URL"
 
